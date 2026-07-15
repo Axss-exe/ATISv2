@@ -1,0 +1,35 @@
+{
+  "intelligence_id": "ATIS-INT-GENERIC",
+  "trigger_event": "US DoD awards $300M DLA contract for direct battery‑grade lithium carbonate supply",
+  "market_equilibrium_shift": "Shift from China‑centric lithium processing to a US‑direct, non‑Chinese supply chain, destabilising the low‑cost concentrate export model.",
+  "opportunities": [
+    {
+      "opportunity_id": "OPP-001",
+      "title": "Joint‑Venture Lithium Refining Facility in Zimbabwe",
+      "type": "Strategic Infrastructure",
+      "urgency_score": 9.2,
+      "feasibility_score": 7.4,
+      "required_missing_nodes": [
+        "Lithium_refining_facility",
+        "Battery-grade_lithium_carbonate_production",
+        "Supply_chain_traceability",
+        "ESG_certification",
+        "Export_credit_facility",
+        "Lithium_transport_network"
+      ],
+      "capital_flow": {
+        "beneficiary": "Zimbabwe Refining Consortium (Arcadia + US investors)",
+        "likely_funder": "US DoD/DLA contract funds and US Export‑Import Bank"
+      },
+      "justification": "The graph lacks a refining node, preventing a non‑Chinese battery‑grade lithium supply and creating a critical structural gap."
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-09T13:48:24.286639+00:00",
+    "source_article": "C:\\Users\\tmaki\\Documents\\ATIS\\test.txt",
+    "extracted_entities_count": 6,
+    "core_event": "The U.S. Department of Defense, via the Defense Logistics Agency, launched a $300 million contract to procure battery‑grade lithium carbonate, aiming to build a strategic lithium stockpile and reduce reliance on China, with Zimbabwe positioned as a potential new supplier.",
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b"
+  }
+}

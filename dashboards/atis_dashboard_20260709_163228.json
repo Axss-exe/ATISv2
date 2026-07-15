@@ -1,0 +1,160 @@
+{
+  "intelligence_id": "ATIS-INT-GENERIC",
+  "trigger_event": "Field-visit programme exposing chaplaincy service gap in Zimbabwe's justice and health sectors",
+  "market_equilibrium_shift": "Introduction of a structured, practice‑oriented chaplaincy training pipeline raises supply quality while demand for professional chaplains accelerates",
+  "opportunities": [
+    {
+      "opportunity_id": "OPP-001",
+      "title": "Certified Chaplaincy Training Institute",
+      "type": "Primary",
+      "urgency_score": 9.2,
+      "feasibility_score": 7.5,
+      "required_missing_nodes": [
+        "TRAINING_PROGRAM node",
+        "ACCREDITATION_AGENCY node",
+        "FINANCIAL_ALLOCATION node"
+      ],
+      "capital_flow": {
+        "beneficiary": "Chaplains of Zimbabwe (training institute)",
+        "likely_funder": "International faith‑based donors and Ministry of Education"
+      },
+      "justification": "Current chaplaincy training lacks formal accreditation and dedicated funding, creating a critical supply‑side deficiency."
+    },
+    {
+      "opportunity_id": "OPP-002",
+      "title": "Partnership Management Platform",
+      "type": "Primary",
+      "urgency_score": 8.5,
+      "feasibility_score": 8.0,
+      "required_missing_nodes": [
+        "PARTNERSHIP edges between CZ and Prison/Hospital/Courts",
+        "M&E_PLATFORM node"
+      ],
+      "capital_flow": {
+        "beneficiary": "CZ and partner institutions",
+        "likely_funder": "Tech‑grant programmes and private SaaS investors"
+      },
+      "justification": "Absence of formal partnership edges prevents coordinated chaplaincy service delivery across institutions."
+    },
+    {
+      "opportunity_id": "OPP-003",
+      "title": "Government‑backed Chaplaincy Funding Scheme",
+      "type": "Primary",
+      "urgency_score": 9.0,
+      "feasibility_score": 6.5,
+      "required_missing_nodes": [
+        "FINANCIAL_ALLOCATION node",
+        "MINISTRY of Health & Justice budget line"
+      ],
+      "capital_flow": {
+        "beneficiary": "Chaplains of Zimbabwe operational budget",
+        "likely_funder": "Ministry of Health and Ministry of Justice"
+      },
+      "justification": "No dedicated budget line exists for chaplaincy training and service provision, limiting scalability."
+    },
+    {
+      "opportunity_id": "OPP-004",
+      "title": "Logistics & Welfare Services",
+      "type": "Secondary",
+      "urgency_score": 7.8,
+      "feasibility_score": 8.7,
+      "required_missing_nodes": [
+        "LOGISTICS_PROVIDER node",
+        "WELFARE_SUPPORT edges to trainees"
+      ],
+      "capital_flow": {
+        "beneficiary": "Trainee chaplains",
+        "likely_funder": "Corporate CSR programmes and CZ operational fund"
+      },
+      "justification": "Training participants lack transport and sustenance support, causing dropout risk."
+    },
+    {
+      "opportunity_id": "OPP-005",
+      "title": "Mental‑Health & Trauma‑Informed Counseling Tools",
+      "type": "Secondary",
+      "urgency_score": 8.0,
+      "feasibility_score": 7.2,
+      "required_missing_nodes": [
+        "TRAUMA_INFORMED_MODULE node",
+        "TECH_PLATFORM for mobile delivery"
+      ],
+      "capital_flow": {
+        "beneficiary": "Chaplains and end‑users (inmates/patients)",
+        "likely_funder": "International health NGOs and private impact investors"
+      },
+      "justification": "Current chaplaincy interventions are spiritual‑only, lacking integrated trauma‑informed counseling."
+    },
+    {
+      "opportunity_id": "OPP-006",
+      "title": "Impact‑Analytics Consultancy",
+      "type": "Secondary",
+      "urgency_score": 7.0,
+      "feasibility_score": 8.5,
+      "required_missing_nodes": [
+        "M&E_PLATFORM node",
+        "DATA_SHARING edges with ministries"
+      ],
+      "capital_flow": {
+        "beneficiary": "CZ and government ministries",
+        "likely_funder": "Tech‑grant programmes and consultancy contracts"
+      },
+      "justification": "No outcome‑based reporting exists to demonstrate chaplaincy impact on recidivism or patient outcomes."
+    },
+    {
+      "opportunity_id": "OPP-007",
+      "title": "Re‑integration Social Enterprises",
+      "type": "Tertiary",
+      "urgency_score": 6.5,
+      "feasibility_score": 7.0,
+      "required_missing_nodes": [
+        "SOCIAL_REINTEGRATION_SERVICES node",
+        "REFERRAL edges from CZ"
+      ],
+      "capital_flow": {
+        "beneficiary": "Former inmates and families",
+        "likely_funder": "Social‑impact investors and micro‑finance institutions"
+      },
+      "justification": "There is no systematic ecosystem to support post‑release transport, housing, and livelihood for beneficiaries."
+    },
+    {
+      "opportunity_id": "OPP-008",
+      "title": "Faith‑Based Health & Wellness Centers",
+      "type": "Tertiary",
+      "urgency_score": 6.0,
+      "feasibility_score": 6.8,
+      "required_missing_nodes": [
+        "HEALTH_CENTER node integrating chaplaincy",
+        "PRIVATE_HEALTH_INVESTOR edges"
+      ],
+      "capital_flow": {
+        "beneficiary": "Patients and chaplains",
+        "likely_funder": "Private health investors and philanthropic foundations"
+      },
+      "justification": "Healthcare facilities lack integrated chaplaincy services that combine spiritual and medical care."
+    },
+    {
+      "opportunity_id": "OPP-009",
+      "title": "Regional Chaplaincy Network",
+      "type": "Tertiary",
+      "urgency_score": 5.5,
+      "feasibility_score": 5.8,
+      "required_missing_nodes": [
+        "FRANCHISE_MODEL node",
+        "PROVINCE_LEVEL_PARTNERSHIP edges"
+      ],
+      "capital_flow": {
+        "beneficiary": "Faith‑based organisations across Southern Africa",
+        "likely_funder": "Regional development funds and franchise investors"
+      },
+      "justification": "The model is confined to Harare, lacking a scalable structure for regional replication."
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-09T16:32:28.076872+00:00",
+    "source_article": "C:\\Users\\tmaki\\Documents\\ATIS\\test2.txt",
+    "extracted_entities_count": 6,
+    "core_event": "Chaplains of Zimbabwe conducted field visits to Harare Central Prison, Magistrates’ Courts and Mbuya Dorcas Hospital to provide practical training for its student chaplains.",
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b"
+  }
+}

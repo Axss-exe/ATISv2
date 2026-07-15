@@ -1,0 +1,34 @@
+{
+  "intelligence_id": "ATIS-INT-GENERIC",
+  "trigger_event": "U.S. Defense Logistics Agency announces $300M contract for non‑Chinese, defense‑grade lithium carbonate",
+  "market_equilibrium_shift": "From China‑centric lithium supply to a diversified Africa‑U.S. defense‑grade lithium carbonate value chain",
+  "opportunities": [
+    {
+      "opportunity_id": "OPP-001",
+      "title": "Secure Lithium‑Carbonate Supply Contract with Zimbabwean Producers",
+      "type": "Supply",
+      "urgency_score": 9.2,
+      "feasibility_score": 6.3,
+      "required_missing_nodes": [
+        "Lithium carbonate supplier",
+        "Refining conversion facility",
+        "ITAR/EAR compliance certification",
+        "Secure logistics hub",
+        "Strategic stockpile storage"
+      ],
+      "capital_flow": {
+        "beneficiary": "Zimbabwean mining firms (e.g., Arcadia Mining) and joint‑venture processing partners",
+        "likely_funder": "U.S. Department of Defense (DLA) / Treasury"
+      },
+      "justification": "The current supply chain lacks a qualified lithium‑carbonate producer and the associated processing, compliance, logistics, and storage nodes required to satisfy the DLA’s defense‑grade demand."
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-09T12:28:30.056987+00:00",
+    "source_article": "C:\\Users\\tmaki\\Documents\\ATIS\\test.txt",
+    "extracted_entities_count": 5,
+    "core_event": "The U.S. Defense Logistics Agency issued a $300 million contract to secure battery‑grade lithium carbonate, aiming to cut reliance on China and opening a potential market for Zimbabwe’s expanding lithium production.",
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b"
+  }
+}

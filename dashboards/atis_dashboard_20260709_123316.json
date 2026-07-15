@@ -1,0 +1,66 @@
+{
+  "intelligence_id": "ATIS-INT-GENERIC",
+  "trigger_event": "U.S. Defense Logistics Agency announces $300M strategic lithium‑carbonate contract targeting non‑Chinese sources",
+  "market_equilibrium_shift": "Transition from a China‑centric lithium supply chain to a diversified, security‑driven non‑Chinese strategic stockpile equilibrium",
+  "opportunities": [
+    {
+      "opportunity_id": "OPP-001",
+      "title": "Award of the $300M DLA lithium‑carbonate contract to a Zimbabwean consortium",
+      "type": "Primary",
+      "urgency_score": 9.5,
+      "feasibility_score": 7.5,
+      "required_missing_nodes": [
+        "non‑Chinese supplier node linked to DLA",
+        "fixed‑price, multi‑year contract edge",
+        "secure logistics & ITAR‑compliant transport edge"
+      ],
+      "capital_flow": {
+        "beneficiary": "Zimbabwean mining & processing consortium",
+        "likely_funder": "U.S. Defense Logistics Agency (taxpayer funds)"
+      },
+      "justification": "The DLA lacks a non‑Chinese supplier capable of delivering battery‑grade lithium carbonate under a fixed‑price, multi‑year contract."
+    },
+    {
+      "opportunity_id": "OPP-002",
+      "title": "Construction/upgrade of a battery‑grade lithium carbonate refinery in Zimbabwe",
+      "type": "Primary",
+      "urgency_score": 8.0,
+      "feasibility_score": 6.5,
+      "required_missing_nodes": [
+        "domestic processing facility node (lithium carbonate refinery)",
+        "financing & risk‑mitigation instrument edges (Export‑Import Bank, ADB guarantees)",
+        "regulatory alignment edge to U.S. DoD/EPA standards"
+      ],
+      "capital_flow": {
+        "beneficiary": "Zimbabwean refinery project (joint venture)",
+        "likely_funder": "U.S. Defense Production Act financing, private equity, EU technology partners"
+      },
+      "justification": "Current supply chain lacks a processing node that can convert concentrate to battery‑grade carbonate meeting U.S. defense specifications."
+    },
+    {
+      "opportunity_id": "OPP-003",
+      "title": "Establishment of a U.S.–Zimbabwe strategic lithium stockpile hub",
+      "type": "Primary",
+      "urgency_score": 7.0,
+      "feasibility_score": 7.0,
+      "required_missing_nodes": [
+        "stockpile storage facility node in Zimbabwe",
+        "logistics & compliance edge (ISO‑9001, ITAR‑compatible transport)",
+        "continuous financing edge for inventory management"
+      ],
+      "capital_flow": {
+        "beneficiary": "Strategic stockpile hub operator (U.S. Army Materiel Command partner)",
+        "likely_funder": "U.S. DLA procurement budget and ancillary logistics service contracts"
+      },
+      "justification": "The graph lacks a secure, compliant logistics and storage link connecting the DLA to a non‑Chinese lithium carbonate source."
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-09T12:33:16.748985+00:00",
+    "source_article": "C:\\Users\\tmaki\\Documents\\ATIS\\test.txt",
+    "extracted_entities_count": 7,
+    "core_event": "The U.S. Defense Logistics Agency issued a $300 million contract to secure lithium supplies, a move that could boost Zimbabwe’s lithium production and processing as the United States seeks to reduce reliance on China.",
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b"
+  }
+}
