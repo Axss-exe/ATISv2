@@ -49,8 +49,8 @@ HARDCODED_API_KEY: str = "csk-v4vf9r666pv9t99etmm9cppv58j8xpc8fnjpxkpw89mk36rp"
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
 SAFETY_BUFFER: int = 1_000
-CHUNK_SIZE: int = 20
-INTER_CHUNK_DELAY_SECONDS: float = 1.5
+CHUNK_SIZE: int = 50
+INTER_CHUNK_DELAY_SECONDS: float = 0.0
 
 # =============================================================================
 # Dependencies
