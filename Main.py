@@ -14,9 +14,7 @@ app = FastAPI(title="ATIS Intelligence API")
 # =============================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-    "http://localhost:3000",      # Local dev
-    "https://av2-fkq2sfy2c-tmakiriyado1-4301s-projects.vercel.app"], # Your production frontend
+    allow_origins=[*], # Your production frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
