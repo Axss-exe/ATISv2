@@ -1,2 +1,5 @@
+fastapi
+uvicorn[standard]
+pydantic
 cerebras-cloud-sdk
 pyyaml

@@ -954,7 +954,7 @@ def persist_outputs(
       1. Markdown execution roadmap.
       2. Structured JSON companion for React Flow UI.
     """
-    output_dir = Path(r"C:\Users\tmaki\Documents\AKSOS\ATIS\Roadmaps")
+    output_dir = Path(os.getenv("OUTPUT_DIR", "./output/roadmaps"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Markdown roadmap
@@ -1100,6 +1100,46 @@ def main() -> None:
 
     print(f"\nSUCCESS: Execution roadmap written to:\n  {md_path}")
     print(f"SUCCESS: Reasoning JSON written to:\n  {json_path}")
+
+
+# =============================================================================
+# Web entry point
+# =============================================================================
+def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str) -> Dict[str, Any]:
+    """
+    Web-compatible entry point. Accepts dashboard dict and opportunity ID.
+    Returns dict with final_roadmap, ui_thinking_graph, and compiled_lineage_traces.
+    """
+    vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
+    vault_mgr = ObsidianVaultManager(vault_path)
+    vault_mgr.build_index()
+
+    opportunity = dashboard_json
+    seed_terms = expand_keywords(opportunity)
+
+    matches = vault_mgr.search(opportunity, seed_terms)
+
+    engine = CerebrasExecutionEngine()
+    result = engine.generate_roadmap(opportunity, matches)
+
+    # Persist
+    md_path, json_path = persist_outputs(
+        opportunity_id,
+        result["final_roadmap"],
+        result["ui_thinking_graph"],
+        result["compiled_lineage_traces"],
+    )
+
+    return {
+        "opportunity_id": opportunity_id,
+        "final_roadmap": result["final_roadmap"],
+        "ui_thinking_graph": result["ui_thinking_graph"],
+        "compiled_lineage_traces": result["compiled_lineage_traces"],
+        "files_written": {
+            "roadmap_md": str(md_path),
+            "reasoning_json": str(json_path),
+        }
+    }
 
 
 if __name__ == "__main__":

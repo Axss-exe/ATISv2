@@ -122,7 +122,7 @@ PROMPT_STAGE_3_FORMATTER: str = (
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-VAULT_DIR: Path = Path(r"C:\Users\tmaki\Documents\AKSOS\ATIS\Data")
+VAULT_DIR: Path = Path(r"C:\Users\tmaki\Documents\ATIS\Data")
 DASHBOARDS_DIR: Path = Path("./dashboards")
 MAX_TOKENS_PER_REQUEST: int = 60_000
 MODEL_NAME: str = "gpt-oss-120b"
@@ -935,6 +935,76 @@ def main() -> None:
     except Exception as exc:
         logger.critical("Pipeline terminated with fatal error: %s", exc)
         sys.exit(1)
+
+# =============================================================================
+# Web entry point
+# =============================================================================
+def run_news_pipeline(article_text: str) -> Dict[str, Any]:
+    """
+    Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
+    """
+    logger.info("=" * 70)
+    logger.info("ATIS NEWS PIPELINE (WEB)")
+    logger.info("=" * 70)
+
+    vault_manager = ObsidianVaultManager()
+    try:
+        pipeline = CerebrasPipeline()
+    except ValueError as exc:
+        logger.critical("%s", exc)
+        raise
+
+    # Stage 1
+    try:
+        stage_1_result = pipeline.stage_1_extract(article_text)
+    except Exception as exc:
+        logger.critical("STAGE 1 FAILED: %s", exc)
+        raise
+
+    entities = stage_1_result.get("entities", [])
+    core_event = stage_1_result.get("core_event", "Unknown event")
+
+    # Graph layer
+    graph_context = vault_manager.build_graph_context(entities)
+
+    # Stage 2
+    try:
+        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context)
+    except Exception as exc:
+        logger.critical("STAGE 2 FAILED: %s", exc)
+        raise
+
+    # Stage 3
+    try:
+        dashboard_payload = pipeline.stage_3_format(stage_2_analysis)
+    except Exception as exc:
+        logger.critical("STAGE 3 FAILED: %s", exc)
+        raise
+
+    # Enrich
+    dashboard_payload["pipeline_metadata"] = {
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "source_article": "web_upload",
+        "extracted_entities_count": len(entities),
+        "core_event": core_event,
+        "model_primary": MODEL_NAME,
+        "model_fallback": FALLBACK_MODEL,
+    }
+
+    # Persist to disk (optional, ephemeral on Render)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_filename = f"atis_dashboard_{timestamp}.json"
+    output_path = DASHBOARDS_DIR / output_filename
+    try:
+        output_path.write_text(
+            json.dumps(dashboard_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Dashboard persisted: %s", output_path)
+    except Exception as exc:
+        logger.error("Failed to write dashboard: %s", exc)
+
+    return dashboard_payload
 
 
 if __name__ == "__main__":

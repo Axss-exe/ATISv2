@@ -776,7 +776,7 @@ class CerebrasQueryEngine:
 # =============================================================================
 def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
                           aggregate_stats: Dict[str, Any], question: str | None = None) -> Tuple[Path, Path]:
-    output_dir = Path(r"C:\Users\tmaki\Documents\AKSOS\ATIS\QueryResults")
+    output_dir = Path(os.getenv("OUTPUT_DIR", "./output/query_results"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -900,6 +900,47 @@ def main() -> None:
     print(f"\nSUCCESS: Query dashboard payload written to:\n  {json_path}")
     print(f"SUCCESS: Graph companion written to:\n  {graph_path}")
     print(f"\nEXECUTIVE SUMMARY:\n{result.get('executive_summary', 'N/A')}")
+
+
+# =============================================================================
+# Web entry point
+# =============================================================================
+def run_query_pipeline(question: str | None = None) -> Dict[str, Any]:
+    """
+    Web-compatible entry point. Accepts optional question string.
+    Returns full query dashboard payload.
+    """
+    vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
+    vault_mgr = ObsidianVaultManager(vault_path)
+    vault_mgr.build_index()
+
+    if vault_mgr.indexed_count == 0:
+        raise RuntimeError("No markdown files found in vault.")
+
+    if question:
+        relevant_nodes = vault_mgr.search_for_question(question)
+        aggregate_stats = vault_mgr.get_aggregate_stats(relevant_nodes)
+        entity_graph = vault_mgr.build_entity_graph(relevant_nodes)
+        all_nodes = relevant_nodes
+    else:
+        aggregate_stats = vault_mgr.get_aggregate_stats()
+        entity_graph = vault_mgr.build_entity_graph()
+        all_nodes = vault_mgr.get_all_nodes_as_context()
+
+    engine = CerebrasQueryEngine()
+    result = engine.generate_query_payload(all_nodes, aggregate_stats, question)
+
+    json_path, graph_path = persist_query_payload(result, entity_graph, aggregate_stats, question)
+
+    return {
+        "dashboard": result,
+        "entity_graph": entity_graph,
+        "stats": aggregate_stats,
+        "files_written": {
+            "dashboard_json": str(json_path),
+            "graph_json": str(graph_path),
+        }
+    }
 
 
 if __name__ == "__main__":
