@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v3 — Grounded Intent-First Architecture
+ATIS_Query.py v3.1 — Grounded Intent-First Architecture
 
 3-STAGE PIPELINE:
-  0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call, cheap)
+  0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
   1. BROAD PRE-FILTER:     Python loose matching → ~80 candidates (0 calls)
   2. LLM SEMANTIC RANKING: LLM reads candidates → ranks top 20 by relevance (1 call)
   3. GROUNDED SYNTHESIS:   LLM synthesizes dashboard from ranked nodes ONLY (1 call)
-                           Every claim cites source_node. Hallucination impossible.
 
-ANTI-HALLUCINATION GUARANTEES:
-  - LLM only sees provided node summaries. No external knowledge.
-  - Every structured_intelligence row has "source_node" field.
-  - Every finding/opportunity/risk has "source_nodes" array.
-  - Executive summary names specific entities and their roles.
-  - If data missing → "Not found in vault" instead of fabrication.
+BACKWARD COMPATIBILITY:
+  - findings/opportunities/risks returned as STRING arrays (v0 compatible)
+  - Cited versions available in findings_cited/opportunities_cited/risks_cited
+  - Response is flat: no nested .dashboard wrapper
+
+ANTI-HALLUCINATION:
+  - LLM only sees provided nodes
+  - Every claim must cite source_node
+  - Missing data → "Not found in vault"
 """
 
 from __future__ import annotations
@@ -106,7 +108,7 @@ INTENT_EXTRACTION_PROMPT: str = (
     "}\n\n"
     "RULES:\n"
     "- intent_type: OVERVIEW for broad summaries, SPECIFIC_ENTITY for 'who is X', FILTERED_LIST for 'which X are Y', RELATIONSHIP for 'who regulates X'.\n"
-    "- target_entities: extract ONLY concrete nouns. Strip vague words.\n"
+    "- target_entities: extract ONLY concrete nouns. Strip vague words like overview, intelligence, information, data, summary, landscape.\n"
     "- max_results_hint: OVERVIEW=20, SPECIFIC_ENTITY=3, FILTERED_LIST=15, RELATIONSHIP=8.\n"
     "- Output ONLY raw JSON."
 )
@@ -152,8 +154,8 @@ GROUNDED_SYNTHESIS_PROMPT: str = (
     "You MUST NOT use any external knowledge. If information is not in the provided nodes, say 'Not found in vault'.\n\n"
     "ANTI-HALLUCINATION RULES (violation = invalid output):\n"
     "1. Every claim in structured_intelligence MUST have a 'source_node' field containing the exact node ID.\n"
-    "2. Every item in findings[], opportunities[], risks[] MUST have a 'source_nodes' array with at least one node ID.\n"
-    "3. Every entity in key_entities[] MUST correspond to a provided node.\n"
+    "2. Every item in findings[], opportunities[], risks[] MUST have a 'text' field and a 'source_nodes' array with at least one node ID.\n"
+    "3. Every entity in key_entities[] MUST correspond to a provided node and have a 'source_node' field.\n"
     "4. The executive_summary MUST reference specific entities by their exact names and explain their roles.\n"
     "5. If you cannot verify a claim from the provided nodes, output 'Not found in vault' for that field.\n"
     "6. Do NOT invent statistics, dates, or facts not present in the nodes.\n\n"
@@ -608,7 +610,7 @@ class CerebrasQueryEngine:
             return ATISIntent({"intent_type": "OVERVIEW", "target_entities": [], "target_entity_types": [], "max_results_hint": 20})
 
     # -----------------------------------------------------------------
-    # STAGE 1: Broad Pre-Filter (Python only)
+    # STAGE 1: Broad Pre-Filter
     # -----------------------------------------------------------------
     def broad_pre_filter(self, vault_mgr: ObsidianVaultManager, intent: ATISIntent) -> List[VaultNode]:
         logger.info("STAGE 1: BROAD PRE-FILTER")
@@ -617,8 +619,6 @@ class CerebrasQueryEngine:
 
         for node in all_nodes:
             score = 0.0
-
-            # Entity type match
             node_type = (node.entity_type or "").lower()
             for target_type in intent.target_entity_types:
                 tt = target_type.lower().replace("_", "")
@@ -626,19 +626,16 @@ class CerebrasQueryEngine:
                 if tt == nt or tt in nt or nt in tt:
                     score += 8.0
 
-            # Country match
             node_country = (node.country or "").lower()
             for tc in intent.target_countries:
                 if tc.lower() in node_country:
                     score += 6.0
 
-            # Sector match
             node_sector = (node.sector or "").lower()
             for ts in intent.target_sectors:
                 if ts.lower() in node_sector:
                     score += 5.0
 
-            # Name/content match
             node_name = node.uid.lower().replace("_", " ").replace("-", " ")
             content = f"{node.summary} {node.body_preview}".lower()
             for entity in intent.target_entities:
@@ -650,12 +647,10 @@ class CerebrasQueryEngine:
                 if ec in content:
                     score += 2.0
 
-            # Attribute match
             for attr_key, attr_val in intent.target_attributes.items():
                 if attr_val.lower() in content:
                     score += 3.0
 
-            # Hub bonus for overview
             if intent.intent_type == "OVERVIEW":
                 score += (len(node.outbound_links) + len(node.backlink_uids)) * 0.3
 
@@ -678,7 +673,6 @@ class CerebrasQueryEngine:
         if not candidates:
             return []
 
-        # Build compact candidate summaries
         candidate_blocks = []
         for node in candidates:
             block = (
@@ -704,7 +698,6 @@ class CerebrasQueryEngine:
             f"Return ONLY raw JSON with ranked_nodes array."
         )
 
-        # Token guard
         if self.token_budget.estimate(SEMANTIC_RANKING_PROMPT + user_prompt) > self.token_budget.available_for_input:
             max_chars = int(self.token_budget.available_for_input * 3.2) - len(SEMANTIC_RANKING_PROMPT)
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
@@ -717,7 +710,6 @@ class CerebrasQueryEngine:
             max_tokens=2048
         )
 
-        # Parse ranking
         try:
             ranking_data = json.loads(raw_response)
             ranked_list = ranking_data.get("ranked_nodes", [])
@@ -725,16 +717,12 @@ class CerebrasQueryEngine:
             logger.warning("Failed to parse ranking JSON: %s. Using top candidates by score.", exc)
             return candidates[:LLM_RANKING_MAX_RESULTS]
 
-        # Map ranked node_ids back to VaultNode objects
         ranked_nodes = []
         candidate_map = {n.uid: n for n in candidates}
         for item in ranked_list:
             node_id = item.get("node_id", "")
             if node_id in candidate_map:
                 node = candidate_map[node_id]
-                # Attach ranking metadata for debugging
-                node._ranking_score = item.get("relevance_score", 0)
-                node._ranking_reason = item.get("reasoning", "")
                 ranked_nodes.append(node)
                 logger.info("  Ranked: %s (score=%s, reason=%s)",
                             node_id, item.get("relevance_score"), item.get("reasoning", "")[:60])
@@ -752,7 +740,6 @@ class CerebrasQueryEngine:
         if not ranked_nodes:
             return self._generate_empty_response(question, intent)
 
-        # Build rich context from ranked nodes
         node_blocks = []
         for node in ranked_nodes:
             fm_fields = []
@@ -790,7 +777,7 @@ class CerebrasQueryEngine:
             f"## CRITICAL RULES\n"
             f"1. Executive summary: 6-10 sentences. Name specific entities. Explain their roles and relationships.\n"
             f"2. Every structured_intelligence row MUST have 'source_node' = exact node ID from above.\n"
-            f"3. Every finding/opportunity/risk MUST have 'source_nodes' array with node IDs.\n"
+            f"3. Every finding/opportunity/risk MUST have 'text' and 'source_nodes' array with node IDs.\n"
             f"4. If information is missing, write 'Not found in vault' — do NOT invent facts.\n"
             f"5. Output ONLY raw JSON."
         )
@@ -821,18 +808,23 @@ class CerebrasQueryEngine:
             match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             data = json.loads(match.group(0)) if match else {}
 
-        # Validate citations exist
+        # Ensure all sections are lists
+        for section in ["structured_intelligence", "findings", "opportunities", "risks", "key_entities"]:
+            if section not in data or not isinstance(data[section], list):
+                data[section] = []
+
         source_node_ids = {n.uid for n in source_nodes}
+
+        # Validate structured_intelligence citations
         validated_intel = []
         for row in data.get("structured_intelligence", []):
             if row.get("source_node") in source_node_ids:
                 validated_intel.append(row)
             else:
                 row["source_node"] = "citation_missing"
-                row["insight"] = "[CITATION MISSING] " + row.get("insight", "")
                 validated_intel.append(row)
 
-        # Validate findings/opportunities/risks citations
+        # Validate findings/opportunities/risks
         for section in ["findings", "opportunities", "risks"]:
             items = data.get(section, [])
             validated = []
@@ -872,7 +864,7 @@ class CerebrasQueryEngine:
         }
 
     # -----------------------------------------------------------------
-    # FULL VAULT SCAN (capped, single-shot)
+    # FULL VAULT SCAN
     # -----------------------------------------------------------------
     def full_vault_scan(self, vault_mgr: ObsidianVaultManager) -> Dict[str, Any]:
         logger.info("MODE A: FULL VAULT SCAN")
@@ -887,8 +879,7 @@ class CerebrasQueryEngine:
 
         system_prompt = (
             "You are the ATIS Master Intelligence Synthesizer. Given vault summaries, "
-            "produce a high-level dashboard. Output ONLY raw JSON. "
-            "Every claim must cite source nodes."
+            "produce a high-level dashboard. Output ONLY raw JSON. Every claim must cite source nodes."
         )
         user_prompt = (
             f"## VAULT SUMMARY\nTotal: {len(all_nodes)}\n\n{context}\n\n"
@@ -913,16 +904,9 @@ class CerebrasQueryEngine:
         if not question:
             return self.full_vault_scan(vault_mgr)
 
-        # Stage 0: Intent
         intent = self.extract_intent(question)
-
-        # Stage 1: Broad pre-filter
         candidates = self.broad_pre_filter(vault_mgr, intent)
-
-        # Stage 2: LLM semantic ranking
         ranked_nodes = self.llm_semantic_ranking(question, intent, candidates)
-
-        # Stage 3: Grounded synthesis
         result = self.grounded_synthesis(question, intent, ranked_nodes)
 
         entity_graph = vault_mgr.build_entity_graph(ranked_nodes)
@@ -983,7 +967,7 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
             "model_primary": "gpt-oss-120b",
             "model_fallback": "gemma-4-31b",
-            "pipeline_version": "grounded_v3",
+            "pipeline_version": "grounded_v3_1",
         },
     }
 
@@ -999,10 +983,17 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
 
 
 # =============================================================================
-# WEB ENTRY POINT
+# WEB ENTRY POINT — BACKWARD COMPATIBLE
 # =============================================================================
 def run_query_pipeline(question: str | None = None,
                        vault_path: str | Path = "./vault") -> Dict[str, Any]:
+    """
+    Web-compatible entry point.
+    Returns FLAT backward-compatible shape for v0 frontend:
+      - findings/opportunities/risks are STRING arrays
+      - Cited versions in *_cited fields
+      - No nested .dashboard wrapper
+    """
     vault_mgr = ObsidianVaultManager(Path(vault_path))
     vault_mgr.build_index()
 
@@ -1015,10 +1006,49 @@ def run_query_pipeline(question: str | None = None,
     entity_graph = result.pop("entity_graph", {})
     aggregate_stats = result.pop("stats", {})
 
-    json_path, graph_path = persist_query_payload(result, entity_graph, aggregate_stats, question)
+    # Extract raw cited versions
+    raw_findings = result.get("findings", [])
+    raw_opportunities = result.get("opportunities", [])
+    raw_risks = result.get("risks", [])
 
+    # Flatten to strings for v0 compatibility
+    findings_strings = [
+        f.get("text", str(f)) if isinstance(f, dict) else str(f)
+        for f in raw_findings
+    ]
+    opportunities_strings = [
+        o.get("text", str(o)) if isinstance(o, dict) else str(o)
+        for o in raw_opportunities
+    ]
+    risks_strings = [
+        r.get("text", str(r)) if isinstance(r, dict) else str(r)
+        for r in raw_risks
+    ]
+
+    # Persist full cited version to disk
+    full_result = {
+        **result,
+        "findings": raw_findings,
+        "opportunities": raw_opportunities,
+        "risks": raw_risks,
+    }
+    json_path, graph_path = persist_query_payload(full_result, entity_graph, aggregate_stats, question)
+
+    # Return FLAT backward-compatible shape
     return {
-        "dashboard": result,
+        "executive_summary": result.get("executive_summary", ""),
+        "structured_intelligence": result.get("structured_intelligence", []),
+        "findings": findings_strings,
+        "opportunities": opportunities_strings,
+        "risks": risks_strings,
+        "key_entities": result.get("key_entities", []),
+        # Cited versions for future frontend upgrades
+        "findings_cited": raw_findings,
+        "opportunities_cited": raw_opportunities,
+        "risks_cited": raw_risks,
+        "source_nodes": result.get("source_nodes", []),
+        "intent": result.get("intent", {}),
+        "filter_stats": result.get("filter_stats", {}),
         "entity_graph": entity_graph,
         "stats": aggregate_stats,
         "files_written": {
@@ -1033,7 +1063,7 @@ def run_query_pipeline(question: str | None = None,
 # =============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ATIS Query v3 — Grounded Intent-First Pipeline",
+        description="ATIS Query v3.1 — Grounded Intent-First Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--vault_path", default="./vault", help="Path to Obsidian vault root.")
@@ -1050,7 +1080,7 @@ def main() -> None:
 
     if question:
         logger.info("=" * 70)
-        logger.info("MODE B: QUESTION-DRIVEN QUERY (Grounded v3)")
+        logger.info("MODE B: QUESTION-DRIVEN QUERY (Grounded v3.1)")
         logger.info("Question: %s", question)
         logger.info("=" * 70)
     else:
@@ -1062,8 +1092,9 @@ def main() -> None:
         result = run_query_pipeline(question, vault_path)
         print(f"\nSUCCESS: {result['files_written']['dashboard_json']}")
         print(f"SUCCESS: {result['files_written']['graph_json']}")
-        print(f"\nEXECUTIVE SUMMARY:\n{result['dashboard'].get('executive_summary', 'N/A')}")
-        print(f"\nFILTER STATS: {result['dashboard'].get('filter_stats', {})}")
+        print(f"\nEXECUTIVE SUMMARY:\n{result.get('executive_summary', 'N/A')}")
+        print(f"\nFILTER STATS: {result.get('filter_stats', {})}")
+        print(f"\nFINDINGS (strings): {result.get('findings', [])[:3]}")
     except Exception as exc:
         logger.error("Pipeline failed: %s", exc)
         sys.exit(1)
