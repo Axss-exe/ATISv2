@@ -4,7 +4,7 @@ ATIS Intelligence API — Render Web Service Entry Point
 
 Features:
   - CORS configured for Vercel frontend
-  - Vault entity listing (no LLM, instant)
+  - Vault entity listing with full profile content (cached, no LLM, instant)
   - 60-second hard timeout on all LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Circuit breaker for Cerebras quota exhaustion
@@ -87,6 +87,10 @@ _pipeline_in_progress = False
 # Simple in-memory cache for query results
 _query_cache: Dict[str, Any] = {}
 
+# Entity cache — rebuilds only when files change
+_entities_cache: Dict[str, Any] | None = None
+_entities_cache_mtime: float = 0.0
+
 # =============================================================================
 # Request models
 # =============================================================================
@@ -140,46 +144,72 @@ async def health():
         "service": "ATIS API",
         "pipeline_busy": _pipeline_in_progress,
         "cached_queries": len(_query_cache),
+        "cached_entities": _entities_cache is not None,
     }
 
 # -----------------------------------------------------------------------------
-# Entity listing (lightweight, no LLM)
+# Entity listing (lightweight, no LLM, cached)
 # -----------------------------------------------------------------------------
 @app.get("/api/entities")
 async def list_entities():
     """
-    Returns all business entity names from the vault.
-    Scans vault/Zimbabwe/Zimbabwe Businesses/Companies for .md files.
+    Returns all business entity profiles from the vault.
+    Scans vault/Zimbabwe/Zimbabwe Businesses/Companies for .md files
+    and reads their contents directly. Cached — rebuilds only on file changes.
     """
+    global _entities_cache, _entities_cache_mtime
+
     entities_dir = _vault_path / "Zimbabwe" / "Zimbabwe Businesses" / "Companies"
-    
+
     if not entities_dir.exists():
-        # Try alternate path separators for cross-platform
-        alt_dir = _vault_path / "Zimbabwe" / "Zimbabwe Businesses" / "Companies"
-        if not alt_dir.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Entities directory not found: {entities_dir}"
-            )
-        entities_dir = alt_dir
-    
-    md_files = sorted(entities_dir.glob("*.md"))
-    entities = [
-        {
-            "id": f.stem,
-            "name": f.stem.replace("_", " ").replace("-", " "),
-            "filename": f.name,
-            "path": str(f.relative_to(_vault_path))
-        }
-        for f in md_files
-    ]
-    
-    return {
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entities directory not found: {entities_dir}"
+        )
+
+    # --- Cache invalidation: rebuild only if directory changed ---
+    md_files = list(entities_dir.glob("*.md"))
+    current_mtime = max(
+        (f.stat().st_mtime for f in md_files),
+        default=0.0
+    )
+
+    if _entities_cache is not None and current_mtime <= _entities_cache_mtime:
+        logger.info("Serving entities from cache (%d profiles)", _entities_cache["count"])
+        return _entities_cache
+
+    # --- Build fresh ---
+    logger.info("Building entity profile cache from %d files...", len(md_files))
+    entities = []
+    start = time.time()
+
+    for f in sorted(md_files):
+        try:
+            content = f.read_text(encoding="utf-8")
+            entities.append({
+                "id": f.stem,
+                "name": f.stem.replace("_", " ").replace("-", " "),
+                "filename": f.name,
+                "path": str(f.relative_to(_vault_path)),
+                "content": content,
+                "size_bytes": f.stat().st_size,
+            })
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", f.name, exc)
+            continue
+
+    elapsed = time.time() - start
+    logger.info("Entity cache built in %.3fs — %d profiles loaded", elapsed, len(entities))
+
+    _entities_cache = {
         "status": "success",
         "count": len(entities),
         "directory": str(entities_dir),
-        "entities": entities
+        "entities": entities,
     }
+    _entities_cache_mtime = current_mtime
+
+    return _entities_cache
 
 # -----------------------------------------------------------------------------
 # News pipeline
@@ -191,7 +221,7 @@ async def news_endpoint(request: NewsRequest):
             "status": "busy",
             "detail": "Another pipeline is running. Please wait and retry."
         }
-    
+
     try:
         start = time.time()
         result = await _run_with_timeout(
@@ -221,7 +251,7 @@ async def execute_endpoint(request: ExecuteRequest):
             "status": "busy",
             "detail": "Another pipeline is running. Please wait and retry."
         }
-    
+
     try:
         start = time.time()
         result = await _run_with_timeout(
@@ -249,7 +279,7 @@ async def execute_endpoint(request: ExecuteRequest):
 async def query_endpoint(request: QueryRequest):
     # Cache key based on question content
     cache_key = hashlib.sha256((request.question or "full_scan").encode()).hexdigest()[:16]
-    
+
     if cache_key in _query_cache:
         logger.info("Cache hit for query: %s", cache_key)
         return {
@@ -257,13 +287,13 @@ async def query_endpoint(request: QueryRequest):
             "cached": True,
             "data": _query_cache[cache_key]
         }
-    
+
     if not _acquire_pipeline_lock():
         return {
             "status": "busy",
             "detail": "Another pipeline is running. Please wait and retry."
         }
-    
+
     try:
         start = time.time()
         result = await _run_with_timeout(
@@ -273,10 +303,10 @@ async def query_endpoint(request: QueryRequest):
         )
         elapsed = time.time() - start
         logger.info("Query pipeline completed in %.1fs", elapsed)
-        
+
         # Cache the result
         _query_cache[cache_key] = result
-        
+
         return {
             "status": "success",
             "cached": False,
