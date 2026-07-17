@@ -1,0 +1,245 @@
+{
+  "query_id": "ATIS-QUERY-20260717_104537",
+  "user_question": "Who regulates Lithium in zimbabwe",
+  "executive_summary": "Lithium mining in Zimbabwe is regulated primarily by the Ministry of Mines and Mining Development, which issues Mining Leases and Exclusive Prospecting Orders under the Mines and Minerals Act. The Ministry grants exclusive rights to explore and extract lithium, as demonstrated by the Arcadia Lithium Mine operating under its authority. Marketing and export of lithium are controlled by the Minerals Marketing Corporation of Zimbabwe (MMCZ), which requires a Mineral Marketing Registration for any sale of the mineral. The Environmental Management Agency (EMA) and the Mining Affairs Board (MAB) also play supporting regulatory roles, ensuring environmental compliance and overseeing mining affairs respectively. This regulatory framework creates a structured pathway for foreign investment, as seen with the foreign‑owned Arcadia Lithium Mine. However, the involvement of multiple agencies introduces compliance complexity, posing a risk for new entrants. Understanding these relationships is crucial for stakeholders to navigate licensing, marketing, and environmental requirements effectively.",
+  "intent": {
+    "type": "RELATIONSHIP",
+    "entities": [
+      "Lithium"
+    ],
+    "entity_types": [
+      "commodity"
+    ],
+    "countries": [
+      "zimbabwe"
+    ],
+    "sectors": []
+  },
+  "filter_stats": {
+    "vault_total": 714,
+    "candidates_after_broad_filter": 80,
+    "ranked_by_llm": 5
+  },
+  "stats": {
+    "total_entities": 5,
+    "total_relationships": 29,
+    "commodities_tracked": 14,
+    "countries_covered": 2,
+    "entity_type_breakdown": {
+      "mining_refinery": 3,
+      "mine": 1,
+      "infrastructure_node": 1
+    }
+  },
+  "entity_graph": {
+    "viewBox": "0 0 700 280",
+    "height": 280,
+    "nodes": [
+      {
+        "id": "Mining Lease _ Mining Title",
+        "label": "Mining Lease _ Mining Title",
+        "type": "mining_refinery",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 50,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "The **Ministry of Mines and Mining Development** issues a Mining Lease, also known as a Mining Title, under the provisio"
+      },
+      {
+        "id": "Exclusive Prospecting Order",
+        "label": "Exclusive Prospecting Order",
+        "type": "mining_refinery",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 130,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "The **Exclusive Prospecting Order** is a regulatory instrument issued by the **Ministry of Mines and Mining Development*"
+      },
+      {
+        "id": "Mineral Marketing Registration",
+        "label": "Mineral Marketing Registration",
+        "type": "mining_refinery",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 210,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "The **Minerals Marketing Corporation of Zimbabwe (MMCZ)** issues a Mineral Marketing Registration under the **MMCZ Act**"
+      },
+      {
+        "id": "Arcadia Lithium Mine",
+        "label": "Arcadia Lithium Mine",
+        "type": "mine",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 290,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "## Core Information\n**Type:** mine\n**Sector:** mining\n**Ownership:** foreign_owned\n**Location:** [[Goromonzi]], [[Mashon"
+      },
+      {
+        "id": "Lithium",
+        "label": "Lithium",
+        "type": "infrastructure_node",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 370,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "A soft, silvery-white alkali metal, the lightest solid element. Essential for energy storage. Does not occur free in nat"
+      }
+    ],
+    "edges": []
+  },
+  "structured_intelligence": [
+    {
+      "entity": "Ministry of Mines and Mining Development",
+      "type": "government_agency",
+      "country": "Zimbabwe",
+      "relationship": "regulates",
+      "status": "Operational",
+      "priority": "Critical",
+      "insight": "Regulates lithium mining activities through mining leases and prospecting orders under the Mines and Minerals Act.",
+      "source_node": "Mining Lease _ Mining Title"
+    },
+    {
+      "entity": "Minerals Marketing Corporation of Zimbabwe (MMCZ)",
+      "type": "state_owned_corporation",
+      "country": "Zimbabwe",
+      "relationship": "regulates",
+      "status": "Operational",
+      "priority": "High",
+      "insight": "Controls marketing and export of lithium via mandatory Mineral Marketing Registration.",
+      "source_node": "Mineral Marketing Registration"
+    }
+  ],
+  "findings": [
+    {
+      "text": "Lithium mining is governed by the Ministry of Mines and Mining Development through Mining Leases and Exclusive Prospecting Orders.",
+      "source_nodes": [
+        "Mining Lease _ Mining Title",
+        "Exclusive Prospecting Order"
+      ]
+    },
+    {
+      "text": "The Arcadia Lithium Mine operates under the regulatory oversight of multiple agencies including the Ministry of Mines, EMA, and MAB.",
+      "source_nodes": [
+        "Arcadia Lithium Mine"
+      ]
+    }
+  ],
+  "opportunities": [
+    {
+      "text": "Foreign investment potential is evident with the Arcadia Lithium Mine, which functions under existing licensing frameworks.",
+      "source_nodes": [
+        "Arcadia Lithium Mine"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "text": "Compliance complexity arises from the involvement of several regulatory bodies (Ministry, EMA, MAB, MMCZ) for lithium projects.",
+      "source_nodes": [
+        "Arcadia Lithium Mine"
+      ]
+    }
+  ],
+  "key_entities": [
+    {
+      "entity_name": "Mining Lease _ Mining Title",
+      "entity_type": "mining_refinery",
+      "country": "Zimbabwe",
+      "sector": "N/A",
+      "significance_score": 9,
+      "related_count": 2,
+      "summary": "The Ministry of Mines and Mining Development issues a Mining Lease, also known as a Mining Title, under the provisions of the Mines and Minerals Act, granting the holder exclusive rights to explore, develop, and extract specified mineral resources within a defined geographic area.",
+      "source_node": "Mining Lease _ Mining Title"
+    },
+    {
+      "entity_name": "Exclusive Prospecting Order",
+      "entity_type": "mining_refinery",
+      "country": "Zimbabwe",
+      "sector": "N/A",
+      "significance_score": 8,
+      "related_count": 2,
+      "summary": "The Exclusive Prospecting Order is a regulatory instrument issued by the Ministry of Mines and Mining Development under the provisions of the Mines and Minerals Act, granting a designated applicant the sole right to explore a specified mineral resource area for a defined period.",
+      "source_node": "Exclusive Prospecting Order"
+    },
+    {
+      "entity_name": "Mineral Marketing Registration",
+      "entity_type": "mining_refinery",
+      "country": "Zimbabwe",
+      "sector": "N/A",
+      "significance_score": 7,
+      "related_count": 1,
+      "summary": "The Minerals Marketing Corporation of Zimbabwe (MMCZ) issues a Mineral Marketing Registration under the MMCZ Act as a compulsory licence that authorises mining entities to legally market, sell, and export their mineral products through the corporation’s regulated channels.",
+      "source_node": "Mineral Marketing Registration"
+    },
+    {
+      "entity_name": "Arcadia Lithium Mine",
+      "entity_type": "mine",
+      "country": "N/A",
+      "sector": "mining",
+      "significance_score": 9,
+      "related_count": 7,
+      "summary": "Arcadia Lithium Mine is a foreign‑owned mining operation located in Goromonzi, Mashonaland East, linked to the Ministry of Mines and Mining Development, EMA, RBZ, MAB, and the Mines and Minerals Act.",
+      "source_node": "Arcadia Lithium Mine"
+    },
+    {
+      "entity_name": "Lithium",
+      "entity_type": "infrastructure_node",
+      "country": "N/A",
+      "sector": "N/A",
+      "significance_score": 6,
+      "related_count": 0,
+      "summary": "A soft, silvery‑white alkali metal, the lightest solid element. Essential for energy storage. Does not occur free in nature.",
+      "source_node": "Lithium"
+    }
+  ],
+  "source_nodes": [
+    {
+      "id": "Mining Lease _ Mining Title",
+      "type": "mining_refinery"
+    },
+    {
+      "id": "Exclusive Prospecting Order",
+      "type": "mining_refinery"
+    },
+    {
+      "id": "Mineral Marketing Registration",
+      "type": "mining_refinery"
+    },
+    {
+      "id": "Arcadia Lithium Mine",
+      "type": "mine"
+    },
+    {
+      "id": "Lithium",
+      "type": "infrastructure_node"
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-17T10:45:37.254238+00:00",
+    "vault_files_scanned": 5,
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b",
+    "pipeline_version": "grounded_v3"
+  }
+}

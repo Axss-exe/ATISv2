@@ -1,0 +1,21 @@
+{
+  "viewBox": "0 0 700 280",
+  "height": 280,
+  "nodes": [
+    {
+      "id": "Arcadia_lithium_project",
+      "label": "Arcadia_lithium_project",
+      "type": "PRIVATE_CONGLOMERATE",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 50,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "# Arcadia lithium project\n\n- Requires [[Continuous Baseload Power Grid]]\n- Requires [[Industrial Bulk Water Source]]\n- R"
+    }
+  ],
+  "edges": []
+}

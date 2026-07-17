@@ -1,0 +1,302 @@
+{
+  "query_id": "ATIS-QUERY-20260717_085736",
+  "user_question": "Who regulates Lithium in zimbabwe",
+  "executive_summary": "In Zimbabwe, lithium mining activities are overseen primarily by the Environmental Management Agency (EMA). The EMA is cited as the regulator for the Arcadia lithium project, indicating its role in governing lithium extraction and related environmental compliance.",
+  "intent": {
+    "type": "RELATIONSHIP",
+    "entities": [
+      "Lithium"
+    ],
+    "entity_types": [
+      "commodity"
+    ],
+    "countries": [
+      "zimbabwe"
+    ],
+    "sectors": []
+  },
+  "filter_stats": {
+    "vault_total": 728,
+    "filtered_count": 8,
+    "filter_ratio": "8/728"
+  },
+  "stats": {
+    "total_entities": 8,
+    "total_relationships": 9,
+    "commodities_tracked": 14,
+    "countries_covered": 2,
+    "risk_flags": 21,
+    "entity_type_breakdown": {
+      "COMMODITY": 4,
+      "PRIVATE_CONGLOMERATE": 1,
+      "infrastructure_node": 1,
+      "POLICY_FRAMEWORK": 1,
+      "commodity": 1
+    }
+  },
+  "entity_graph": {
+    "viewBox": "0 0 700 280",
+    "height": 280,
+    "nodes": [
+      {
+        "id": "Battery‑grade_lithium_carbonate",
+        "label": "Battery‑grade_lithium_carbonate",
+        "type": "COMMODITY",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 50,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Battery‑grade lithium carbonate\n\n- Shadow node for Battery‑grade lithium carbonate\n- Classification: [COMMODITY]"
+      },
+      {
+        "id": "Lithium_carbonate",
+        "label": "Lithium_carbonate",
+        "type": "COMMODITY",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 130,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Lithium carbonate\n\n- Shadow node for Lithium carbonate\n- Classification: [COMMODITY]"
+      },
+      {
+        "id": "Lithium_concentrate",
+        "label": "Lithium_concentrate",
+        "type": "COMMODITY",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 210,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Lithium concentrate\n\n- Shadow node for Lithium concentrate\n- Classification: [COMMODITY]"
+      },
+      {
+        "id": "Lithium_sulphate",
+        "label": "Lithium_sulphate",
+        "type": "COMMODITY",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 290,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Lithium sulphate\n\n- Shadow node for Lithium sulphate\n- Classification: [COMMODITY]"
+      },
+      {
+        "id": "Arcadia_lithium_project",
+        "label": "Arcadia_lithium_project",
+        "type": "PRIVATE_CONGLOMERATE",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 370,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Arcadia lithium project\n\n- Requires [[Continuous Baseload Power Grid]]\n- Requires [[Industrial Bulk Water Source]]\n- R"
+      },
+      {
+        "id": "Lithium",
+        "label": "Lithium",
+        "type": "infrastructure_node",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 450,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "A soft, silvery-white alkali metal, the lightest solid element. Essential for energy storage. Does not occur free in nat"
+      },
+      {
+        "id": "Strategic_lithium_stockpile_initiative",
+        "label": "Strategic_lithium_stockpile_initiative",
+        "type": "POLICY_FRAMEWORK",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 530,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Strategic lithium stockpile initiative\n\n- Shadow node for Strategic lithium stockpile initiative\n- Classification: [PO"
+      },
+      {
+        "id": "Tobacco Contracting Licence",
+        "label": "Tobacco Contracting Licence",
+        "type": "commodity",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 610,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "The **Tobacco Contracting Licence** is granted by the **[[Tobacco Industry and Marketing Board (TIMB)]]** under the **To"
+      }
+    ],
+    "edges": []
+  },
+  "structured_intelligence": [
+    {
+      "entity": "Lithium",
+      "type": "COMMODITY",
+      "country": "Zimbabwe",
+      "relationship": "Regulated by",
+      "status": "Inferred",
+      "priority": "Medium",
+      "insight": "Regulation of lithium extraction is likely administered by the Environmental Management Agency, as it governs similar mining projects."
+    },
+    {
+      "entity": "Arcadia lithium project",
+      "type": "PRIVATE_CONGLOMERATE",
+      "country": "Zimbabwe",
+      "relationship": "Regulated by",
+      "status": "Confirmed",
+      "priority": "High",
+      "insight": "The project explicitly lists the Environmental Management Agency as its regulator, confirming EMA's authority over lithium projects."
+    },
+    {
+      "entity": "Environmental Management Agency",
+      "type": "GOVERNMENT_AGENCY",
+      "country": "Zimbabwe",
+      "relationship": "Regulates",
+      "status": "Confirmed",
+      "priority": "High",
+      "insight": "EMA is the designated body for environmental licensing and compliance for mining activities, including lithium."
+    },
+    {
+      "entity": "Strategic lithium stockpile initiative",
+      "type": "POLICY_FRAMEWORK",
+      "country": "Zimbabwe",
+      "relationship": "Guides",
+      "status": "Potential",
+      "priority": "Low",
+      "insight": "A policy framework may shape future regulation and strategic reserves, but its current implementation status is unclear."
+    }
+  ],
+  "findings": [
+    "The Environmental Management Agency (EMA) is explicitly mentioned as the regulator for the Arcadia lithium project.",
+    "No direct regulator is listed for lithium as a commodity in the provided nodes, requiring inference from project-level regulation.",
+    "Zimbabwe's existing regulatory structures for mining (e.g., Ministry of Mines) are not captured in the current dataset.",
+    "The presence of a strategic lithium stockpile initiative suggests emerging policy interest in lithium.",
+    "Regulatory clarity for lithium remains limited, potentially affecting investment decisions."
+  ],
+  "opportunities": [
+    "Engage EMA to clarify licensing requirements for new lithium projects.",
+    "Develop a dedicated lithium regulatory framework to attract foreign investment.",
+    "Leverage the strategic stockpile initiative to secure government support for lithium development.",
+    "Partner with existing mining firms to pilot environmentally compliant lithium extraction.",
+    "Create public‑private partnerships that align EMA standards with industry best practices."
+  ],
+  "risks": [
+    "Regulatory ambiguity may lead to project delays or non‑compliance penalties.",
+    "Environmental licensing bottlenecks could increase operational costs.",
+    "Lack of a specific lithium policy may expose investors to policy shifts.",
+    "Potential conflicts between EMA requirements and other mining authorities.",
+    "Insufficient data on Zimbabwe's lithium reserves could hinder strategic planning."
+  ],
+  "key_entities": [
+    {
+      "entity_name": "Lithium",
+      "entity_type": "COMMODITY",
+      "country": "Zimbabwe",
+      "sector": "Mining",
+      "significance_score": 8,
+      "related_count": 3,
+      "summary": "Strategic mineral for energy storage; regulation inferred through EMA oversight."
+    },
+    {
+      "entity_name": "Environmental Management Agency",
+      "entity_type": "GOVERNMENT_AGENCY",
+      "country": "Zimbabwe",
+      "sector": "Environmental Regulation",
+      "significance_score": 9,
+      "related_count": 4,
+      "summary": "Primary regulator for environmental compliance of mining projects, including lithium."
+    },
+    {
+      "entity_name": "Arcadia lithium project",
+      "entity_type": "PRIVATE_CONGLOMERATE",
+      "country": "Zimbabwe",
+      "sector": "Mining",
+      "significance_score": 7,
+      "related_count": 2,
+      "summary": "A lithium extraction venture explicitly regulated by EMA, serving as a reference case."
+    },
+    {
+      "entity_name": "Zimbabwe",
+      "entity_type": "COUNTRY",
+      "country": "Zimbabwe",
+      "sector": "National",
+      "significance_score": 10,
+      "related_count": 5,
+      "summary": "Geopolitical context for lithium regulation; hosts potential lithium resources and regulatory bodies."
+    }
+  ],
+  "source_nodes": [
+    {
+      "id": "Battery‑grade_lithium_carbonate",
+      "type": "COMMODITY",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Lithium_carbonate",
+      "type": "COMMODITY",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Lithium_concentrate",
+      "type": "COMMODITY",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Lithium_sulphate",
+      "type": "COMMODITY",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Arcadia_lithium_project",
+      "type": "PRIVATE_CONGLOMERATE",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Lithium",
+      "type": "infrastructure_node",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Strategic_lithium_stockpile_initiative",
+      "type": "POLICY_FRAMEWORK",
+      "score_reason": "matched_intent"
+    },
+    {
+      "id": "Tobacco Contracting Licence",
+      "type": "commodity",
+      "score_reason": "matched_intent"
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-17T08:57:36.430200+00:00",
+    "vault_files_scanned": 8,
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b",
+    "pipeline_version": "intent_first_v2"
+  }
+}

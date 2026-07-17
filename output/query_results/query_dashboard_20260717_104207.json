@@ -1,0 +1,124 @@
+{
+  "query_id": "ATIS-QUERY-20260717_104207",
+  "user_question": "Who regulates Lithium in zimbabwe",
+  "executive_summary": "The lithium sector in Zimbabwe is overseen by the Environmental Management Agency (EMA). EMA is the regulatory body that grants permits and ensures compliance for mining projects such as the Arcadia lithium project. The Arcadia lithium project, a private conglomerate, explicitly cites EMA as its regulator in its project documentation. This regulatory relationship ties the commodity extraction activities to national environmental standards and policy. The dashboard findings highlight that EMA’s oversight is the sole identified regulator for lithium, indicating a clear but singular governance structure. The primary opportunity lies in leveraging EMA’s framework to attract investment and ensure sustainable development of lithium resources. However, a key risk is potential project delays if EMA’s permitting processes become bottlenecked, which could impede the growth of Zimbabwe’s lithium industry.",
+  "intent": {
+    "type": "RELATIONSHIP",
+    "entities": [
+      "Lithium"
+    ],
+    "entity_types": [
+      "commodity"
+    ],
+    "countries": [
+      "zimbabwe"
+    ],
+    "sectors": []
+  },
+  "filter_stats": {
+    "vault_total": 728,
+    "candidates_after_broad_filter": 80,
+    "ranked_by_llm": 1
+  },
+  "stats": {
+    "total_entities": 1,
+    "total_relationships": 3,
+    "commodities_tracked": 14,
+    "countries_covered": 2,
+    "entity_type_breakdown": {
+      "PRIVATE_CONGLOMERATE": 1
+    }
+  },
+  "entity_graph": {
+    "viewBox": "0 0 700 280",
+    "height": 280,
+    "nodes": [
+      {
+        "id": "Arcadia_lithium_project",
+        "label": "Arcadia_lithium_project",
+        "type": "PRIVATE_CONGLOMERATE",
+        "shape": "rect",
+        "fill": "#1c1c1e",
+        "stroke": "#333",
+        "text_color": "#fff",
+        "x": 50,
+        "y": 40,
+        "width": 120,
+        "height": 50,
+        "summary": "# Arcadia lithium project\n\n- Requires [[Continuous Baseload Power Grid]]\n- Requires [[Industrial Bulk Water Source]]\n- R"
+      }
+    ],
+    "edges": []
+  },
+  "structured_intelligence": [
+    {
+      "entity": "Environmental Management Agency",
+      "type": "Regulatory Agency",
+      "country": "Zimbabwe",
+      "relationship": "regulates",
+      "status": "Operational",
+      "priority": "Critical",
+      "insight": "EMA oversees lithium mining activities in Zimbabwe.",
+      "source_node": "Arcadia_lithium_project"
+    }
+  ],
+  "findings": [
+    {
+      "text": "Lithium extraction projects in Zimbabwe are regulated by the Environmental Management Agency.",
+      "source_nodes": [
+        "Arcadia_lithium_project"
+      ]
+    }
+  ],
+  "opportunities": [
+    {
+      "text": "Opportunity to develop lithium projects under clear EMA guidelines, attracting investment.",
+      "source_nodes": [
+        "Arcadia_lithium_project"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "text": "Risk of project delays due to EMA permitting processes.",
+      "source_nodes": [
+        "Arcadia_lithium_project"
+      ]
+    }
+  ],
+  "key_entities": [
+    {
+      "entity_name": "Environmental Management Agency",
+      "entity_type": "Regulatory Agency",
+      "country": "Zimbabwe",
+      "sector": "Energy",
+      "significance_score": 9,
+      "related_count": 1,
+      "summary": "Regulates the Arcadia lithium project.",
+      "source_node": "Arcadia_lithium_project"
+    },
+    {
+      "entity_name": "Arcadia lithium project",
+      "entity_type": "Private Conglomerate",
+      "country": "Zimbabwe",
+      "sector": "Energy",
+      "significance_score": 8,
+      "related_count": 1,
+      "summary": "# Arcadia lithium project\n\n- Requires [[Continuous Baseload Power Grid]]\n- Requires [[Industrial Bulk Water Source]]\n- Regulated by [[Environmental Management Agency]]",
+      "source_node": "Arcadia_lithium_project"
+    }
+  ],
+  "source_nodes": [
+    {
+      "id": "Arcadia_lithium_project",
+      "type": "PRIVATE_CONGLOMERATE"
+    }
+  ],
+  "pipeline_metadata": {
+    "processed_at": "2026-07-17T10:42:07.325095+00:00",
+    "vault_files_scanned": 1,
+    "model_primary": "gpt-oss-120b",
+    "model_fallback": "gemma-4-31b",
+    "pipeline_version": "grounded_v3"
+  }
+}

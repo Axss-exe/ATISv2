@@ -1,0 +1,77 @@
+{
+  "viewBox": "0 0 700 280",
+  "height": 280,
+  "nodes": [
+    {
+      "id": "Mining Lease _ Mining Title",
+      "label": "Mining Lease _ Mining Title",
+      "type": "mining_refinery",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 50,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "The **Ministry of Mines and Mining Development** issues a Mining Lease, also known as a Mining Title, under the provisio"
+    },
+    {
+      "id": "Exclusive Prospecting Order",
+      "label": "Exclusive Prospecting Order",
+      "type": "mining_refinery",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 130,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "The **Exclusive Prospecting Order** is a regulatory instrument issued by the **Ministry of Mines and Mining Development*"
+    },
+    {
+      "id": "Mineral Marketing Registration",
+      "label": "Mineral Marketing Registration",
+      "type": "mining_refinery",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 210,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "The **Minerals Marketing Corporation of Zimbabwe (MMCZ)** issues a Mineral Marketing Registration under the **MMCZ Act**"
+    },
+    {
+      "id": "Arcadia Lithium Mine",
+      "label": "Arcadia Lithium Mine",
+      "type": "mine",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 290,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "## Core Information\n**Type:** mine\n**Sector:** mining\n**Ownership:** foreign_owned\n**Location:** [[Goromonzi]], [[Mashon"
+    },
+    {
+      "id": "Lithium",
+      "label": "Lithium",
+      "type": "infrastructure_node",
+      "shape": "rect",
+      "fill": "#1c1c1e",
+      "stroke": "#333",
+      "text_color": "#fff",
+      "x": 370,
+      "y": 40,
+      "width": 120,
+      "height": 50,
+      "summary": "A soft, silvery-white alkali metal, the lightest solid element. Essential for energy storage. Does not occur free in nat"
+    }
+  ],
+  "edges": []
+}
