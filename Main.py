@@ -5,6 +5,7 @@ ATIS Intelligence API — Render Web Service Entry Point
 Features:
   - CORS configured for Vercel frontend
   - Vault entity listing with recursive subfolder discovery & full profile content
+  - SINGLE ENTITY LOOKUP with slug-based IDs, backlink resolution & related vault traversal
   - 60-second hard timeout on all LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Emergency kill endpoint
@@ -16,11 +17,13 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import signal
 import threading
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +68,7 @@ app.add_middleware(
 # =============================================================================
 # Global state
 # =============================================================================
-_vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
+_vault_path = Path(os.getenv("VAULT_PATH", r"C:\Users\tmaki\Documents\ATIS\vault"))
 
 # Cache vault indexes at startup (skip re-indexing on every request)
 _query_vault: QueryVaultManager | None = None
@@ -133,57 +136,110 @@ async def _run_with_timeout(func, *args, timeout: float = 60.0, **kwargs):
         raise RuntimeError(f"Pipeline timed out after {timeout} seconds")
 
 # =============================================================================
+# NEW: Slug & decode utilities (fixes 404s and double-encoding)
+# =============================================================================
+def slugify(text: str) -> str:
+    """Create a stable, URL-safe slug from any vault filename or title."""
+    if not text:
+        return ""
+    text = urllib.parse.unquote(text)
+    text = text.strip()
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower())
+    text = re.sub(r"-+", "-", text)
+    return text.strip("-")
+
+def decode_entity_id(raw: str) -> str:
+    """Recursively URL-decode until stable (handles double-encoded URLs)."""
+    prev = ""
+    decoded = raw
+    while decoded != prev:
+        prev = decoded
+        decoded = urllib.parse.unquote(prev)
+    return decoded
+
+def _infer_entity_type(rel_path: Path) -> str:
+    """
+    Guess entity category from folder structure.
+    Examples:
+      Zimbabwe/Zimbabwe Businesses/...  -> 'business'
+      Zimbabwe/Zimbabwe Commodities/... -> 'commodity'
+      Zimbabwe/Zimbabwe Government/...  -> 'government'
+      Zimbabwe/Zimbabwe Infrastructure/... -> 'infrastructure'
+      Zimbabwe/Zimbabwe People/...      -> 'person'
+      Zimbabwe/Zimbabwe Region/...      -> 'region'
+    """
+    parts = [p.lower() for p in rel_path.parts]
+    type_hints = {
+        "businesses": "business",
+        "companies": "business",
+        "commodities": "commodity",
+        "minerals": "commodity",
+        "government": "government",
+        "agencies": "government",
+        "infrastructure": "infrastructure",
+        "people": "person",
+        "contacts": "person",
+        "region": "region",
+    }
+    for part in parts:
+        if part in type_hints:
+            return type_hints[part]
+    return "unknown"
+
+# =============================================================================
 # Entity Discovery Helpers
 # =============================================================================
 
 def _discover_entity_directories(vault: Path) -> List[Path]:
     """
-    Auto-discover directories that likely contain entity profiles.
-    Tries known paths first, then scans the vault structure recursively.
+    Auto-discover directories containing entity profiles.
+    Scans country folders (Zimbabwe, China, etc.) and their category subfolders
+    (Zimbabwe Businesses, Zimbabwe Commodities, Zimbabwe Government, etc.).
     """
     discovered: List[Path] = []
+    seen: Set[str] = set()
     
-    # --- Candidate paths to try (in order) ---
-    candidates = [
-        vault / "Zimbabwe" / "Zimbabwe Businesses" / "Companies",
-        vault / "Zimbabwe" / "Zimbabwe_Businesses" / "Companies",
-        vault / "Zimbabwe" / "Businesses" / "Companies",
-        vault / "Zimbabwe" / "Companies",
-        vault / "Businesses" / "Companies",
-        vault / "Entities" / "Companies",
-        vault / "Companies",
-        vault / "Entities",
-        vault / "Profiles",
-    ]
+    if not vault.exists():
+        logger.error("Vault path does not exist: %s", vault)
+        return discovered
     
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_dir():
-            # Recursively count .md files in this directory tree
-            md_count = len(list(candidate.rglob("*.md")))
-            logger.info("Candidate path exists: %s (%d .md files in tree)", candidate, md_count)
+    # --- Strategy 1: Country -> Category structure ---
+    # Vault root contains country folders. Each country has category folders.
+    country_dirs = [d for d in vault.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    
+    for country_dir in country_dirs:
+        # Check country root for .md files (e.g., Zimbabwe.md)
+        if any(country_dir.glob("*.md")):
+            key = str(country_dir.resolve())
+            if key not in seen:
+                seen.add(key)
+                discovered.append(country_dir)
+                logger.info("Discovered country root: %s", country_dir.relative_to(vault))
+        
+        # Check category subfolders (e.g., Zimbabwe Businesses, Zimbabwe Commodities)
+        for category_dir in country_dir.iterdir():
+            if not category_dir.is_dir() or category_dir.name.startswith('.'):
+                continue
+            
+            md_count = len(list(category_dir.rglob("*.md")))
             if md_count > 0:
-                discovered.append(candidate)
-        else:
-            logger.debug("Candidate path not found: %s", candidate)
+                key = str(category_dir.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    discovered.append(category_dir)
+                    logger.info("Discovered category: %s (%d .md files)", category_dir.relative_to(vault), md_count)
     
-    # --- Fallback: scan vault for any directory named Companies/Businesses/Entities/Profiles ---
+    # --- Strategy 2: Full recursive scan fallback ---
     if not discovered:
-        logger.info("No candidate paths matched. Scanning vault recursively for entity directories...")
+        logger.info("No structured directories found. Scanning vault recursively...")
         for root, dirs, files in os.walk(vault):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
             root_path = Path(root)
-            dir_name = root_path.name.lower()
-            if dir_name in ("companies", "businesses", "entities", "profiles"):
-                md_count = len(list(root_path.rglob("*.md")))
-                if md_count > 0:
-                    logger.info("Discovered via scan: %s (%d .md files in tree)", root_path, md_count)
+            if any(f.endswith('.md') for f in files):
+                key = str(root_path.resolve())
+                if key not in seen:
+                    seen.add(key)
                     discovered.append(root_path)
-    
-    # --- Last resort: if vault has .md files directly, treat root as entity dir ---
-    if not discovered:
-        root_md = list(vault.rglob("*.md"))
-        if root_md:
-            logger.info("Using vault root as entity directory (%d .md files)", len(root_md))
-            discovered.append(vault)
     
     return discovered
 
@@ -196,22 +252,22 @@ def _load_entities_from_dirs(dirs: List[Path]) -> List[Dict[str, Any]]:
     seen_ids = set()
     
     for directory in dirs:
-        # rglob = recursive glob — walks into every subfolder
         for f in sorted(directory.rglob("*.md")):
             if not f.is_file():
                 continue
-            # Prevent duplicates by ID
             if f.stem in seen_ids:
                 continue
             seen_ids.add(f.stem)
             
             try:
                 content = f.read_text(encoding="utf-8")
+                rel = f.relative_to(_vault_path)
                 entities.append({
                     "id": f.stem,
+                    "slug": slugify(f.stem),
                     "name": f.stem.replace("_", " ").replace("-", " "),
                     "filename": f.name,
-                    "path": str(f.relative_to(_vault_path)),
+                    "path": str(rel),
                     "content": content,
                     "size_bytes": f.stat().st_size,
                 })
@@ -220,6 +276,57 @@ def _load_entities_from_dirs(dirs: List[Path]) -> List[Dict[str, Any]]:
                 continue
     
     return entities
+
+# =============================================================================
+# NEW: Relationship resolver (uses the graph index for backlinks & outbound links)
+# =============================================================================
+def _resolve_related_entities(node, vault: QueryVaultManager) -> List[Dict[str, Any]]:
+    """
+    Given a vault node, resolve its outbound links and backlinks into
+    traversable entity profiles with slugs, names, types, and summaries.
+    """
+    related: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    # Outbound links
+    for link in getattr(node, "outbound_links", []):
+        if link in vault.nodes:
+            target = vault.nodes[link]
+            if target.uid in seen:
+                continue
+            seen.add(target.uid)
+            try:
+                rel_path = target.absolute_path.relative_to(_vault_path)
+            except ValueError:
+                rel_path = Path(target.absolute_path.name)
+            related.append({
+                "slug": slugify(target.uid),
+                "name": getattr(target, "front_matter", {}).get("title") or target.stem,
+                "entity_type": _infer_entity_type(rel_path),
+                "relation_type": "outbound",
+                "summary": getattr(target, "summary", "")[:150],
+            })
+
+    # Backlinks
+    for back in getattr(node, "backlink_uids", []):
+        if back in vault.nodes:
+            source = vault.nodes[back]
+            if source.uid in seen:
+                continue
+            seen.add(source.uid)
+            try:
+                rel_path = source.absolute_path.relative_to(_vault_path)
+            except ValueError:
+                rel_path = Path(source.absolute_path.name)
+            related.append({
+                "slug": slugify(source.uid),
+                "name": getattr(source, "front_matter", {}).get("title") or source.stem,
+                "entity_type": _infer_entity_type(rel_path),
+                "relation_type": "backlink",
+                "summary": getattr(source, "summary", "")[:150],
+            })
+
+    return related
 
 # =============================================================================
 # Endpoints
@@ -242,7 +349,7 @@ async def health():
 @app.get("/api/entities")
 async def list_entities():
     """
-    Returns all business entity profiles from the vault.
+    Returns all entity profiles from the vault.
     Auto-discovers directories and recursively searches subfolders for .md files.
     Cached — rebuilds only on file changes.
     """
@@ -277,7 +384,7 @@ async def list_entities():
 
     logger.info("Discovered %d entity directories", len(discovered_dirs))
     for d in discovered_dirs:
-        logger.info("  -> %s", d)
+        logger.info("  -> %s", d.relative_to(_vault_path))
 
     entities = _load_entities_from_dirs(discovered_dirs)
     elapsed = time.time() - start
@@ -294,6 +401,126 @@ async def list_entities():
     _entities_cache_mtime = current_mtime
 
     return _entities_cache
+
+# -----------------------------------------------------------------------------
+# NEW: Single entity profile with backlink & outbound resolution
+# -----------------------------------------------------------------------------
+@app.get("/api/entity/{entity_id}")
+async def get_entity(entity_id: str):
+    """
+    Retrieve a single entity profile by ID or slug.
+    Resolves outbound links and backlinks across the entire vault
+    (businesses, laws, commodities, infrastructure, people, government, etc.).
+    """
+    clean_id = decode_entity_id(entity_id)
+    target_slug = slugify(clean_id)
+    logger.info("Entity lookup | raw=%s | decoded=%s | slug=%s", entity_id, clean_id, target_slug)
+
+    # --- Strategy 1: Look in entity cache (fast path) ---
+    if _entities_cache:
+        for ent in _entities_cache.get("entities", []):
+            if ent.get("slug") == target_slug or ent["id"] == clean_id:
+                result = dict(ent)
+
+                # Enrich with graph data from query vault
+                try:
+                    vault = _get_query_vault()
+                    node = vault.nodes.get(ent["id"])
+                    if node:
+                        result["front_matter"] = getattr(node, "front_matter", {})
+                        result["summary"] = getattr(node, "summary", "")
+                        result["outbound_links"] = getattr(node, "outbound_links", [])
+                        result["backlink_uids"] = getattr(node, "backlink_uids", [])
+                        result["related_entities"] = _resolve_related_entities(node, vault)
+                    else:
+                        result["outbound_links"] = []
+                        result["backlink_uids"] = []
+                        result["related_entities"] = []
+                except Exception as exc:
+                    logger.warning("Failed to enrich entity %s from vault index: %s", ent["id"], exc)
+                    result["outbound_links"] = []
+                    result["backlink_uids"] = []
+                    result["related_entities"] = []
+
+                return result
+
+    # --- Strategy 2: Direct vault index lookup (fallback for non-cached or cross-folder files) ---
+    try:
+        vault = _get_query_vault()
+        node = None
+
+        # Try exact stem match
+        if clean_id in vault.nodes:
+            node = vault.nodes[clean_id]
+        else:
+            # Try slug match across all nodes
+            for stem, n in vault.nodes.items():
+                if slugify(stem) == target_slug:
+                    node = n
+                    break
+
+        if not node:
+            raise HTTPException(status_code=404, detail=f"Entity not found: {entity_id}")
+
+        rel_path = node.absolute_path.relative_to(_vault_path)
+
+        return {
+            "id": node.uid,
+            "slug": slugify(node.uid),
+            "name": getattr(node, "front_matter", {}).get("title") or node.stem,
+            "filename": node.absolute_path.name,
+            "path": str(rel_path),
+            "content": getattr(node, "raw_content", ""),
+            "size_bytes": node.absolute_path.stat().st_size,
+            "front_matter": getattr(node, "front_matter", {}),
+            "summary": getattr(node, "summary", ""),
+            "entity_type": _infer_entity_type(rel_path),
+            "outbound_links": getattr(node, "outbound_links", []),
+            "backlink_uids": getattr(node, "backlink_uids", []),
+            "related_entities": _resolve_related_entities(node, vault),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Entity lookup failed: %s", exc)
+        raise HTTPException(status_code=404, detail=f"Entity not found: {entity_id}")
+
+# -----------------------------------------------------------------------------
+# NEW: Search across all vault nodes (not just entity cache)
+# -----------------------------------------------------------------------------
+@app.get("/api/search")
+async def search_entities(q: str):
+    """
+    Full-text search across the entire vault index.
+    Returns matching entities with slugs for direct navigation.
+    """
+    vault = _get_query_vault()
+    q_clean = q.lower()
+    results = []
+    seen_slugs: Set[str] = set()
+
+    for stem, node in vault.nodes.items():
+        haystack = f"{stem} {getattr(node, 'summary', '')} {getattr(node, 'body', '')}".lower()
+        if q_clean in haystack:
+            slug = slugify(stem)
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            try:
+                rel_path = node.absolute_path.relative_to(_vault_path)
+            except ValueError:
+                rel_path = Path(node.absolute_path.name)
+
+            results.append({
+                "id": stem,
+                "slug": slug,
+                "name": getattr(node, "front_matter", {}).get("title") or stem,
+                "entity_type": _infer_entity_type(rel_path),
+                "summary": getattr(node, "summary", "")[:200],
+            })
+
+    return {"query": q, "count": len(results), "results": results}
 
 # -----------------------------------------------------------------------------
 # News pipeline
