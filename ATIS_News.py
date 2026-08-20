@@ -6,22 +6,21 @@ ATIS Constraint-Solving and Market Equilibrium Engine
 Africa Trade & Intelligence System (ATIS) — Production Orchestration Script.
 
 This module implements a decoupled, state-passing pipeline that:
-  1. Extracts economic entities from a news article via Cerebras LLM.
+    1. Extracts economic entities from a news article via the configured LLM.
   2. Reconciles extracted entities against a local Obsidian markdown vault,
      using canonical fuzzy matching and bidirectional backlink crawling.
   3. Scans the entire vault to build a token-efficient global database landscape.
-  4. Performs macroeconomic constraint-solving analysis via Cerebras LLM.
+    4. Performs macroeconomic constraint-solving analysis via the configured LLM.
   5. Formats the analysis into a structured commercial-intelligence dashboard.
   6. Persists the final dashboard JSON to a local `./dashboards/` directory.
 
 Constraints:
   - Python 3.10+
-  - cerebras.cloud.sdk
   - Strict 60,000-token ceiling per API request (aggressive truncation).
   - Zero placeholders; fully operational.
 
 Environment:
-  - CEREBRAS_API_KEY must be set in the environment.
+    - LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL must be configured.
   - Article path provided as the first CLI argument.
 """
 
@@ -39,18 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# --------------------------------------------------------------------------- #
-# Cerebras SDK
-# --------------------------------------------------------------------------- #
-try:
-    from cerebras.cloud.sdk import Cerebras
-    from cerebras.cloud.sdk import APIError, APIConnectionError, RateLimitError
-except ImportError as _import_err:
-    sys.stderr.write(
-        "ERROR: The 'cerebras.cloud.sdk' package is not installed. "
-        "Install it via: pip install cerebras-cloud-sdk\n"
-    )
-    raise SystemExit(1) from _import_err
+from llm_client import LLMClient, get_client
 
 
 # --------------------------------------------------------------------------- #
@@ -125,12 +113,8 @@ PROMPT_STAGE_3_FORMATTER: str = (
 VAULT_DIR: Path = Path(r"C:\Users\tmaki\Documents\ATIS\Data")
 DASHBOARDS_DIR: Path = Path("./dashboards")
 MAX_TOKENS_PER_REQUEST: int = 60_000
-MODEL_NAME: str = "gpt-oss-120b"
-FALLBACK_MODEL: str = "gemma-4-31b"
 RESPONSE_RESERVE: int = 8_000
 SAFETY_BUFFER: int = 1_000
-MAX_RETRIES: int = 3
-BASE_DELAY_SECONDS: float = 2.0
 
 
 # --------------------------------------------------------------------------- #
@@ -558,127 +542,24 @@ def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Cerebras Pipeline Wrapper
+# LLM Pipeline Wrapper
 # --------------------------------------------------------------------------- #
-class CerebrasPipeline:
+class LLMPipeline:
     """
-    Encapsulates all Cerebras API interactions, retry logic,
-    token-budget enforcement, and stage orchestration.
+    Encapsulates ATIS stage orchestration around the central LLM client.
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = "csk-v4vf9r666pv9t99etmm9cppv58j8xpc8fnjpxkpw89mk36rp",
-        model: str = MODEL_NAME,
-        fallback_model: str = FALLBACK_MODEL,
-    ) -> None:
-        self.api_key: str = api_key or os.environ.get("CEREBRAS_API_KEY", "")
-        if not self.api_key:
-            raise ValueError(
-                "CEREBRAS_API_KEY is not set in the environment. "
-                "Export it before running the pipeline."
-            )
-        self.client: Cerebras = Cerebras(api_key=self.api_key)
-        self.model: str = model
-        self.fallback_model: str = fallback_model
+    def __init__(self) -> None:
+        self.client: LLMClient = get_client()
+        self.config = self.client.config
         self.token_budget: TokenBudget = TokenBudget()
-        self.max_retries: int = MAX_RETRIES
-        self.base_delay: float = BASE_DELAY_SECONDS
 
     # -- Low-level API call with retries ------------------------------------ #
-    def _call_api(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.1,
-        max_tokens: int = 8_000,
-    ) -> str:
-        """
-        Execute a chat completion against the Cerebras API.
-        Implements exponential back-off for RateLimitError and
-        APIConnectionError. Falls back to the smaller model on persistent
-        APIErrors if the primary model is the large one.
-        """
-        messages = [
+    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        return self.client.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ]
-
-        models_to_try = [self.model, self.fallback_model]
-
-        for model in models_to_try:
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    logger.info(
-                        "API call | model=%s | attempt=%d/%d",
-                        model,
-                        attempt,
-                        self.max_retries,
-                    )
-                    response = self.client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    content: str = response.choices[0].message.content
-                    logger.info("API call successful (%s)", model)
-                    return content
-
-                except RateLimitError as exc:
-                    delay = self.base_delay * (2 ** (attempt - 1))
-                    logger.warning(
-                        "RateLimitError on %s (attempt %d): %s. "
-                        "Backing off for %.1f seconds...",
-                        model,
-                        attempt,
-                        exc,
-                        delay,
-                    )
-                    time.sleep(delay)
-
-                except APIConnectionError as exc:
-                    delay = self.base_delay * (2 ** (attempt - 1))
-                    logger.warning(
-                        "APIConnectionError on %s (attempt %d): %s. "
-                        "Retrying in %.1f seconds...",
-                        model,
-                        attempt,
-                        exc,
-                        delay,
-                    )
-                    time.sleep(delay)
-
-                except APIError as exc:
-                    logger.error(
-                        "APIError on %s (attempt %d): %s", model, attempt, exc
-                    )
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            logger.warning(
-                                "Falling back to smaller model: %s",
-                                self.fallback_model,
-                            )
-                            break  # break inner loop, try next model
-                        raise
-                    time.sleep(self.base_delay)
-
-                except Exception as exc:
-                    logger.error(
-                        "Unexpected error on %s (attempt %d): %s",
-                        model,
-                        attempt,
-                        exc,
-                    )
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            break
-                        raise
-                    time.sleep(self.base_delay)
-
-        raise RuntimeError(
-            "All API retries exhausted and fallback model failed."
-        )
+        ])
 
     # -- Stage 1: Entity Extraction ----------------------------------------- #
     def stage_1_extract(self, article_text: str) -> Dict[str, Any]:
@@ -705,9 +586,7 @@ class CerebrasPipeline:
                 "Article aggressively truncated to fit Stage-1 token budget."
             )
 
-        raw_response = self._call_api(
-            PROMPT_STAGE_1_EXTRACTOR, article_text, temperature=0.1
-        )
+        raw_response = self._call_api(PROMPT_STAGE_1_EXTRACTOR, article_text)
         data = safe_json_loads(raw_response, stage_name="Stage 1")
 
         entity_count = len(data.get("entities", []))
@@ -743,9 +622,7 @@ class CerebrasPipeline:
         )
         logger.info("Final Stage-2 input token estimate: %d", estimated)
 
-        raw_analysis = self._call_api(
-            PROMPT_STAGE_2_SOLVER, user_payload, temperature=0.2
-        )
+        raw_analysis = self._call_api(PROMPT_STAGE_2_SOLVER, user_payload)
         logger.info("Stage 2 complete. Analysis length: %d chars", len(raw_analysis))
         return raw_analysis
 
@@ -775,9 +652,7 @@ class CerebrasPipeline:
                 "Stage-2 analysis truncated to fit Stage-3 token budget."
             )
 
-        raw_response = self._call_api(
-            PROMPT_STAGE_3_FORMATTER, stage_2_analysis, temperature=0.1
-        )
+        raw_response = self._call_api(PROMPT_STAGE_3_FORMATTER, stage_2_analysis)
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
         logger.info("Stage 3 complete. Dashboard JSON generated.")
         return dashboard
@@ -806,8 +681,8 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     logger.info("Article path      : %s", article_path)
     logger.info("Vault directory   : %s", VAULT_DIR.resolve())
     logger.info("Dashboard directory: %s", DASHBOARDS_DIR.resolve())
-    logger.info("Model (primary)   : %s", MODEL_NAME)
-    logger.info("Model (fallback)  : %s", FALLBACK_MODEL)
+    logger.info("Model (primary)   : configured")
+    logger.info("Model (fallback)  : configured")
 
     # ------------------------------------------------------------------ #
     # 0. Load article
@@ -830,7 +705,7 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     # ------------------------------------------------------------------ #
     vault_manager = ObsidianVaultManager()
     try:
-        pipeline = CerebrasPipeline()
+        pipeline = LLMPipeline()
     except ValueError as exc:
         logger.critical("%s", exc)
         raise
@@ -888,8 +763,8 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
         "source_article": str(article_file.resolve()),
         "extracted_entities_count": len(entities),
         "core_event": core_event,
-        "model_primary": MODEL_NAME,
-        "model_fallback": FALLBACK_MODEL,
+        "model_primary": pipeline.config.model,
+        "model_fallback": pipeline.config.fallback_model,
     }
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -949,7 +824,7 @@ def run_news_pipeline(article_text: str) -> Dict[str, Any]:
 
     vault_manager = ObsidianVaultManager()
     try:
-        pipeline = CerebrasPipeline()
+        pipeline = LLMPipeline()
     except ValueError as exc:
         logger.critical("%s", exc)
         raise
@@ -987,8 +862,8 @@ def run_news_pipeline(article_text: str) -> Dict[str, Any]:
         "source_article": "web_upload",
         "extracted_entities_count": len(entities),
         "core_event": core_event,
-        "model_primary": MODEL_NAME,
-        "model_fallback": FALLBACK_MODEL,
+        "model_primary": pipeline.config.model,
+        "model_fallback": pipeline.config.fallback_model,
     }
 
     # Persist to disk (optional, ephemeral on Render)

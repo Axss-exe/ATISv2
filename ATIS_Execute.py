@@ -5,7 +5,7 @@ ATIS_Execute.py
 Execution Layer of the ATIS Intelligence Suite.
 
 Scans an indexed Obsidian vault against a target opportunity from an ATIS
-dashboard, compiles a tactical transaction roadmap via the Cerebras API,
+dashboard, compiles a tactical transaction roadmap via the configured LLM,
 and persists the result as a markdown file.
 
 Map-Reduce Architecture:
@@ -34,10 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from datetime import date, datetime
 
-# =============================================================================
-# CONFIGURATION — Hardcode your API key here if desired
-# =============================================================================
-HARDCODED_API_KEY: str = "csk-v4vf9r666pv9t99etmm9cppv58j8xpc8fnjpxkpw89mk36rp"
+from llm_client import LLMClient, get_client
 
 # =============================================================================
 # Token Budget Configuration
@@ -65,16 +62,6 @@ if _MISSING_DEPS:
         file=sys.stderr,
     )
     sys.exit(1)
-
-try:
-    from cerebras.cloud.sdk import Cerebras
-    from cerebras.cloud.sdk import APIError, APIConnectionError, RateLimitError
-except ImportError as _import_err:
-    sys.stderr.write(
-        "ERROR: The 'cerebras.cloud.sdk' package is not installed. "
-        "Install it via: pip install cerebras-cloud-sdk\n"
-    )
-    raise SystemExit(1) from _import_err
 
 # =============================================================================
 # Logging configuration
@@ -548,127 +535,23 @@ class TokenBudget:
 # =============================================================================
 # LLM Integration Layer — Map-Reduce Chunked Execution
 # =============================================================================
-class CerebrasExecutionEngine:
+class LLMExecutionEngine:
     """
     Map-Reduce architecture:
-      MAP: Split vault nodes into chunks. Extract legal waivers, restrictions,
-           and tactical facts per chunk via Cerebras.
+     MAP: Split vault nodes into chunks. Extract legal waivers, restrictions,
+         and tactical facts per chunk via the configured LLM.
       REDUCE: Synthesize chunk summaries into the final master roadmap.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
-        resolved_key = api_key or HARDCODED_API_KEY or os.environ.get("CEREBRAS_API_KEY")
-        if not resolved_key:
-            raise RuntimeError(
-                "Cerebras API key is not configured. Set the HARDCODED_API_KEY constant "
-                "at the top of this script, pass --api_key, or export the "
-                "CEREBRAS_API_KEY environment variable."
-            )
-
-        self.client = Cerebras(api_key=resolved_key)
-        self.model = "gpt-oss-120b"
-        self.fallback_model = "gemma-4-31b"
-        self.temperature = 0.15
-        self.max_tokens = 4096
-        self.max_retries = 3
-        self.base_delay_seconds = 2.0
+    def __init__(self) -> None:
+        self.client: LLMClient = get_client()
         self.token_budget = TokenBudget()
-        logger.info("Cerebras client initialized. Model: %s", self.model)
 
-    def _call_api(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-    ) -> str:
-        temperature = temperature if temperature is not None else self.temperature
-        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
-
-        messages = [
+    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        return self.client.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ]
-
-        models_to_try = [self.model, self.fallback_model]
-
-        for model in models_to_try:
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    logger.info(
-                        "API call | model=%s | attempt=%d/%d",
-                        model,
-                        attempt,
-                        self.max_retries,
-                    )
-                    response = self.client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    content = response.choices[0].message.content
-                    logger.info("API call successful (%s)", model)
-                    return content
-                except RateLimitError as exc:
-                    delay = self.base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning(
-                        "RateLimitError on %s (attempt %d): %s. "
-                        "Backing off for %.1f seconds...",
-                        model,
-                        attempt,
-                        exc,
-                        delay,
-                    )
-                    if attempt < self.max_retries:
-                        time.sleep(delay)
-                    else:
-                        if model == self.model:
-                            break
-                        raise
-                except APIConnectionError as exc:
-                    delay = self.base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning(
-                        "APIConnectionError on %s (attempt %d): %s. "
-                        "Retrying in %.1f seconds...",
-                        model,
-                        attempt,
-                        exc,
-                        delay,
-                    )
-                    if attempt < self.max_retries:
-                        time.sleep(delay)
-                    else:
-                        if model == self.model:
-                            break
-                        raise
-                except APIError as exc:
-                    logger.error(
-                        "APIError on %s (attempt %d): %s", model, attempt, exc
-                    )
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            logger.warning(
-                                "Falling back to smaller model: %s",
-                                self.fallback_model,
-                            )
-                            break
-                        raise
-                    time.sleep(self.base_delay_seconds)
-                except Exception as exc:
-                    logger.error(
-                        "Unexpected error on %s (attempt %d): %s",
-                        model,
-                        attempt,
-                        exc,
-                    )
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            break
-                        raise
-                    time.sleep(self.base_delay_seconds)
-
-        raise RuntimeError("All API retries exhausted and fallback model failed.")
+        ])
 
     # ---------------------------------------------------------------------
     # MAP: Chunk extraction
@@ -744,12 +627,7 @@ class CerebrasExecutionEngine:
             user_prompt = user_prompt[:max_chars] + "\n[CHUNK TRUNCATED]"
             logger.warning("Chunk %d truncated to fit token budget.", chunk_index + 1)
 
-        raw_response = self._call_api(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.1,
-            max_tokens=2048,
-        )
+        raw_response = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
 
         logger.info(
             "Chunk %d/%d raw response received (%d chars).",
@@ -837,12 +715,7 @@ class CerebrasExecutionEngine:
             user_prompt = user_prompt[:max_chars] + "\n[FINAL PROMPT TRUNCATED]"
             logger.warning("Final reduce prompt truncated to fit token budget.")
 
-        return self._call_api(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.15,
-            max_tokens=4096,
-        )
+        return self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
 
     # ---------------------------------------------------------------------
     # Orchestrator: Map -> Reduce
@@ -1037,11 +910,6 @@ def main() -> None:
         help="Absolute path to the Obsidian vault root. (default: ATIS Vault)",
     )
     parser.add_argument(
-        "--api_key",
-        default="",
-        help="Optional Cerebras API key. Overrides the hardcoded constant and env var.",
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable DEBUG-level logging.",
@@ -1079,7 +947,7 @@ def main() -> None:
         sys.exit(1)
 
     # 4. LLM generation — Map-Reduce
-    engine = CerebrasExecutionEngine(api_key=args.api_key if args.api_key else None)
+    engine = LLMExecutionEngine()
     try:
         result = engine.generate_roadmap(opportunity, matches)
     except Exception as exc:
@@ -1119,7 +987,7 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str) ->
 
     matches = vault_mgr.search(opportunity, seed_terms)
 
-    engine = CerebrasExecutionEngine()
+    engine = LLMExecutionEngine()
     result = engine.generate_roadmap(opportunity, matches)
 
     # Persist

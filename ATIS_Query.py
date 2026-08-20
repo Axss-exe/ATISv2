@@ -34,10 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set
 from datetime import date, datetime, timezone
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-HARDCODED_API_KEY: str = "csk-v4vf9r666pv9t99etmm9cppv58j8xpc8fnjpxkpw89mk36rp"
+from llm_client import LLMClient, get_client
 
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
@@ -60,14 +57,6 @@ except ImportError:
 if _MISSING_DEPS:
     print("FATAL: Missing required dependencies:\n  - " + "\n  - ".join(_MISSING_DEPS), file=sys.stderr)
     sys.exit(1)
-
-try:
-    from cerebras.cloud.sdk import Cerebras
-    from cerebras.cloud.sdk import APIError, APIConnectionError, RateLimitError
-except ImportError as _import_err:
-    sys.stderr.write("ERROR: The 'cerebras.cloud.sdk' package is not installed. "
-                     "Install it via: pip install cerebras-cloud-sdk\n")
-    raise SystemExit(1) from _import_err
 
 # =============================================================================
 # Logging
@@ -503,88 +492,18 @@ class TokenBudget:
 
 
 # =============================================================================
-# CEREBRAS ENGINE — 3-STAGE GROUNDED PIPELINE
+# LLM ENGINE — 3-STAGE GROUNDED PIPELINE
 # =============================================================================
-class CerebrasQueryEngine:
-    def __init__(self, api_key: str | None = None) -> None:
-        resolved_key = api_key or HARDCODED_API_KEY or os.environ.get("CEREBRAS_API_KEY")
-        if not resolved_key:
-            raise RuntimeError("Cerebras API key not configured.")
-        self.client = Cerebras(api_key=resolved_key)
-        self.model = "gpt-oss-120b"
-        self.fallback_model = "gemma-4-31b"
-        self.temperature = 0.1
-        self.max_tokens = 512
-        self.max_retries = 2
-        self.base_delay_seconds = 2.0
+class LLMQueryEngine:
+    def __init__(self) -> None:
+        self.client: LLMClient = get_client()
         self.token_budget = TokenBudget()
-        logger.info("Cerebras client initialized. Model: %s", self.model)
 
-    def _call_api(self, system_prompt: str, user_prompt: str,
-                  temperature: float | None = None, max_tokens: int | None = None) -> str:
-        temperature = temperature if temperature is not None else self.temperature
-        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        models_to_try = [self.model, self.fallback_model]
-
-        for model in models_to_try:
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    logger.info("API call | model=%s | attempt=%d/%d", model, attempt, self.max_retries)
-                    response = self.client.chat.completions.create(
-                        model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
-                    if not response.choices:
-                        raise APIError(message="Empty choices", request=None, body=None)
-                    content = response.choices[0].message.content
-                    if content is None:
-                        raise APIError(message="None content", request=None, body=None)
-                    content = content.strip()
-                    if not content:
-                        raise APIError(message="Empty content", request=None, body=None)
-                    logger.info("API call successful (%s) | %d chars", model, len(content))
-                    return content
-                except RateLimitError as exc:
-                    error_body = getattr(exc, 'body', {}) or {}
-                    error_code = error_body.get('code', '') if isinstance(error_body, dict) else ''
-                    if error_code == 'token_quota_exceeded':
-                        logger.error("Cerebras daily token quota EXHAUSTED. Aborting.")
-                        raise RuntimeError(
-                            "Cerebras API daily token limit reached. "
-                            "Try again after 24 hours or upgrade your plan."
-                        ) from exc
-                    delay = self.base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning("RateLimitError on %s (attempt %d). Backing off %.1fs...", model, attempt, delay)
-                    if attempt < self.max_retries:
-                        time.sleep(delay)
-                    else:
-                        if model == self.model:
-                            break
-                        raise
-                except APIConnectionError as exc:
-                    delay = self.base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning("APIConnectionError on %s (attempt %d). Retrying %.1fs...", model, attempt, delay)
-                    if attempt < self.max_retries:
-                        time.sleep(delay)
-                    else:
-                        if model == self.model:
-                            break
-                        raise
-                except APIError as exc:
-                    logger.error("APIError on %s (attempt %d): %s", model, attempt, exc)
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            logger.warning("Falling back to: %s", self.fallback_model)
-                            break
-                        raise
-                    time.sleep(self.base_delay_seconds)
-                except Exception as exc:
-                    logger.error("Unexpected error on %s (attempt %d): %s", model, attempt, exc)
-                    if attempt == self.max_retries:
-                        if model == self.model:
-                            break
-                        raise
-                    time.sleep(self.base_delay_seconds)
-        raise RuntimeError("All API retries exhausted and fallback model failed.")
+    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        return self.client.chat([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
 
     # -----------------------------------------------------------------
     # STAGE 0: Intent Extraction
@@ -596,8 +515,6 @@ class CerebrasQueryEngine:
         raw_response = self._call_api(
             system_prompt=INTENT_EXTRACTION_PROMPT,
             user_prompt=user_prompt,
-            temperature=0.05,
-            max_tokens=512
         )
 
         try:
@@ -706,8 +623,6 @@ class CerebrasQueryEngine:
         raw_response = self._call_api(
             system_prompt=SEMANTIC_RANKING_PROMPT,
             user_prompt=user_prompt,
-            temperature=0.05,
-            max_tokens=2048
         )
 
         try:
@@ -790,8 +705,6 @@ class CerebrasQueryEngine:
         raw_response = self._call_api(
             system_prompt=GROUNDED_SYNTHESIS_PROMPT,
             user_prompt=user_prompt,
-            temperature=0.1,
-            max_tokens=4096
         )
 
         return self._parse_grounded_response(raw_response, ranked_nodes)
@@ -891,7 +804,7 @@ class CerebrasQueryEngine:
             max_chars = int(self.token_budget.available_for_input * 3.2) - len(system_prompt)
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
 
-        raw = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.15, max_tokens=4096)
+        raw = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
         result = self._parse_grounded_response(raw, all_nodes)
         result["scan_mode"] = "full_vault_capped"
         return result
@@ -935,7 +848,8 @@ class CerebrasQueryEngine:
 # PERSISTENCE
 # =============================================================================
 def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
-                          aggregate_stats: Dict[str, Any], question: str | None = None) -> Tuple[Path, Path]:
+                          aggregate_stats: Dict[str, Any], question: str | None = None,
+                          model_primary: str = "configured", model_fallback: str = "configured") -> Tuple[Path, Path]:
     output_dir = Path(os.getenv("OUTPUT_DIR", "./output/query_results"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -965,8 +879,8 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
         "pipeline_metadata": {
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
-            "model_primary": "gpt-oss-120b",
-            "model_fallback": "gemma-4-31b",
+            "model_primary": model_primary,
+            "model_fallback": model_fallback,
             "pipeline_version": "grounded_v3_1",
         },
     }
@@ -1000,7 +914,7 @@ def run_query_pipeline(question: str | None = None,
     if vault_mgr.indexed_count == 0:
         raise RuntimeError("No markdown files found in vault.")
 
-    engine = CerebrasQueryEngine()
+    engine = LLMQueryEngine()
     result = engine.generate_query_payload(vault_mgr, question)
 
     entity_graph = result.pop("entity_graph", {})
@@ -1032,7 +946,14 @@ def run_query_pipeline(question: str | None = None,
         "opportunities": raw_opportunities,
         "risks": raw_risks,
     }
-    json_path, graph_path = persist_query_payload(full_result, entity_graph, aggregate_stats, question)
+    json_path, graph_path = persist_query_payload(
+        full_result,
+        entity_graph,
+        aggregate_stats,
+        question,
+        engine.client.config.model,
+        engine.client.config.fallback_model,
+    )
 
     # Return FLAT backward-compatible shape
     return {
@@ -1068,7 +989,6 @@ def main() -> None:
     )
     parser.add_argument("--vault_path", default="./vault", help="Path to Obsidian vault root.")
     parser.add_argument("--question", default="", help="Natural language question.")
-    parser.add_argument("--api_key", default="", help="Optional Cerebras API key override.")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging.")
 
     args = parser.parse_args()
