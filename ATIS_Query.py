@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Tuple, Set
 from datetime import date, datetime, timezone
 
 from llm_client import LLMClient, get_client
+from atis_context import PerspectiveContext, validate_opportunity
 
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
@@ -104,7 +105,7 @@ INTENT_EXTRACTION_PROMPT: str = (
 
 SEMANTIC_RANKING_PROMPT: str = (
     "You are a Semantic Relevance Engine for the ATIS Intelligence System. "
-    "Your job is to rank vault nodes by their relevance to the user's question.\n\n"
+    "Your job is to rank vault nodes by their relevance to the user's question from the selected analytical perspective.\n\n"
     "You will be given:\n"
     "1. The user's question\n"
     "2. A list of candidate vault nodes (each with id, type, country, sector, summary)\n\n"
@@ -113,7 +114,7 @@ SEMANTIC_RANKING_PROMPT: str = (
     "- Score relevance from 1.0 to 10.0 based on how directly the node answers the question\n"
     "- Select the top N most relevant nodes\n"
     "- Provide 1-sentence reasoning for each selection\n\n"
-    "SCORING CRITERIA:\n"
+    "SCORING CRITERIA (in priority order): direct event relevance, perspective-country relevance, perspective actor capability, cross-border relationships, regulatory/access pathways, capital relationships, evidence strength.\n"
     "- 10.0: Directly answers the question (e.g., the exact entity asked about)\n"
     "- 7.0-9.0: Highly relevant (e.g., regulator of the entity, parent company)\n"
     "- 4.0-6.0: Moderately relevant (e.g., same sector, related commodity)\n"
@@ -174,7 +175,7 @@ GROUNDED_SYNTHESIS_PROMPT: str = (
     '    {"text": "Finding statement.", "source_nodes": ["Node_ID_1", "Node_ID_2"]}\n'
     '  ],\n'
     '  "opportunities": [\n'
-    '    {"text": "Opportunity statement.", "source_nodes": ["Node_ID"]}\n'
+    '    {"opportunity_id": "OPP-001", "title": "Opportunity statement", "type": "String", "perspective_country": "Zimbabwe", "perspective_country_code": "ZW", "source_country": "String", "event_country": "String", "opportunity_country": "String", "cross_border": true, "cross_border_countries": ["Zimbabwe", "String"], "perspective_actor": "Evidenced actor or empty", "perspective_capability": "Evidenced capability or empty", "pathway": "Evidenced pathway or empty", "urgency_score": 0.0, "feasibility_score": 0.0, "required_missing_nodes": [], "capital_flow": {"beneficiary": "String", "likely_funder": "String"}, "justification": "String", "source_nodes": ["Node_ID"]}\n'
     '  ],\n'
     '  "risks": [\n'
     '    {"text": "Risk statement.", "source_nodes": ["Node_ID"]}\n'
@@ -210,6 +211,7 @@ class ATISIntent:
         self.relationship_type: str | None = raw_json.get("relationship_type")
         self.output_format: str = raw_json.get("output_format", "structured_table")
         self.max_results_hint: int = raw_json.get("max_results_hint", 20)
+        self.perspective_country: str = raw_json.get("perspective_country", "")
 
     def __repr__(self) -> str:
         return f"ATISIntent({self.intent_type}, entities={self.target_entities}, types={self.target_entity_types})"
@@ -529,7 +531,8 @@ class LLMQueryEngine:
     # -----------------------------------------------------------------
     # STAGE 1: Broad Pre-Filter
     # -----------------------------------------------------------------
-    def broad_pre_filter(self, vault_mgr: ObsidianVaultManager, intent: ATISIntent) -> List[VaultNode]:
+    def broad_pre_filter(self, vault_mgr: ObsidianVaultManager, intent: ATISIntent,
+                         perspective: PerspectiveContext) -> List[VaultNode]:
         logger.info("STAGE 1: BROAD PRE-FILTER")
         all_nodes = list(vault_mgr.nodes.values())
         scored: List[Tuple[float, VaultNode]] = []
@@ -544,6 +547,11 @@ class LLMQueryEngine:
                     score += 8.0
 
             node_country = (node.country or "").lower()
+            path_text = str(node.absolute_path).lower()
+            if perspective.country.lower() in node_country or perspective.country.lower() in path_text:
+                score += 7.0
+            if perspective.country_code.lower() in path_text:
+                score += 2.0
             for tc in intent.target_countries:
                 if tc.lower() in node_country:
                     score += 6.0
@@ -584,6 +592,7 @@ class LLMQueryEngine:
     # STAGE 2: LLM Semantic Ranking
     # -----------------------------------------------------------------
     def llm_semantic_ranking(self, question: str, intent: ATISIntent,
+                             perspective: PerspectiveContext,
                              candidates: List[VaultNode]) -> List[VaultNode]:
         logger.info("STAGE 2: LLM SEMANTIC RANKING (%d candidates)", len(candidates))
 
@@ -604,6 +613,7 @@ class LLMQueryEngine:
 
         user_prompt = (
             f"## USER QUESTION\n{question}\n\n"
+            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
             f"## SEARCH INTENT\n"
             f"Type: {intent.intent_type}\n"
             f"Looking for: {', '.join(intent.target_entities) or 'N/A'}\n"
@@ -649,6 +659,7 @@ class LLMQueryEngine:
     # STAGE 3: Grounded Synthesis
     # -----------------------------------------------------------------
     def grounded_synthesis(self, question: str, intent: ATISIntent,
+                           perspective: PerspectiveContext,
                            ranked_nodes: List[VaultNode]) -> Dict[str, Any]:
         logger.info("STAGE 3: GROUNDED SYNTHESIS (%d nodes)", len(ranked_nodes))
 
@@ -679,6 +690,8 @@ class LLMQueryEngine:
 
         user_prompt = (
             f"## USER QUESTION\n{question}\n\n"
+            f"## ANALYTICAL PERSPECTIVE\nPerspective country: {perspective.country}\nPerspective country code: {perspective.country_code}\n"
+            "You are answering from this perspective, not automatically from the source-event country. An external event can create a perspective-country opportunity. Every opportunity must show an evidenced actor, capability, and pathway; otherwise mark it RESEARCH_REQUIRED.\n\n"
             f"## SEARCH INTENT\n"
             f"Type: {intent.intent_type}\n"
             f"Looking for: {', '.join(intent.target_entities) or 'N/A'}\n"
@@ -707,9 +720,10 @@ class LLMQueryEngine:
             user_prompt=user_prompt,
         )
 
-        return self._parse_grounded_response(raw_response, ranked_nodes)
+        return self._parse_grounded_response(raw_response, ranked_nodes, perspective, intent)
 
-    def _parse_grounded_response(self, raw: str, source_nodes: List[VaultNode]) -> Dict[str, Any]:
+    def _parse_grounded_response(self, raw: str, source_nodes: List[VaultNode],
+                                 perspective: PerspectiveContext, intent: ATISIntent) -> Dict[str, Any]:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
@@ -751,6 +765,13 @@ class LLMQueryEngine:
                     validated.append({"text": str(item), "source_nodes": ["citation_needed"]})
             data[section] = validated
 
+        validated_opportunities = []
+        for item in data["opportunities"]:
+            if not item.get("source_country") and intent.target_countries:
+                item["source_country"] = intent.target_countries[0]
+            validated_opportunities.append(validate_opportunity(item, perspective, source_node_ids))
+        data["opportunities"] = validated_opportunities
+
         return {
             "executive_summary": data.get("executive_summary", "No summary generated."),
             "structured_intelligence": validated_intel,
@@ -779,7 +800,7 @@ class LLMQueryEngine:
     # -----------------------------------------------------------------
     # FULL VAULT SCAN
     # -----------------------------------------------------------------
-    def full_vault_scan(self, vault_mgr: ObsidianVaultManager) -> Dict[str, Any]:
+    def full_vault_scan(self, vault_mgr: ObsidianVaultManager, perspective: PerspectiveContext) -> Dict[str, Any]:
         logger.info("MODE A: FULL VAULT SCAN")
         all_nodes = vault_mgr.get_all_nodes_as_context()
         if len(all_nodes) > FULL_SCAN_MAX_NODES:
@@ -795,6 +816,8 @@ class LLMQueryEngine:
             "produce a high-level dashboard. Output ONLY raw JSON. Every claim must cite source nodes."
         )
         user_prompt = (
+            f"## ANALYTICAL PERSPECTIVE\nPerspective country: {perspective.country}\nPerspective country code: {perspective.country_code}\n"
+            "Produce perspective-specific intelligence from the full African vault; do not turn this into a country filter.\n\n"
             f"## VAULT SUMMARY\nTotal: {len(all_nodes)}\n\n{context}\n\n"
             f"## OUTPUT\nProduce dashboard JSON with executive_summary, structured_intelligence, findings, opportunities, risks, key_entities. "
             f"Every row must have source_node. Every finding must have source_nodes."
@@ -805,7 +828,7 @@ class LLMQueryEngine:
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
 
         raw = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
-        result = self._parse_grounded_response(raw, all_nodes)
+        result = self._parse_grounded_response(raw, all_nodes, perspective, ATISIntent({}))
         result["scan_mode"] = "full_vault_capped"
         return result
 
@@ -813,14 +836,18 @@ class LLMQueryEngine:
     # MAIN ORCHESTRATOR
     # -----------------------------------------------------------------
     def generate_query_payload(self, vault_mgr: ObsidianVaultManager,
-                               question: str | None = None) -> Dict[str, Any]:
+                               question: str | None = None,
+                               perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
+        perspective = perspective or PerspectiveContext()
         if not question:
-            return self.full_vault_scan(vault_mgr)
+            result = self.full_vault_scan(vault_mgr, perspective)
+            result["perspective"] = perspective.as_dict()
+            return result
 
         intent = self.extract_intent(question)
-        candidates = self.broad_pre_filter(vault_mgr, intent)
-        ranked_nodes = self.llm_semantic_ranking(question, intent, candidates)
-        result = self.grounded_synthesis(question, intent, ranked_nodes)
+        candidates = self.broad_pre_filter(vault_mgr, intent, perspective)
+        ranked_nodes = self.llm_semantic_ranking(question, intent, perspective, candidates)
+        result = self.grounded_synthesis(question, intent, perspective, ranked_nodes)
 
         entity_graph = vault_mgr.build_entity_graph(ranked_nodes)
         aggregate_stats = vault_mgr.get_aggregate_stats(ranked_nodes)
@@ -833,6 +860,8 @@ class LLMQueryEngine:
                 "entity_types": intent.target_entity_types,
                 "countries": intent.target_countries,
                 "sectors": intent.target_sectors,
+                "perspective_country": perspective.country,
+                "perspective_country_code": perspective.country_code,
             },
             "filter_stats": {
                 "vault_total": vault_mgr.indexed_count,
@@ -841,6 +870,7 @@ class LLMQueryEngine:
             },
             "entity_graph": entity_graph,
             "stats": aggregate_stats,
+            "perspective": perspective.as_dict(),
         }
 
 
@@ -859,6 +889,7 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
     dashboard_payload = {
         "query_id": query_id,
         "user_question": question or "FULL_VAULT_SCAN",
+        "perspective": payload.get("perspective", {}),
         "executive_summary": payload.get("executive_summary", ""),
         "intent": payload.get("intent", {}),
         "filter_stats": payload.get("filter_stats", {}),
@@ -900,7 +931,8 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
 # WEB ENTRY POINT — BACKWARD COMPATIBLE
 # =============================================================================
 def run_query_pipeline(question: str | None = None,
-                       vault_path: str | Path = "./vault") -> Dict[str, Any]:
+                       vault_path: str | Path = "./vault",
+                       perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Web-compatible entry point.
     Returns FLAT backward-compatible shape for v0 frontend:
@@ -915,7 +947,8 @@ def run_query_pipeline(question: str | None = None,
         raise RuntimeError("No markdown files found in vault.")
 
     engine = LLMQueryEngine()
-    result = engine.generate_query_payload(vault_mgr, question)
+    perspective = perspective or PerspectiveContext()
+    result = engine.generate_query_payload(vault_mgr, question, perspective)
 
     entity_graph = result.pop("entity_graph", {})
     aggregate_stats = result.pop("stats", {})
@@ -969,6 +1002,7 @@ def run_query_pipeline(question: str | None = None,
         "risks_cited": raw_risks,
         "source_nodes": result.get("source_nodes", []),
         "intent": result.get("intent", {}),
+        "perspective": perspective.as_dict(),
         "filter_stats": result.get("filter_stats", {}),
         "entity_graph": entity_graph,
         "stats": aggregate_stats,

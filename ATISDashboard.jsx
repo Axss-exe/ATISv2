@@ -13,6 +13,23 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import dagre from 'dagre';
 
+export const PERSPECTIVE_COUNTRY_CODES = {
+  Botswana: 'BW',
+  Kenya: 'KE',
+  'South Africa': 'ZA',
+  Zambia: 'ZM',
+  Zimbabwe: 'ZW',
+};
+
+export function buildPerspectiveRequest(payload, selectedCountry) {
+  const country = selectedCountry || 'Zimbabwe';
+  return {
+    ...payload,
+    perspective_country: country,
+    perspective_country_code: PERSPECTIVE_COUNTRY_CODES[country] || '',
+  };
+}
+
 // ============================================================
 // INSTALLATION NOTE:
 // npm install reactflow dagre
@@ -303,6 +320,7 @@ function Tier3Node({ data }) {
 export default function ATISDashboard() {
   const [showPanel, setShowPanel] = useState(false);
   const [hoveredEdge, setHoveredEdge] = useState(null);
+  const [selectedCountry, setSelectedCountry] = useState('Zimbabwe');
 
   // Memoize initial graph
   const { nodes: initialNodes, edges: initialEdges } = useMemo(
@@ -384,6 +402,18 @@ export default function ATISDashboard() {
         </div>
 
         <div className="flex items-center gap-4">
+          <label className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-400">
+            Analysing from
+            <select
+              value={selectedCountry}
+              onChange={(event) => setSelectedCountry(event.target.value)}
+              className="rounded-lg border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs font-semibold normal-case tracking-normal text-white"
+            >
+              {Object.keys(PERSPECTIVE_COUNTRY_CODES).map((country) => (
+                <option key={country} value={country}>{country}</option>
+              ))}
+            </select>
+          </label>
           <MetricCard
             icon={
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

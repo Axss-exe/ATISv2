@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from llm_client import LLMClient, get_client
+from atis_context import PerspectiveContext, validate_opportunity
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +73,7 @@ PROMPT_STAGE_2_SOLVER: str = (
     "You are the ATIS Equilibrium and Constraint Engine. Your objective is to act as a macroeconomic constraint solver. "
     "You will be provided with a [NEW EVENT] and a [GRAPH CONTEXT] representing the current known state of the market.\n"
     "Do not summarize the event. You must calculate the systemic shifts and unfulfilled requirements caused by the event.\n"
+    "Analyse the event from the selected perspective country. Identify which requirements can be satisfied by evidenced perspective-country actors, cross-border pathways, competitive threats, and strategic responses. Distinguish local source-country opportunities from perspective-country opportunities.\n"
     "Follow this exact reasoning sequence in your markdown output:\n"
     "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?\n"
     "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?\n"
@@ -96,6 +98,11 @@ PROMPT_STAGE_3_FORMATTER: str = (
     '      "opportunity_id": "OPP-001",\n'
     '      "title": "String",\n'
     '      "type": "String",\n'
+    '      "perspective_country": "String", "perspective_country_code": "ISO-2",\n'
+    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",\n'
+    '      "cross_border": true, "cross_border_countries": ["String"],\n'
+    '      "perspective_actor": "Evidenced actor or empty", "perspective_capability": "Evidenced capability or empty", "pathway": "Evidenced pathway or empty",\n'
+    '      "source_nodes": ["Exact vault node IDs"],\n'
     '      "urgency_score": Float,\n'
     '      "feasibility_score": Float,\n'
     '      "required_missing_nodes": ["String"],\n'
@@ -598,7 +605,8 @@ class LLMPipeline:
         return data
 
     # -- Stage 2: Constraint Solving ---------------------------------------- #
-    def stage_2_solve(self, article_text: str, graph_context: str) -> str:
+    def stage_2_solve(self, article_text: str, graph_context: str,
+                      perspective: PerspectiveContext) -> str:
         """
         Stage 2 — Send the [NEW EVENT] + [GRAPH CONTEXT] to the
         Equilibrium and Constraint Engine. Returns raw markdown analysis.
@@ -613,6 +621,8 @@ class LLMPipeline:
         )
 
         user_payload = (
+            f"[ANALYTICAL PERSPECTIVE]: {perspective.country} ({perspective.country_code})\n"
+            "Every proposed opportunity must be actionable from this perspective and supported by the graph.\n\n"
             f"[NEW EVENT]:\n{article_text}\n\n"
             f"[GRAPH CONTEXT]:\n{graph_context}"
         )
@@ -627,7 +637,7 @@ class LLMPipeline:
         return raw_analysis
 
     # -- Stage 3: Dashboard Formatting -------------------------------------- #
-    def stage_3_format(self, stage_2_analysis: str) -> Dict[str, Any]:
+    def stage_3_format(self, stage_2_analysis: str, perspective: PerspectiveContext) -> Dict[str, Any]:
         """
         Stage 3 — Send the Stage-2 markdown analysis to the strict
         data-serialisation module. Returns a structured dashboard JSON dict.
@@ -652,7 +662,12 @@ class LLMPipeline:
                 "Stage-2 analysis truncated to fit Stage-3 token budget."
             )
 
-        raw_response = self._call_api(PROMPT_STAGE_3_FORMATTER, stage_2_analysis)
+        raw_response = self._call_api(
+            PROMPT_STAGE_3_FORMATTER,
+            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n"
+            "Do not invent a perspective actor or capability. Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
+            + stage_2_analysis,
+        )
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
         logger.info("Stage 3 complete. Dashboard JSON generated.")
         return dashboard
@@ -661,7 +676,7 @@ class LLMPipeline:
 # --------------------------------------------------------------------------- #
 # Main Orchestration Entry Point
 # --------------------------------------------------------------------------- #
-def process_article_pipeline(article_path: str) -> Dict[str, Any]:
+def process_article_pipeline(article_path: str, perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Primary orchestration function for the ATIS pipeline.
 
@@ -678,7 +693,9 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     logger.info("=" * 70)
     logger.info("ATIS PIPELINE INITIALISATION")
     logger.info("=" * 70)
+    perspective = perspective or PerspectiveContext()
     logger.info("Article path      : %s", article_path)
+    logger.info("Perspective       : %s (%s)", perspective.country, perspective.country_code)
     logger.info("Vault directory   : %s", VAULT_DIR.resolve())
     logger.info("Dashboard directory: %s", DASHBOARDS_DIR.resolve())
     logger.info("Model (primary)   : configured")
@@ -741,7 +758,7 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     # 4. Stage 2 — Constraint Solving
     # ------------------------------------------------------------------ #
     try:
-        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context)
+        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
     except Exception as exc:
         logger.critical("STAGE 2 FAILED: %s", exc)
         raise
@@ -750,7 +767,7 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     # 5. Stage 3 — Dashboard Formatting
     # ------------------------------------------------------------------ #
     try:
-        dashboard_payload = pipeline.stage_3_format(stage_2_analysis)
+        dashboard_payload = pipeline.stage_3_format(stage_2_analysis, perspective)
     except Exception as exc:
         logger.critical("STAGE 3 FAILED: %s", exc)
         raise
@@ -758,6 +775,12 @@ def process_article_pipeline(article_path: str) -> Dict[str, Any]:
     # ------------------------------------------------------------------ #
     # 6. Enrich & Persist
     # ------------------------------------------------------------------ #
+    dashboard_payload["perspective"] = perspective.as_dict()
+    dashboard_payload["opportunities"] = [
+        validate_opportunity(item, perspective)
+        for item in dashboard_payload.get("opportunities", [])
+        if isinstance(item, dict)
+    ]
     dashboard_payload["pipeline_metadata"] = {
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source_article": str(article_file.resolve()),
@@ -814,12 +837,13 @@ def main() -> None:
 # =============================================================================
 # Web entry point
 # =============================================================================
-def run_news_pipeline(article_text: str) -> Dict[str, Any]:
+def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
     """
     logger.info("=" * 70)
-    logger.info("ATIS NEWS PIPELINE (WEB)")
+    perspective = perspective or PerspectiveContext()
+    logger.info("ATIS NEWS PIPELINE (WEB) | Perspective: %s (%s)", perspective.country, perspective.country_code)
     logger.info("=" * 70)
 
     vault_manager = ObsidianVaultManager()
@@ -844,19 +868,25 @@ def run_news_pipeline(article_text: str) -> Dict[str, Any]:
 
     # Stage 2
     try:
-        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context)
+        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
     except Exception as exc:
         logger.critical("STAGE 2 FAILED: %s", exc)
         raise
 
     # Stage 3
     try:
-        dashboard_payload = pipeline.stage_3_format(stage_2_analysis)
+        dashboard_payload = pipeline.stage_3_format(stage_2_analysis, perspective)
     except Exception as exc:
         logger.critical("STAGE 3 FAILED: %s", exc)
         raise
 
     # Enrich
+    dashboard_payload["perspective"] = perspective.as_dict()
+    dashboard_payload["opportunities"] = [
+        validate_opportunity(item, perspective)
+        for item in dashboard_payload.get("opportunities", [])
+        if isinstance(item, dict)
+    ]
     dashboard_payload["pipeline_metadata"] = {
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source_article": "web_upload",

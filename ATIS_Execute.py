@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Tuple
 from datetime import date, datetime
 
 from llm_client import LLMClient, get_client
+from atis_context import PerspectiveContext
 
 # =============================================================================
 # Token Budget Configuration
@@ -431,6 +432,15 @@ def expand_keywords(opportunity: Dict[str, Any]) -> List[str]:
     if title:
         keywords.append(str(title))
 
+    for key in ("perspective_country", "source_country", "event_country", "opportunity_country",
+                "perspective_actor", "perspective_capability", "pathway"):
+        value = opportunity.get(key)
+        if value:
+            keywords.append(str(value))
+    for country in opportunity.get("cross_border_countries", []):
+        if country:
+            keywords.append(str(country))
+
     missing = opportunity.get("required_missing_nodes", [])
     if isinstance(missing, list):
         for node in missing:
@@ -601,6 +611,8 @@ class LLMExecutionEngine:
             f"```json\n"
             f"{json.dumps(_sanitize_for_json(opportunity), indent=2, default=str)}\n"
             f"```\n\n"
+            f"## TARGET PERSPECTIVE\n{opportunity.get('perspective_country', 'Zimbabwe')} ({opportunity.get('perspective_country_code', 'ZW')})\n"
+            "Extract assets needed by the perspective-country operator; do not substitute the source-country actor.\n\n"
             f"## VAULT NODES (Chunk {chunk_index + 1} of {total_chunks})\n"
             f"{chunk_context}\n\n"
             f"## EXTRACTION INSTRUCTIONS\n"
@@ -665,6 +677,11 @@ class LLMExecutionEngine:
 
         user_prompt = (
             "# ATIS EXECUTION LAYER — TACTICAL TRANSACTION ROADMAP\n\n"
+            f"## TARGET PERSPECTIVE\n{opportunity.get('perspective_country', 'Zimbabwe')} ({opportunity.get('perspective_country_code', 'ZW')})\n"
+            f"SOURCE / EVENT COUNTRY: {opportunity.get('source_country') or opportunity.get('event_country') or 'Not found in vault'}\n"
+            f"OPPORTUNITY COUNTRY: {opportunity.get('opportunity_country', 'Not found in vault')}\n"
+            f"CROSS-BORDER STATUS: {bool(opportunity.get('cross_border'))}\n"
+            "Every action must be actionable by or for an actor operating from the target perspective. Never fabricate missing capability; recommend research or network expansion instead.\n\n"
             "## ISOLATED OPPORTUNITY JSON\n"
             "```json\n"
             f"{json.dumps(_sanitize_for_json(opportunity), indent=2, default=str)}\n"
@@ -973,7 +990,8 @@ def main() -> None:
 # =============================================================================
 # Web entry point
 # =============================================================================
-def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str) -> Dict[str, Any]:
+def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
+                         perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Web-compatible entry point. Accepts dashboard dict and opportunity ID.
     Returns dict with final_roadmap, ui_thinking_graph, and compiled_lineage_traces.
@@ -982,7 +1000,21 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str) ->
     vault_mgr = ObsidianVaultManager(vault_path)
     vault_mgr.build_index()
 
-    opportunity = dashboard_json
+    dashboard_perspective = PerspectiveContext.from_payload(dashboard_json)
+    if perspective and perspective != dashboard_perspective:
+        raise ValueError("Execute perspective does not match the opportunity dashboard perspective.")
+    perspective = dashboard_perspective
+    opportunity = dict(dashboard_json)
+    opportunity.update(perspective.as_fields())
+    logger.info(
+        "ATIS ANALYSIS CONTEXT | Perspective: %s (%s) | Source country: %s | Event country: %s | Opportunity country: %s | Cross-border: %s",
+        perspective.country,
+        perspective.country_code,
+        opportunity.get("source_country", ""),
+        opportunity.get("event_country", ""),
+        opportunity.get("opportunity_country", ""),
+        opportunity.get("cross_border", False),
+    )
     seed_terms = expand_keywords(opportunity)
 
     matches = vault_mgr.search(opportunity, seed_terms)
@@ -1003,6 +1035,7 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str) ->
         "final_roadmap": result["final_roadmap"],
         "ui_thinking_graph": result["ui_thinking_graph"],
         "compiled_lineage_traces": result["compiled_lineage_traces"],
+        "perspective": perspective.as_dict(),
         "files_written": {
             "roadmap_md": str(md_path),
             "reasoning_json": str(json_path),

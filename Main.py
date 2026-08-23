@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from ATIS_News import run_news_pipeline
 from ATIS_Execute import run_execute_pipeline
 from ATIS_Query import run_query_pipeline, ObsidianVaultManager as QueryVaultManager
+from atis_context import PerspectiveContext
 
 # =============================================================================
 # Logging
@@ -89,6 +90,11 @@ _pipeline_in_progress = False
 # Simple in-memory cache for query results
 _query_cache: Dict[str, Any] = {}
 
+def _query_cache_key(question: str | None, perspective: PerspectiveContext) -> str:
+    """Keep identical questions isolated between analytical perspectives."""
+    material = f"{perspective.country_code}:{question or 'full_scan'}"
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
 # Entity cache — rebuilds only when files change
 _entities_cache: Dict[str, Any] | None = None
 _entities_cache_mtime: float = 0.0
@@ -98,13 +104,19 @@ _entities_cache_mtime: float = 0.0
 # =============================================================================
 class NewsRequest(BaseModel):
     article_text: str
+    perspective_country: str | None = None
+    perspective_country_code: str | None = None
 
 class ExecuteRequest(BaseModel):
     dashboard_json: dict
     opportunity_id: str
+    perspective_country: str | None = None
+    perspective_country_code: str | None = None
 
 class QueryRequest(BaseModel):
     question: str | None = None
+    perspective_country: str | None = None
+    perspective_country_code: str | None = None
 
 # =============================================================================
 # Helper: Run pipeline with timeout and lock
@@ -538,6 +550,7 @@ async def news_endpoint(request: NewsRequest):
         result = await _run_with_timeout(
             run_news_pipeline,
             request.article_text,
+            PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code),
             timeout=60.0
         )
         elapsed = time.time() - start
@@ -569,6 +582,8 @@ async def execute_endpoint(request: ExecuteRequest):
             run_execute_pipeline,
             request.dashboard_json,
             request.opportunity_id,
+            PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code)
+            if request.perspective_country or request.perspective_country_code else None,
             timeout=60.0
         )
         elapsed = time.time() - start
@@ -588,7 +603,8 @@ async def execute_endpoint(request: ExecuteRequest):
 # -----------------------------------------------------------------------------
 @app.post("/api/query")
 async def query_endpoint(request: QueryRequest):
-    cache_key = hashlib.sha256((request.question or "full_scan").encode()).hexdigest()[:16]
+    perspective = PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code)
+    cache_key = _query_cache_key(request.question, perspective)
 
     if cache_key in _query_cache:
         logger.info("Cache hit for query: %s", cache_key)
@@ -609,6 +625,8 @@ async def query_endpoint(request: QueryRequest):
         result = await _run_with_timeout(
             run_query_pipeline,
             request.question,
+            _vault_path,
+            perspective,
             timeout=60.0
         )
         elapsed = time.time() - start
