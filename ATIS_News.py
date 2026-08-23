@@ -7,12 +7,13 @@ Africa Trade & Intelligence System (ATIS) — Production Orchestration Script.
 
 This module implements a decoupled, state-passing pipeline that:
     1. Extracts economic entities from a news article via the configured LLM.
-  2. Reconciles extracted entities against a local Obsidian markdown vault,
-     using canonical fuzzy matching and bidirectional backlink crawling.
-  3. Scans the entire vault to build a token-efficient global database landscape.
+    2. Reconciles extracted entities against a local Obsidian markdown vault,
+       using canonical fuzzy matching and bidirectional backlink crawling.
+    3. Retrieves perspective-side actors, capabilities, and cross-border bridges.
     4. Performs macroeconomic constraint-solving analysis via the configured LLM.
-  5. Formats the analysis into a structured commercial-intelligence dashboard.
-  6. Persists the final dashboard JSON to a local `./dashboards/` directory.
+    5. Formats the analysis into a structured commercial-intelligence dashboard.
+    6. Deterministically validates every opportunity against vault evidence.
+    7. Persists the final dashboard JSON to a local `./dashboards/` directory.
 
 Constraints:
   - Python 3.10+
@@ -48,69 +49,149 @@ from atis_context import PerspectiveContext, validate_opportunity
 PROMPT_STAGE_1_EXTRACTOR: str = (
     "You are the Entity Extraction Module for an economic intelligence pipeline. "
     "Your sole objective is to extract entities from the provided text and classify them into a strict schema. "
-    "Do not analyze or interpret the text.\n"
-    "CLASSIFICATION SCHEMA:\n"
-    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.\n"
-    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.\n"
-    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.\n"
-    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.\n"
-    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.\n"
-    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.\n"
-    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).\n"
-    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.\n\n"
-    "OUTPUT INSTRUCTIONS:\n"
-    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).\n"
-    "JSON SCHEMA:\n"
-    "{\n"
-    '  "entities": [\n'
-    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}\n'
-    "  ],\n"
-    '  "core_event": "String summarizing the article main event."'
-    "\n}"
+    "Do not analyze or interpret the text.
+"
+    "CLASSIFICATION SCHEMA:
+"
+    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.
+"
+    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.
+"
+    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.
+"
+    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.
+"
+    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.
+"
+    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.
+"
+    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).
+"
+    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.
+
+"
+    "OUTPUT INSTRUCTIONS:
+"
+    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).
+"
+    "JSON SCHEMA:
+"
+    "{
+"
+    '  "entities": [
+'
+    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}
+'
+    "  ],
+"
+    '  "core_event": "String summarizing the article main event.",
+'
+    '  "source_country": "Country where the event occurred (infer from text)",
+'
+    '  "event_country": "Country where the underlying development occurred (infer from text)"
+'
+    "}"
 )
 
 PROMPT_STAGE_2_SOLVER: str = (
     "You are the ATIS Equilibrium and Constraint Engine. Your objective is to act as a macroeconomic constraint solver. "
-    "You will be provided with a [NEW EVENT] and a [GRAPH CONTEXT] representing the current known state of the market.\n"
-    "Do not summarize the event. You must calculate the systemic shifts and unfulfilled requirements caused by the event.\n"
-    "Analyse the event from the selected perspective country. Identify which requirements can be satisfied by evidenced perspective-country actors, cross-border pathways, competitive threats, and strategic responses. Distinguish local source-country opportunities from perspective-country opportunities.\n"
-    "Follow this exact reasoning sequence in your markdown output:\n"
-    "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?\n"
-    "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?\n"
-    "## 3. GRAPH RECONCILIATION: Compare constraints against the [GRAPH CONTEXT] and identify unmet requirements.\n"
-    "## 4. ECONOMIC FLOW: For unmet requirements, identify who pays, who benefits, and capital flow.\n"
-    "## 5. OPPORTUNITY CASCADE: Detail Primary, Secondary, and Tertiary business/investment opportunities created by this structural gap."
+    "You will be provided with a [NEW EVENT], a [PERSPECTIVE CONTEXT] containing evidenced actors and capabilities from the perspective country, "
+    "and a [CROSS-BORDER BRIDGE CONTEXT] showing actual vault-documented relationships between the perspective country and the source event country. "
+    "You must calculate the systemic shifts and unfulfilled requirements caused by the event, BUT you may only propose opportunities that are grounded in the provided perspective-side evidence.
+
+"
+    "CRITICAL RULES:
+"
+    "1. You MUST select perspective_actor from the [PERSPECTIVE ACTOR REGISTRY] list below. Do not invent actors.
+"
+    "2. You MUST select perspective_capability from the capabilities listed for that actor. Do not invent capabilities.
+"
+    "3. You MUST select pathway from the [CROSS-BORDER BRIDGE CONTEXT] or from the enumerated list: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry. The pathway must be supported by evidence.
+"
+    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists — this may be the source country, the perspective country, or a third country. Do NOT default it to the perspective country.
+"
+    "5. If no perspective-side actor can respond to the event, state 'NO VALID OPPORTUNITY' and explain the gap.
+"
+    "6. Distinguish local source-country opportunities from perspective-country opportunities. A source-country event does NOT automatically create a perspective-country opportunity.
+
+"
+    "Follow this exact reasoning sequence in your markdown output:
+"
+    "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?
+"
+    "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?
+"
+    "## 3. PERSPECTIVE-SIDE CAPABILITY AUDIT: Which perspective-country actors have evidenced capabilities that could address the constraints?
+"
+    "## 4. CROSS-BORDER BRIDGE AUDIT: Which evidenced pathways connect perspective actors to the source event?
+"
+    "## 5. ECONOMIC FLOW: For validated cross-border opportunities, identify who pays, who benefits, and capital flow.
+"
+    "## 6. OPPORTUNITY CASCADE: Detail ONLY perspective-validated Primary, Secondary, and Tertiary opportunities. If none, say NONE."
 )
 
 PROMPT_STAGE_3_FORMATTER: str = (
     "You are a strict data serialization module. Your objective is to take the provided macroeconomic constraint analysis "
-    "and format it into a structured JSON payload for a commercial intelligence dashboard.\n"
-    "OUTPUT INSTRUCTIONS:\n"
+    "and format it into a structured JSON payload for a commercial intelligence dashboard.
+"
+    "OUTPUT INSTRUCTIONS:
+"
     "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json). "
-    "Calculate urgency_score and feasibility_score on a scale of 1.0 to 10.0.\n"
-    "JSON SCHEMA:\n"
-    "{\n"
-    '  "intelligence_id": "ATIS-INT-GENERIC",\n'
-    '  "trigger_event": "String",\n'
-    '  "market_equilibrium_shift": "String",\n'
-    '  "opportunities": [\n'
-    "    {\n"
-    '      "opportunity_id": "OPP-001",\n'
-    '      "title": "String",\n'
-    '      "type": "String",\n'
-    '      "perspective_country": "String", "perspective_country_code": "ISO-2",\n'
-    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",\n'
-    '      "cross_border": true, "cross_border_countries": ["String"],\n'
-    '      "perspective_actor": "Evidenced actor or empty", "perspective_capability": "Evidenced capability or empty", "pathway": "Evidenced pathway or empty",\n'
-    '      "source_nodes": ["Exact vault node IDs"],\n'
-    '      "urgency_score": Float,\n'
-    '      "feasibility_score": Float,\n'
-    '      "required_missing_nodes": ["String"],\n'
-    '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},\n'
-    '      "justification": "One precise sentence explaining the structural gap."'
-    "\n    }\n"
+    "Calculate urgency_score and feasibility_score on a scale of 1.0 to 10.0.
+"
+    "JSON SCHEMA:
+"
+    "{
+"
+    '  "intelligence_id": "ATIS-INT-GENERIC",
+'
+    '  "trigger_event": "String",
+'
+    '  "market_equilibrium_shift": "String",
+'
+    '  "source_country": "String",
+'
+    '  "event_country": "String",
+'
+    '  "opportunities": [
+'
+    "    {
+"
+    '      "opportunity_id": "OPP-001",
+'
+    '      "title": "String",
+'
+    '      "type": "String",
+'
+    '      "perspective_country": "String", "perspective_country_code": "ISO-2",
+'
+    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",
+'
+    '      "cross_border": true, "cross_border_countries": ["String"],
+'
+    '      "perspective_actor": "MUST be from the PERSPECTIVE ACTOR REGISTRY",
+'
+    '      "perspective_capability": "MUST be a capability listed for that actor",
+'
+    '      "pathway": "MUST be from the enumerated list and supported by evidence",
+'
+    '      "source_nodes": ["Exact vault node IDs"],
+'
+    '      "urgency_score": Float,
+'
+    '      "feasibility_score": Float,
+'
+    '      "required_missing_nodes": ["String"],
+'
+    '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},
+'
+    '      "justification": "One precise sentence explaining the structural gap and the evidenced pathway."
+'
+    "    }
+"
     "  ]"
-    "\n}"
+    "
+}"
 )
 
 
@@ -230,7 +311,8 @@ class TokenBudget:
 class ObsidianVaultManager:
     """
     Handles vault indexing, fuzzy filename matching, bidirectional link crawling
-    (outbound + inbound backlinks), and shadow-node provisioning for the ATIS graph layer.
+    (outbound + inbound backlinks), shadow-node provisioning, and perspective-side
+    retrieval for the ATIS graph layer.
     """
 
     def __init__(self, vault_dir: Path = VAULT_DIR) -> None:
@@ -240,6 +322,7 @@ class ObsidianVaultManager:
         # Core Graph Indexing Maps
         self.file_map: Dict[str, str] = {}  # canonical_name -> actual_file_stem
         self.backlink_map: Dict[str, Set[str]] = {}  # canonical_name -> set of actual_file_stems linking to it
+        self.node_metadata: Dict[str, Dict[str, Any]] = {}  # canonical_name -> {country, type, summary}
 
         # Build index immediately on startup
         self._index_vault()
@@ -266,11 +349,13 @@ class ObsidianVaultManager:
         """
         Performs a full pass over the vault to catalog existing nodes and map
         bidirectional graph relationships (backlinks) before execution.
+        Also extracts country metadata from frontmatter and file paths.
         """
         self.file_map.clear()
         self.backlink_map.clear()
+        self.node_metadata.clear()
 
-        md_files = list(self.vault_dir.glob("*.md"))
+        md_files = list(self.vault_dir.rglob("*.md"))
         logger.info("Indexing %d existing vault files for graph matching...", len(md_files))
 
         for file_path in md_files:
@@ -282,6 +367,42 @@ class ObsidianVaultManager:
 
             try:
                 content = file_path.read_text(encoding="utf-8")
+                # Extract frontmatter for country metadata
+                country = ""
+                node_type = ""
+                fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+                if fm_match:
+                    try:
+                        import yaml
+                        front = yaml.safe_load(fm_match.group(1)) or {}
+                        country = front.get("country", "") or front.get("location", "")
+                        node_type = front.get("node_type", "") or front.get("type", "") or front.get("entity_type", "")
+                    except Exception:
+                        pass
+
+                # Infer country from path if not in frontmatter
+                if not country:
+                    path_parts = [p.lower() for p in file_path.relative_to(self.vault_dir).parts]
+                    for part in path_parts:
+                        if part in ("zimbabwe", "zambia", "south africa", "botswana", "kenya", "china", "germany", "switzerland", "united kingdom", "united states of america"):
+                            country = part.title()
+                            break
+
+                # Extract summary
+                summary = ""
+                lines = [l.strip() for l in content.split("\n") if l.strip()]
+                for line in lines:
+                    if not line.startswith("---") and not line.startswith("#"):
+                        summary = line[:200]
+                        break
+
+                self.node_metadata[canonical_stem] = {
+                    "country": country,
+                    "type": node_type,
+                    "summary": summary,
+                    "path": str(file_path.relative_to(self.vault_dir)),
+                }
+
                 # Parse Obsidian style [[WikiLinks]] or [[WikiLinks|Display Name]]
                 links = re.findall(r"\[\[(.*?)\]\]", content)
                 for link in links:
@@ -375,6 +496,103 @@ class ObsidianVaultManager:
 
         return "\n".join(bundle_parts)
 
+    # -- Perspective-Side Retrieval (NEW) ----------------------------------- #
+    def get_perspective_nodes(self, perspective: PerspectiveContext) -> List[Dict[str, Any]]:
+        """
+        Retrieve all vault nodes that belong to the perspective country.
+        Returns a list of dicts with node_id, country, type, summary, content.
+        """
+        perspective_country_norm = perspective.country.lower()
+        results: List[Dict[str, Any]] = []
+
+        for canonical_stem, actual_stem in self.file_map.items():
+            meta = self.node_metadata.get(canonical_stem, {})
+            node_country = (meta.get("country") or "").lower()
+            if node_country == perspective_country_norm:
+                content = self.read_entity(actual_stem)
+                results.append({
+                    "node_id": actual_stem,
+                    "country": meta.get("country", ""),
+                    "type": meta.get("type", ""),
+                    "summary": meta.get("summary", ""),
+                    "content": content[:1500],  # Truncated for token efficiency
+                })
+
+        logger.info("Retrieved %d perspective-side nodes for %s", len(results), perspective.country)
+        return results
+
+    def get_cross_border_bridges(self, perspective: PerspectiveContext, source_country: str) -> List[Dict[str, Any]]:
+        """
+        Find nodes in the perspective country that have links to nodes in the source country,
+        or nodes in the source country that have links to perspective-country nodes.
+        Returns bridge dicts with from_node, to_node, relationship_type.
+        """
+        perspective_norm = perspective.country.lower()
+        source_norm = source_country.lower()
+        bridges: List[Dict[str, Any]] = []
+
+        for canonical_stem, actual_stem in self.file_map.items():
+            meta = self.node_metadata.get(canonical_stem, {})
+            node_country = (meta.get("country") or "").lower()
+
+            # Only process nodes from either perspective or source country
+            if node_country not in (perspective_norm, source_norm):
+                continue
+
+            content = self.read_entity(actual_stem)
+            links = re.findall(r"\[\[(.*?)\]\]", content)
+
+            for link in links:
+                link_clean = link.split("|")[0].strip()
+                link_canonical = self._canonicalize(link_clean)
+                if link_canonical not in self.file_map:
+                    continue
+
+                link_meta = self.node_metadata.get(link_canonical, {})
+                link_country = (link_meta.get("country") or "").lower()
+
+                # Check if this link crosses between perspective and source countries
+                if node_country == perspective_norm and link_country == source_norm:
+                    bridges.append({
+                        "from_node": actual_stem,
+                        "from_country": perspective.country,
+                        "to_node": self.file_map[link_canonical],
+                        "to_country": source_country,
+                        "relationship_type": "outbound_link",
+                    })
+                elif node_country == source_norm and link_country == perspective_norm:
+                    bridges.append({
+                        "from_node": actual_stem,
+                        "from_country": source_country,
+                        "to_node": self.file_map[link_canonical],
+                        "to_country": perspective.country,
+                        "relationship_type": "outbound_link",
+                    })
+
+        # Also check backlinks
+        for canonical_stem, actual_stem in self.file_map.items():
+            meta = self.node_metadata.get(canonical_stem, {})
+            node_country = (meta.get("country") or "").lower()
+            if node_country != perspective_norm:
+                continue
+
+            inbound_stems = self.backlink_map.get(canonical_stem, set())
+            for inbound in inbound_stems:
+                inbound_canonical = self._canonicalize(inbound)
+                inbound_meta = self.node_metadata.get(inbound_canonical, {})
+                inbound_country = (inbound_meta.get("country") or "").lower()
+                if inbound_country == source_norm:
+                    bridges.append({
+                        "from_node": inbound,
+                        "from_country": source_country,
+                        "to_node": actual_stem,
+                        "to_country": perspective.country,
+                        "relationship_type": "backlink",
+                    })
+
+        logger.info("Found %d cross-border bridges between %s and %s", len(bridges), perspective.country, source_country)
+        return bridges
+
     # -- Global Database Indexer -------------------------------------------- #
     def build_global_database_context(self, explicit_names: set[str]) -> str:
         """
@@ -388,22 +606,15 @@ class ObsidianVaultManager:
             if canonical_stem in canonical_explicits:
                 continue
 
-            content = self.read_entity(actual_stem)
+            meta = self.node_metadata.get(canonical_stem, {})
             front_matter = ""
-            fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-            if fm_match:
-                front_matter = fm_match.group(1).strip().replace("\n", " | ")
-
-            summary = ""
-            lines = [l.strip() for l in content.split("\n") if l.strip()]
-            for line in lines:
-                if not line.startswith("---") and not line.startswith("#"):
-                    summary = line[:120]
-                    break
+            summary = meta.get("summary", "")
 
             metadata_str = f"- **{actual_stem}**"
-            if front_matter:
-                metadata_str += f" [{front_matter}]"
+            if meta.get("country"):
+                metadata_str += f" [country: {meta['country']}]"
+            if meta.get("type"):
+                metadata_str += f" [type: {meta['type']}]"
             if summary:
                 metadata_str += f" -> Context: {summary}"
 
@@ -458,9 +669,11 @@ class ObsidianVaultManager:
             )
 
     # -- Graph Context Builder ---------------------------------------------- #
-    def build_graph_context(self, entities: List[Dict[str, str]]) -> str:
+    def build_graph_context(self, entities: List[Dict[str, str]], perspective: PerspectiveContext) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Process explicit entities using the new fuzzy-matching and backlink injection engine.
+        Also retrieves perspective-side nodes and cross-border bridges.
+        Returns: (combined_context, perspective_nodes, cross_border_bridges)
         """
         context_parts: List[str] = []
         handled_canonical_names: set[str] = set()
@@ -497,7 +710,51 @@ class ObsidianVaultManager:
             f"{global_landscape}"
         )
 
-        return "\n".join(context_parts)
+        source_context = "\n".join(context_parts)
+
+        # Retrieve perspective-side nodes
+        perspective_nodes = self.get_perspective_nodes(perspective)
+
+        # Determine source country from entities (best effort)
+        source_country = ""
+        for entity in entities:
+            ctx = entity.get("context", "").lower()
+            if "zambia" in ctx:
+                source_country = "Zambia"
+                break
+            elif "zimbabwe" in ctx:
+                source_country = "Zimbabwe"
+                break
+
+        # If we couldn't infer from entities, try to find any non-perspective country in the source context
+        if not source_country:
+            source_country = perspective.country  # fallback for domestic analysis
+
+        # Retrieve cross-border bridges
+        cross_border_bridges = []
+        if source_country.lower() != perspective.country.lower():
+            cross_border_bridges = self.get_cross_border_bridges(perspective, source_country)
+
+        # Build perspective context block
+        perspective_blocks: List[str] = []
+        perspective_blocks.append(f"\n=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
+        for pn in perspective_nodes[:30]:  # Cap for token budget
+            perspective_blocks.append(
+                f"- {pn['node_id']} | type: {pn['type']} | summary: {pn['summary'][:100]}"
+            )
+
+        if cross_border_bridges:
+            perspective_blocks.append(f"\n=== CROSS-BORDER BRIDGE CONTEXT ({perspective.country} ↔ {source_country}) ===")
+            for bridge in cross_border_bridges[:20]:  # Cap for token budget
+                perspective_blocks.append(
+                    f"- {bridge['from_node']} ({bridge['from_country']}) → {bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
+                )
+        else:
+            perspective_blocks.append(f"\n=== CROSS-BORDER BRIDGE CONTEXT ===\nNo evidenced cross-border relationships found between {perspective.country} and {source_country}.")
+
+        combined_context = source_context + "\n" + "\n".join(perspective_blocks)
+
+        return combined_context, perspective_nodes, cross_border_bridges
 
 
 # --------------------------------------------------------------------------- #
@@ -572,7 +829,7 @@ class LLMPipeline:
     def stage_1_extract(self, article_text: str) -> Dict[str, Any]:
         """
         Stage 1 — Send the article text to the Entity Extraction Module.
-        Returns a Python dict with 'entities' and 'core_event'.
+        Returns a Python dict with 'entities', 'core_event', 'source_country', 'event_country'.
         """
         logger.info("=" * 60)
         logger.info("STAGE 1: ENTITY EXTRACTION")
@@ -598,9 +855,11 @@ class LLMPipeline:
 
         entity_count = len(data.get("entities", []))
         logger.info(
-            "Stage 1 complete. Extracted %d entities. Core event: %s",
+            "Stage 1 complete. Extracted %d entities. Core event: %s | Source: %s | Event: %s",
             entity_count,
             data.get("core_event", "N/A"),
+            data.get("source_country", "N/A"),
+            data.get("event_country", "N/A"),
         )
         return data
 
@@ -622,7 +881,9 @@ class LLMPipeline:
 
         user_payload = (
             f"[ANALYTICAL PERSPECTIVE]: {perspective.country} ({perspective.country_code})\n"
-            "Every proposed opportunity must be actionable from this perspective and supported by the graph.\n\n"
+            "You MUST use only the actors and capabilities listed in the PERSPECTIVE ACTOR REGISTRY. "
+            "You MUST use only the pathways evidenced in the CROSS-BORDER BRIDGE CONTEXT. "
+            "Do not invent perspective-side actors, capabilities, or pathways.\n\n"
             f"[NEW EVENT]:\n{article_text}\n\n"
             f"[GRAPH CONTEXT]:\n{graph_context}"
         )
@@ -665,7 +926,12 @@ class LLMPipeline:
         raw_response = self._call_api(
             PROMPT_STAGE_3_FORMATTER,
             f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n"
-            "Do not invent a perspective actor or capability. Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
+            "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
+            "You MUST select perspective_capability from the capabilities listed for that actor. "
+            "You MUST select pathway from the enumerated list and ensure it is supported by the CROSS-BORDER BRIDGE CONTEXT. "
+            "You MUST set opportunity_country to the actual country where the commercial value exists. "
+            "Do NOT default opportunity_country to the perspective country. "
+            "Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
             + stage_2_analysis,
         )
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
@@ -738,21 +1004,27 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
 
     entities: List[Dict[str, str]] = stage_1_result.get("entities", [])
     core_event: str = stage_1_result.get("core_event", "Unknown event")
+    source_country: str = stage_1_result.get("source_country", "")
+    event_country: str = stage_1_result.get("event_country", source_country)
 
     if not entities:
         logger.warning("No entities extracted; graph context will be empty.")
 
     # ------------------------------------------------------------------ #
-    # 3. Graph Processing Layer
+    # 3. Graph Processing Layer — WITH PERSPECTIVE RECONCILIATION
     # ------------------------------------------------------------------ #
     logger.info("=" * 60)
-    logger.info("GRAPH PROCESSING LAYER")
+    logger.info("GRAPH PROCESSING LAYER — PERSPECTIVE RECONCILIATION")
     logger.info("=" * 60)
 
-    graph_context = vault_manager.build_graph_context(entities)
+    graph_context, perspective_nodes, cross_border_bridges = vault_manager.build_graph_context(entities, perspective)
     logger.info(
-        "Consolidated graph context built: %d characters", len(graph_context)
+        "Consolidated graph context built: %d characters | %d perspective nodes | %d cross-border bridges",
+        len(graph_context), len(perspective_nodes), len(cross_border_bridges),
     )
+
+    # Build sets for deterministic validation
+    perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
 
     # ------------------------------------------------------------------ #
     # 4. Stage 2 — Constraint Solving
@@ -773,19 +1045,36 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
         raise
 
     # ------------------------------------------------------------------ #
-    # 6. Enrich & Persist
+    # 6. Enrich & Persist — WITH DETERMINISTIC VALIDATION
     # ------------------------------------------------------------------ #
     dashboard_payload["perspective"] = perspective.as_dict()
-    dashboard_payload["opportunities"] = [
-        validate_opportunity(item, perspective)
-        for item in dashboard_payload.get("opportunities", [])
-        if isinstance(item, dict)
-    ]
+    dashboard_payload["source_country"] = source_country
+    dashboard_payload["event_country"] = event_country
+
+    validated_opportunities = []
+    for item in dashboard_payload.get("opportunities", []):
+        if isinstance(item, dict):
+            validated = validate_opportunity(
+                item,
+                perspective,
+                source_node_ids=None,  # In news pipeline, source nodes are the extracted entities
+                perspective_node_ids=perspective_node_ids,
+                cross_border_bridges=cross_border_bridges,
+            )
+            validated_opportunities.append(validated)
+    dashboard_payload["opportunities"] = validated_opportunities
+
     dashboard_payload["pipeline_metadata"] = {
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source_article": str(article_file.resolve()),
         "extracted_entities_count": len(entities),
         "core_event": core_event,
+        "source_country": source_country,
+        "event_country": event_country,
+        "perspective_country": perspective.country,
+        "perspective_country_code": perspective.country_code,
+        "perspective_nodes_found": len(perspective_nodes),
+        "cross_border_bridges_found": len(cross_border_bridges),
         "model_primary": pipeline.config.model,
         "model_fallback": pipeline.config.fallback_model,
     }
@@ -862,9 +1151,12 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
 
     entities = stage_1_result.get("entities", [])
     core_event = stage_1_result.get("core_event", "Unknown event")
+    source_country = stage_1_result.get("source_country", "")
+    event_country = stage_1_result.get("event_country", source_country)
 
-    # Graph layer
-    graph_context = vault_manager.build_graph_context(entities)
+    # Graph layer — WITH PERSPECTIVE RECONCILIATION
+    graph_context, perspective_nodes, cross_border_bridges = vault_manager.build_graph_context(entities, perspective)
+    perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
 
     # Stage 2
     try:
@@ -880,18 +1172,35 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         logger.critical("STAGE 3 FAILED: %s", exc)
         raise
 
-    # Enrich
+    # Enrich with deterministic validation
     dashboard_payload["perspective"] = perspective.as_dict()
-    dashboard_payload["opportunities"] = [
-        validate_opportunity(item, perspective)
-        for item in dashboard_payload.get("opportunities", [])
-        if isinstance(item, dict)
-    ]
+    dashboard_payload["source_country"] = source_country
+    dashboard_payload["event_country"] = event_country
+
+    validated_opportunities = []
+    for item in dashboard_payload.get("opportunities", []):
+        if isinstance(item, dict):
+            validated = validate_opportunity(
+                item,
+                perspective,
+                source_node_ids=None,
+                perspective_node_ids=perspective_node_ids,
+                cross_border_bridges=cross_border_bridges,
+            )
+            validated_opportunities.append(validated)
+    dashboard_payload["opportunities"] = validated_opportunities
+
     dashboard_payload["pipeline_metadata"] = {
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source_article": "web_upload",
         "extracted_entities_count": len(entities),
         "core_event": core_event,
+        "source_country": source_country,
+        "event_country": event_country,
+        "perspective_country": perspective.country,
+        "perspective_country_code": perspective.country_code,
+        "perspective_nodes_found": len(perspective_nodes),
+        "cross_border_bridges_found": len(cross_border_bridges),
         "model_primary": pipeline.config.model,
         "model_fallback": pipeline.config.fallback_model,
     }

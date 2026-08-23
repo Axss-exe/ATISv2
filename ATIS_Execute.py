@@ -8,6 +8,10 @@ Scans an indexed Obsidian vault against a target opportunity from an ATIS
 dashboard, compiles a tactical transaction roadmap via the configured LLM,
 and persists the result as a markdown file.
 
+CRITICAL: Only opportunities with status == "VALID" and evidenced perspective-side
+actors, capabilities, and pathways are eligible for execution. RESEARCH_REQUIRED
+opportunities are rejected with a research recommendation.
+
 Map-Reduce Architecture:
   1. MAP: Split vault nodes into 4-node chunks. Extract legal waivers,
      restrictions, and tactical facts per chunk.
@@ -58,8 +62,10 @@ except ImportError:
 
 if _MISSING_DEPS:
     print(
-        "FATAL: Missing required dependencies:\n  - "
-        + "\n  - ".join(_MISSING_DEPS),
+        "FATAL: Missing required dependencies:
+  - "
+        + "
+  - ".join(_MISSING_DEPS),
         file=sys.stderr,
     )
     sys.exit(1)
@@ -112,6 +118,7 @@ class VaultNode:
     body_preview: str = ""
     is_anchor: bool = False
     backlink_uids: List[str] = field(default_factory=list)
+    country: str = ""
 
 
 # =============================================================================
@@ -229,6 +236,15 @@ class ObsidianVaultManager:
             outbound_links = self._extract_outbound_links(raw_content)
             extracted_sections = self._extract_relevant_sections(body)
 
+            # Extract country from frontmatter or path
+            country = front_matter.get("country", "") or front_matter.get("location", "")
+            if not country:
+                path_parts = [p.lower() for p in md_path.relative_to(self.vault_root).parts]
+                for part in path_parts:
+                    if part in ("zimbabwe", "zambia", "south africa", "botswana", "kenya", "china", "germany", "switzerland", "united kingdom", "united states of america"):
+                        country = part.title()
+                        break
+
             uid = md_path.stem
             node = VaultNode(
                 uid=uid,
@@ -241,6 +257,7 @@ class ObsidianVaultManager:
                 body=body,
                 extracted_sections=extracted_sections,
                 body_preview=body[:2000],
+                country=country,
             )
             self.nodes[uid] = node
 
@@ -747,7 +764,7 @@ class LLMExecutionEngine:
           1. Split nodes into chunks of CHUNK_SIZE.
           2. MAP: Extract tactical intelligence per chunk (analysis_summary + ui_lineage_trace).
           3. REDUCE: Synthesize master roadmap from chunk summaries.
-          
+
         Returns a dict with keys:
           - 'final_roadmap': str
           - 'ui_thinking_graph': str (raw JSON string)
@@ -778,7 +795,7 @@ class LLMExecutionEngine:
         # MAP phase
         for idx, chunk in enumerate(chunks):
             raw_response = self._map_chunk(opportunity, chunk, idx, total_chunks)
-            
+
             # Extract <analysis_summary>
             summary_match = re.search(r"<analysis_summary>(.*?)</analysis_summary>", raw_response, re.DOTALL)
             if summary_match:
@@ -786,7 +803,7 @@ class LLMExecutionEngine:
             else:
                 analysis_summaries.append(raw_response.strip())
                 logger.warning("Chunk %d: <analysis_summary> tag not found; using raw response.", idx + 1)
-            
+
             # Extract <ui_lineage_trace>
             trace_match = re.search(r"<ui_lineage_trace>(.*?)</ui_lineage_trace>", raw_response, re.DOTALL)
             if trace_match:
@@ -802,17 +819,17 @@ class LLMExecutionEngine:
                     logger.warning("Chunk %d: failed to parse lineage trace JSON: %s", idx + 1, exc)
             else:
                 logger.warning("Chunk %d: <ui_lineage_trace> tag not found.", idx + 1)
-            
+
             if idx < total_chunks - 1:
                 time.sleep(INTER_CHUNK_DELAY_SECONDS)
 
         # REDUCE phase
         raw_reduce = self._reduce_synthesize(opportunity, analysis_summaries)
-        
+
         # Extract <final_roadmap>
         roadmap_match = re.search(r"<final_roadmap>(.*?)</final_roadmap>", raw_reduce, re.DOTALL)
         final_roadmap = roadmap_match.group(1).strip() if roadmap_match else raw_reduce
-        
+
         # Extract <ui_thinking_graph>
         graph_match = re.search(r"<ui_thinking_graph>(.*?)</ui_thinking_graph>", raw_reduce, re.DOTALL)
         ui_thinking_graph = graph_match.group(1).strip() if graph_match else "{}"
@@ -866,10 +883,10 @@ Opportunity ID: `{opportunity_id}`
         thinking_graph = json.loads(ui_thinking_graph_raw)
         if not isinstance(thinking_graph, dict):
             raise ValueError("ui_thinking_graph root is not a JSON object.")
-        
+
         # Inject granular lineage traces
         thinking_graph["compiled_lineage_traces"] = compiled_lineage_traces
-        
+
         json_path.write_text(
             json.dumps(thinking_graph, indent=2, default=str),
             encoding="utf-8",
@@ -877,7 +894,7 @@ Opportunity ID: `{opportunity_id}`
         logger.info("Reasoning JSON persisted to: %s", json_path)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.error("Failed to parse ui_thinking_graph JSON: %s", exc)
-        
+
         # Write raw unparsed string to debug log
         debug_path = output_dir / f"reasoning_{opportunity_id}_DEBUG.log"
         debug_path.write_text(
@@ -885,7 +902,7 @@ Opportunity ID: `{opportunity_id}`
             encoding="utf-8",
         )
         logger.warning("Raw graph string written to debug log: %s", debug_path)
-        
+
         # Prevent crash by writing a fallback JSON with traces and error metadata
         fallback = {
             "parse_error": str(exc),
@@ -901,6 +918,46 @@ Opportunity ID: `{opportunity_id}`
         logger.info("Fallback reasoning JSON persisted to: %s", json_path)
 
     return md_path, json_path
+
+
+# =============================================================================
+# Opportunity validation for execution
+# =============================================================================
+def validate_opportunity_for_execution(opportunity: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate that an opportunity is eligible for execution.
+    Only VALID opportunities with evidenced perspective-side actors can be executed.
+
+    Returns (is_valid, message).
+    """
+    status = opportunity.get("status", "")
+    if status != "VALID":
+        return False, f"Opportunity status is '{status}'. Only VALID opportunities can be executed. RESEARCH_REQUIRED opportunities need additional vault evidence before execution."
+
+    perspective_actor = opportunity.get("perspective_actor", "")
+    perspective_capability = opportunity.get("perspective_capability", "")
+    pathway = opportunity.get("pathway", "")
+
+    if not perspective_actor:
+        return False, "Missing perspective_actor. Cannot execute without an evidenced actor."
+
+    if not perspective_capability:
+        return False, "Missing perspective_capability. Cannot execute without evidenced capability."
+
+    if not pathway:
+        return False, "Missing pathway. Cannot execute without an evidenced mechanism."
+
+    # Check evidence flags
+    if not opportunity.get("perspective_actor_evidence", False):
+        return False, f"Perspective actor '{perspective_actor}' is not evidenced in the vault."
+
+    if not opportunity.get("perspective_capability_evidence", False):
+        return False, "Perspective capability is not evidenced."
+
+    if not opportunity.get("pathway_evidence", False):
+        return False, "Pathway is not evidenced."
+
+    return True, "Opportunity validated for execution."
 
 
 # =============================================================================
@@ -947,7 +1004,15 @@ def main() -> None:
         logger.error("Failed to load opportunity: %s", exc)
         sys.exit(1)
 
-    # 2. Index vault
+    # 2. Validate opportunity for execution
+    is_valid, validation_message = validate_opportunity_for_execution(opportunity)
+    logger.info("Execution validation: %s", validation_message)
+    if not is_valid:
+        logger.error("Execution blocked: %s", validation_message)
+        print(f"\nEXECUTION BLOCKED: {validation_message}")
+        sys.exit(1)
+
+    # 3. Index vault
     vault_mgr = ObsidianVaultManager(vault_path)
     try:
         vault_mgr.build_index()
@@ -955,7 +1020,7 @@ def main() -> None:
         logger.error("Vault indexing failed: %s", exc)
         sys.exit(1)
 
-    # 3. Expand keywords and search (Anchor + Crawl)
+    # 4. Expand keywords and search (Anchor + Crawl)
     seed_terms = expand_keywords(opportunity)
     try:
         matches = vault_mgr.search(opportunity, seed_terms)
@@ -963,7 +1028,7 @@ def main() -> None:
         logger.error("Vault search failed: %s", exc)
         sys.exit(1)
 
-    # 4. LLM generation — Map-Reduce
+    # 5. LLM generation — Map-Reduce
     engine = LLMExecutionEngine()
     try:
         result = engine.generate_roadmap(opportunity, matches)
@@ -971,7 +1036,7 @@ def main() -> None:
         logger.error("Roadmap generation failed: %s", exc)
         sys.exit(1)
 
-    # 5. Persist twin files
+    # 6. Persist twin files
     try:
         md_path, json_path = persist_outputs(
             args.opportunity_id,
@@ -995,6 +1060,9 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
     """
     Web-compatible entry point. Accepts dashboard dict and opportunity ID.
     Returns dict with final_roadmap, ui_thinking_graph, and compiled_lineage_traces.
+
+    CRITICAL: Validates that the opportunity is VALID before executing.
+    RESEARCH_REQUIRED opportunities are rejected with an explanation.
     """
     vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
     vault_mgr = ObsidianVaultManager(vault_path)
@@ -1006,17 +1074,36 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
     perspective = dashboard_perspective
     opportunity = dict(dashboard_json)
     opportunity.update(perspective.as_fields())
+
     logger.info(
-        "ATIS ANALYSIS CONTEXT | Perspective: %s (%s) | Source country: %s | Event country: %s | Opportunity country: %s | Cross-border: %s",
+        "ATIS ANALYSIS CONTEXT | Perspective: %s (%s) | Source country: %s | Event country: %s | Opportunity country: %s | Cross-border: %s | Status: %s",
         perspective.country,
         perspective.country_code,
         opportunity.get("source_country", ""),
         opportunity.get("event_country", ""),
         opportunity.get("opportunity_country", ""),
         opportunity.get("cross_border", False),
+        opportunity.get("status", "UNKNOWN"),
     )
-    seed_terms = expand_keywords(opportunity)
 
+    # Validate before execution
+    is_valid, validation_message = validate_opportunity_for_execution(opportunity)
+    if not is_valid:
+        logger.warning("Execution blocked for %s: %s", opportunity_id, validation_message)
+        return {
+            "opportunity_id": opportunity_id,
+            "status": "EXECUTION_BLOCKED",
+            "validation_message": validation_message,
+            "perspective": perspective.as_dict(),
+            "final_roadmap": f"# Execution Blocked\n\n{validation_message}\n\n## Recommended Actions\n1. Expand the vault with perspective-country actors and capabilities\n2. Document cross-border relationships between {perspective.country} and {opportunity.get('source_country', 'source country')}\n3. Re-run the pipeline after vault enrichment",
+            "ui_thinking_graph": json.dumps({
+                "metrics": {"total_vault_files_scanned": vault_mgr.indexed_count, "nodes_extracted": 0, "map_chunks_processed": 0, "estimated_manual_hours_saved": 0},
+                "convergence_flow": {"tier_1_anchors": [], "tier_2_processing_chunks": [], "tier_3_synthesis_logic": "Execution blocked due to insufficient perspective-side evidence."},
+            }),
+            "compiled_lineage_traces": [],
+        }
+
+    seed_terms = expand_keywords(opportunity)
     matches = vault_mgr.search(opportunity, seed_terms)
 
     engine = LLMExecutionEngine()
@@ -1032,6 +1119,8 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
 
     return {
         "opportunity_id": opportunity_id,
+        "status": "EXECUTED",
+        "validation_message": validation_message,
         "final_roadmap": result["final_roadmap"],
         "ui_thinking_graph": result["ui_thinking_graph"],
         "compiled_lineage_traces": result["compiled_lineage_traces"],

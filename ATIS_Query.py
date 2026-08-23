@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v3.1 — Grounded Intent-First Architecture
+ATIS_Query.py v4.0 — Perspective-First Grounded Architecture
 
-3-STAGE PIPELINE:
+4-STAGE PIPELINE:
   0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
-  1. BROAD PRE-FILTER:     Python loose matching → ~80 candidates (0 calls)
-  2. LLM SEMANTIC RANKING: LLM reads candidates → ranks top 20 by relevance (1 call)
-  3. GROUNDED SYNTHESIS:   LLM synthesizes dashboard from ranked nodes ONLY (1 call)
+  1. SOURCE PRE-FILTER:    Python loose matching → source-event candidates (0 calls)
+  2. PERSPECTIVE-SIDE RETRIEVAL: Programmatic vault query for perspective-country actors,
+     capabilities, and cross-border bridges (0 calls)
+  3. LLM SEMANTIC RANKING: LLM reads combined candidates → ranks top 20 by relevance (1 call)
+  4. GROUNDED SYNTHESIS:   LLM synthesizes dashboard from ranked nodes ONLY,
+     with mandatory perspective actor/capability/pathway evidence (1 call)
 
 BACKWARD COMPATIBILITY:
   - findings/opportunities/risks returned as STRING arrays (v0 compatible)
-  - Cited versions available in findings_cited/opportunities_cited/risks_cited
+  - Cited versions available in *_cited fields
   - Response is flat: no nested .dashboard wrapper
 
 ANTI-HALLUCINATION:
   - LLM only sees provided nodes
   - Every claim must cite source_node
   - Missing data → "Not found in vault"
+  - Perspective actor MUST be from perspective-side node registry
+  - Cross-border pathways MUST be supported by bridge evidence
 """
 
 from __future__ import annotations
@@ -56,7 +61,9 @@ except ImportError:
     _MISSING_DEPS.append("PyYAML (pip install pyyaml)")
 
 if _MISSING_DEPS:
-    print("FATAL: Missing required dependencies:\n  - " + "\n  - ".join(_MISSING_DEPS), file=sys.stderr)
+    print("FATAL: Missing required dependencies:
+  - " + "
+  - ".join(_MISSING_DEPS), file=sys.stderr)
     sys.exit(1)
 
 # =============================================================================
@@ -83,116 +90,253 @@ def _sanitize_for_json(data):
 # =============================================================================
 INTENT_EXTRACTION_PROMPT: str = (
     "You are the ATIS Intent Extraction Engine. Analyze the user's question and extract "
-    "a structured search intent. Output ONLY valid raw JSON. No markdown fences. No commentary.\n\n"
-    "OUTPUT SCHEMA:\n"
-    "{\n"
-    '  "intent_type": "OVERVIEW|SPECIFIC_ENTITY|FILTERED_LIST|RELATIONSHIP|COMPARISON",\n'
-    '  "target_entities": ["concrete nouns to search for"],\n'
-    '  "target_entity_types": ["mining_refinery|government_agency|commodity|policy_framework|infrastructure_node|private_conglomerate|government_ministry|academic_institution"],\n'
-    '  "target_countries": ["country names if mentioned"],\n'
-    '  "target_sectors": ["sector names if mentioned"],\n'
-    '  "target_attributes": {"status": "operational|planned|under_construction", "ownership": "state_owned|private"},\n'
-    '  "relationship_type": "regulates|owns|funds|operates|licenses|null",\n'
-    '  "output_format": "structured_table|summary|entity_profile|relationship_graph",\n'
-    '  "max_results_hint": 5|10|15|20|30\n'
-    "}\n\n"
-    "RULES:\n"
-    "- intent_type: OVERVIEW for broad summaries, SPECIFIC_ENTITY for 'who is X', FILTERED_LIST for 'which X are Y', RELATIONSHIP for 'who regulates X'.\n"
-    "- target_entities: extract ONLY concrete nouns. Strip vague words like overview, intelligence, information, data, summary, landscape.\n"
-    "- max_results_hint: OVERVIEW=20, SPECIFIC_ENTITY=3, FILTERED_LIST=15, RELATIONSHIP=8.\n"
+    "a structured search intent. Output ONLY valid raw JSON. No markdown fences. No commentary.
+
+"
+    "OUTPUT SCHEMA:
+"
+    "{
+"
+    '  "intent_type": "OVERVIEW|SPECIFIC_ENTITY|FILTERED_LIST|RELATIONSHIP|COMPARISON",
+'
+    '  "target_entities": ["concrete nouns to search for"],
+'
+    '  "target_entity_types": ["mining_refinery|government_agency|commodity|policy_framework|infrastructure_node|private_conglomerate|government_ministry|academic_institution"],
+'
+    '  "target_countries": ["country names if mentioned"],
+'
+    '  "target_sectors": ["sector names if mentioned"],
+'
+    '  "target_attributes": {"status": "operational|planned|under_construction", "ownership": "state_owned|private"},
+'
+    '  "relationship_type": "regulates|owns|funds|operates|licenses|null",
+'
+    '  "output_format": "structured_table|summary|entity_profile|relationship_graph",
+'
+    '  "max_results_hint": 5|10|15|20|30
+'
+    "}
+
+"
+    "RULES:
+"
+    "- intent_type: OVERVIEW for broad summaries, SPECIFIC_ENTITY for 'who is X', FILTERED_LIST for 'which X are Y', RELATIONSHIP for 'who regulates X'.
+"
+    "- target_entities: extract ONLY concrete nouns. Strip vague words like overview, intelligence, information, data, summary, landscape.
+"
+    "- max_results_hint: OVERVIEW=20, SPECIFIC_ENTITY=3, FILTERED_LIST=15, RELATIONSHIP=8.
+"
+    "- target_countries: infer the SOURCE/EVENT country from the question, NOT the perspective country.
+"
     "- Output ONLY raw JSON."
 )
 
 SEMANTIC_RANKING_PROMPT: str = (
     "You are a Semantic Relevance Engine for the ATIS Intelligence System. "
-    "Your job is to rank vault nodes by their relevance to the user's question from the selected analytical perspective.\n\n"
-    "You will be given:\n"
-    "1. The user's question\n"
-    "2. A list of candidate vault nodes (each with id, type, country, sector, summary)\n\n"
-    "Your task:\n"
-    "- Read each candidate carefully\n"
-    "- Score relevance from 1.0 to 10.0 based on how directly the node answers the question\n"
-    "- Select the top N most relevant nodes\n"
-    "- Provide 1-sentence reasoning for each selection\n\n"
-    "SCORING CRITERIA (in priority order): direct event relevance, perspective-country relevance, perspective actor capability, cross-border relationships, regulatory/access pathways, capital relationships, evidence strength.\n"
-    "- 10.0: Directly answers the question (e.g., the exact entity asked about)\n"
-    "- 7.0-9.0: Highly relevant (e.g., regulator of the entity, parent company)\n"
-    "- 4.0-6.0: Moderately relevant (e.g., same sector, related commodity)\n"
-    "- 1.0-3.0: Weakly relevant (e.g., same country, tangential connection)\n"
-    "- 0.0: Not relevant at all\n\n"
-    "OUTPUT SCHEMA (raw JSON only):\n"
-    "{\n"
-    '  "ranked_nodes": [\n'
-    '    {\n'
-    '      "rank": 1,\n'
-    '      "node_id": "exact_filename_no_extension",\n'
-    '      "relevance_score": 9.5,\n'
-    '      "reasoning": "One sentence explaining why this node is relevant"\n'
-    '    }\n'
-    '  ],\n'
-    '  "excluded_count": 45\n'
-    "}\n\n"
-    "RULES:\n"
-    "- Use the EXACT node_id as provided. Do not modify filenames.\n"
-    "- If a node is not relevant, do not include it.\n"
-    "- Be strict. A score of 10.0 should be rare.\n"
+    "Your job is to rank vault nodes by their relevance to the user's question from the selected analytical perspective.
+
+"
+    "You will be given:
+"
+    "1. The user's question
+"
+    "2. The analytical perspective country
+"
+    "3. A list of candidate vault nodes (each with id, type, country, sector, summary)
+"
+    "4. A PERSPECTIVE ACTOR REGISTRY of evidenced actors from the perspective country
+"
+    "5. A CROSS-BORDER BRIDGE CONTEXT showing actual relationships between perspective and source countries
+
+"
+    "Your task:
+"
+    "- Read each candidate carefully
+"
+    "- Score relevance from 1.0 to 10.0 based on how directly the node answers the question
+"
+    "- Prioritize nodes that: (1) directly answer the question, (2) are from the perspective country, (3) have cross-border bridge evidence
+"
+    "- Select the top N most relevant nodes
+"
+    "- Provide 1-sentence reasoning for each selection
+
+"
+    "SCORING CRITERIA (in priority order):
+"
+    "- 10.0: Directly answers the question AND is a perspective-country actor with cross-border bridge
+"
+    "- 8.0-9.0: Directly answers the question (exact entity, regulator, parent company)
+"
+    "- 6.0-7.0: Perspective-country actor with capability relevant to the question
+"
+    "- 4.0-5.0: Moderately relevant (same sector, related commodity, same country)
+"
+    "- 1.0-3.0: Weakly relevant (tangential connection)
+"
+    "- 0.0: Not relevant at all
+
+"
+    "OUTPUT SCHEMA (raw JSON only):
+"
+    "{
+"
+    '  "ranked_nodes": [
+'
+    '    {
+'
+    '      "rank": 1,
+'
+    '      "node_id": "exact_filename_no_extension",
+'
+    '      "relevance_score": 9.5,
+'
+    '      "reasoning": "One sentence explaining why this node is relevant"
+'
+    '    }
+'
+    '  ],
+'
+    '  "excluded_count": 45
+'
+    "}
+
+"
+    "RULES:
+"
+    "- Use the EXACT node_id as provided. Do not modify filenames.
+"
+    "- If a node is not relevant, do not include it.
+"
+    "- Be strict. A score of 10.0 should be rare.
+"
     "- Output ONLY raw JSON. No markdown fences."
 )
 
 GROUNDED_SYNTHESIS_PROMPT: str = (
     "You are the ATIS Grounded Synthesis Engine. You have access ONLY to the provided vault nodes. "
-    "You MUST NOT use any external knowledge. If information is not in the provided nodes, say 'Not found in vault'.\n\n"
-    "ANTI-HALLUCINATION RULES (violation = invalid output):\n"
-    "1. Every claim in structured_intelligence MUST have a 'source_node' field containing the exact node ID.\n"
-    "2. Every item in findings[], opportunities[], risks[] MUST have a 'text' field and a 'source_nodes' array with at least one node ID.\n"
-    "3. Every entity in key_entities[] MUST correspond to a provided node and have a 'source_node' field.\n"
-    "4. The executive_summary MUST reference specific entities by their exact names and explain their roles.\n"
-    "5. If you cannot verify a claim from the provided nodes, output 'Not found in vault' for that field.\n"
-    "6. Do NOT invent statistics, dates, or facts not present in the nodes.\n\n"
-    "EXECUTIVE SUMMARY REQUIREMENTS:\n"
-    "- Length: 6-10 sentences\n"
+    "You MUST NOT use any external knowledge. If information is not in the provided nodes, say 'Not found in vault'.
+
+"
+    "ANTI-HALLUCINATION RULES (violation = invalid output):
+"
+    "1. Every claim in structured_intelligence MUST have a 'source_node' field containing the exact node ID.
+"
+    "2. Every item in findings[], opportunities[], risks[] MUST have a 'text' field and a 'source_nodes' array with at least one node ID.
+"
+    "3. Every entity in key_entities[] MUST correspond to a provided node and have a 'source_node' field.
+"
+    "4. The executive_summary MUST reference specific entities by their exact names and explain their roles.
+"
+    "5. If you cannot verify a claim from the provided nodes, output 'Not found in vault' for that field.
+"
+    "6. Do NOT invent statistics, dates, or facts not present in the nodes.
+
+"
+    "PERSPECTIVE RULES:
+"
+    "7. You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. Do not invent actors.
+"
+    "8. You MUST select perspective_capability from the capabilities evidenced for that actor in the vault.
+"
+    "9. You MUST select pathway from the CROSS-BORDER BRIDGE CONTEXT or from: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry.
+"
+    "10. You MUST set opportunity_country to the actual country where the commercial value exists. Do NOT default to the perspective country.
+"
+    "11. If no perspective-side actor can respond to the event, mark the opportunity RESEARCH_REQUIRED and explain the gap.
+"
+    "12. A source-country event does NOT automatically create a perspective-country opportunity. There must be an evidenced cross-border pathway.
+
+"
+    "EXECUTIVE SUMMARY REQUIREMENTS:
+"
+    "- Length: 6-10 sentences
+"
     "- Must explain: the overall landscape, key players and their specific roles, regulatory context, "
-    "structural gaps, primary opportunities, and key risks\n"
-    "- Must name specific entities (e.g., 'ZESA Holdings operates the national grid under ZERA regulation')\n"
-    "- Must connect entities to each other (e.g., 'Bikita Minerals is regulated by the Ministry of Mines')\n"
-    "- Must explain WHY the dashboard findings matter\n\n"
-    "OUTPUT SCHEMA (raw JSON only):\n"
-    "{\n"
-    '  "executive_summary": "6-10 sentence comprehensive narrative...",\n'
-    '  "structured_intelligence": [\n'
-    '    {\n'
-    '      "entity": "Entity Name",\n'
-    '      "type": "entity_type",\n'
-    '      "country": "Zimbabwe",\n'
-    '      "relationship": "regulates",\n'
-    '      "status": "Operational",\n'
-    '      "priority": "Critical|High|Medium|Low",\n'
-    '      "insight": "One precise sentence.",\n'
-    '      "source_node": "Exact_Node_ID"\n'
-    '    }\n'
-    '  ],\n'
-    '  "findings": [\n'
-    '    {"text": "Finding statement.", "source_nodes": ["Node_ID_1", "Node_ID_2"]}\n'
-    '  ],\n'
-    '  "opportunities": [\n'
-    '    {"opportunity_id": "OPP-001", "title": "Opportunity statement", "type": "String", "perspective_country": "Zimbabwe", "perspective_country_code": "ZW", "source_country": "String", "event_country": "String", "opportunity_country": "String", "cross_border": true, "cross_border_countries": ["Zimbabwe", "String"], "perspective_actor": "Evidenced actor or empty", "perspective_capability": "Evidenced capability or empty", "pathway": "Evidenced pathway or empty", "urgency_score": 0.0, "feasibility_score": 0.0, "required_missing_nodes": [], "capital_flow": {"beneficiary": "String", "likely_funder": "String"}, "justification": "String", "source_nodes": ["Node_ID"]}\n'
-    '  ],\n'
-    '  "risks": [\n'
-    '    {"text": "Risk statement.", "source_nodes": ["Node_ID"]}\n'
-    '  ],\n'
-    '  "key_entities": [\n'
-    '    {\n'
-    '      "entity_name": "Exact Name",\n'
-    '      "entity_type": "type",\n'
-    '      "country": "Zimbabwe",\n'
-    '      "sector": "Energy",\n'
-    '      "significance_score": 9,\n'
-    '      "related_count": 5,\n'
-    '      "summary": "Description from vault.",\n'
-    '      "source_node": "Exact_Node_ID"\n'
-    '    }\n'
-    '  ]\n'
-    "}\n\n"
+    "structural gaps, primary opportunities, and key risks
+"
+    "- Must name specific entities (e.g., 'ZESA Holdings operates the national grid under ZERA regulation')
+"
+    "- Must connect entities to each other (e.g., 'Bikita Minerals is regulated by the Ministry of Mines')
+"
+    "- Must explain WHY the dashboard findings matter
+
+"
+    "OUTPUT SCHEMA (raw JSON only):
+"
+    "{
+"
+    '  "executive_summary": "6-10 sentence comprehensive narrative...",
+'
+    '  "structured_intelligence": [
+'
+    '    {
+'
+    '      "entity": "Entity Name",
+'
+    '      "type": "entity_type",
+'
+    '      "country": "Zimbabwe",
+'
+    '      "relationship": "regulates",
+'
+    '      "status": "Operational",
+'
+    '      "priority": "Critical|High|Medium|Low",
+'
+    '      "insight": "One precise sentence.",
+'
+    '      "source_node": "Exact_Node_ID"
+'
+    '    }
+'
+    '  ],
+'
+    '  "findings": [
+'
+    '    {"text": "Finding statement.", "source_nodes": ["Node_ID_1", "Node_ID_2"]}
+'
+    '  ],
+'
+    '  "opportunities": [
+'
+    '    {"opportunity_id": "OPP-001", "title": "Opportunity statement", "type": "String", "perspective_country": "Zimbabwe", "perspective_country_code": "ZW", "source_country": "String", "event_country": "String", "opportunity_country": "String", "cross_border": true, "cross_border_countries": ["Zimbabwe", "String"], "perspective_actor": "MUST be from PERSPECTIVE ACTOR REGISTRY", "perspective_capability": "MUST be evidenced capability", "pathway": "MUST be evidenced pathway", "urgency_score": 0.0, "feasibility_score": 0.0, "required_missing_nodes": [], "capital_flow": {"beneficiary": "String", "likely_funder": "String"}, "justification": "String", "source_nodes": ["Node_ID"]}
+'
+    '  ],
+'
+    '  "risks": [
+'
+    '    {"text": "Risk statement.", "source_nodes": ["Node_ID"]}
+'
+    '  ],
+'
+    '  "key_entities": [
+'
+    '    {
+'
+    '      "entity_name": "Exact Name",
+'
+    '      "entity_type": "type",
+'
+    '      "country": "Zimbabwe",
+'
+    '      "sector": "Energy",
+'
+    '      "significance_score": 9,
+'
+    '      "related_count": 5,
+'
+    '      "summary": "Description from vault.",
+'
+    '      "source_node": "Exact_Node_ID"
+'
+    '    }
+'
+    '  ]
+'
+    "}
+
+"
     "Output ONLY raw JSON. No markdown fences. No commentary outside JSON."
 )
 
@@ -331,6 +475,12 @@ class ObsidianVaultManager:
                 if any(w in body_lower for w in keywords):
                     entity_type = etype
                     break
+
+        # Infer country from path if not in frontmatter
+        if not country:
+            # This will be set during build_index
+            pass
+
         return entity_type, country, sector
 
     def build_index(self) -> None:
@@ -352,6 +502,14 @@ class ObsidianVaultManager:
             summary = self._extract_summary(front_matter, body)
             outbound_links = self._extract_outbound_links(raw_content)
             entity_type, country, sector = self._infer_entity_metadata(front_matter, body)
+
+            # Infer country from path
+            if not country:
+                path_parts = [p.lower() for p in md_path.relative_to(self.vault_root).parts]
+                for part in path_parts:
+                    if part in ("zimbabwe", "zambia", "south africa", "botswana", "kenya", "china", "germany", "switzerland", "united kingdom", "united states of america"):
+                        country = part.title()
+                        break
 
             uid = md_path.stem
             node = VaultNode(
@@ -460,6 +618,73 @@ class ObsidianVaultManager:
     def get_all_nodes_as_context(self) -> List[VaultNode]:
         return list(self.nodes.values())
 
+    # -- Perspective-Side Retrieval (NEW) ----------------------------------- #
+    def get_perspective_nodes(self, perspective: PerspectiveContext) -> List[VaultNode]:
+        """Retrieve all vault nodes that belong to the perspective country."""
+        perspective_norm = perspective.country.lower()
+        results: List[VaultNode] = []
+        for node in self.nodes.values():
+            if (node.country or "").lower() == perspective_norm:
+                results.append(node)
+        logger.info("Retrieved %d perspective-side nodes for %s", len(results), perspective.country)
+        return results
+
+    def get_cross_border_bridges(self, perspective: PerspectiveContext, source_country: str) -> List[Dict[str, Any]]:
+        """
+        Find cross-border bridges between perspective country and source country.
+        A bridge exists when a perspective-country node links to a source-country node or vice versa.
+        """
+        perspective_norm = perspective.country.lower()
+        source_norm = source_country.lower()
+        bridges: List[Dict[str, Any]] = []
+
+        for node in self.nodes.values():
+            node_country = (node.country or "").lower()
+            if node_country not in (perspective_norm, source_norm):
+                continue
+
+            for link in node.outbound_links:
+                if link in self.nodes:
+                    target = self.nodes[link]
+                    target_country = (target.country or "").lower()
+                    if node_country == perspective_norm and target_country == source_norm:
+                        bridges.append({
+                            "from_node": node.uid,
+                            "from_country": perspective.country,
+                            "to_node": target.uid,
+                            "to_country": source_country,
+                            "relationship_type": "outbound_link",
+                        })
+                    elif node_country == source_norm and target_country == perspective_norm:
+                        bridges.append({
+                            "from_node": node.uid,
+                            "from_country": source_country,
+                            "to_node": target.uid,
+                            "to_country": perspective.country,
+                            "relationship_type": "outbound_link",
+                        })
+
+        # Check backlinks
+        for uid, node in self.nodes.items():
+            node_country = (node.country or "").lower()
+            if node_country != perspective_norm:
+                continue
+            for back_uid in node.backlink_uids:
+                if back_uid in self.nodes:
+                    back_node = self.nodes[back_uid]
+                    back_country = (back_node.country or "").lower()
+                    if back_country == source_norm:
+                        bridges.append({
+                            "from_node": back_uid,
+                            "from_country": source_country,
+                            "to_node": uid,
+                            "to_country": perspective.country,
+                            "relationship_type": "backlink",
+                        })
+
+        logger.info("Found %d cross-border bridges between %s and %s", len(bridges), perspective.country, source_country)
+        return bridges
+
 
 # =============================================================================
 # TOKEN BUDGET
@@ -494,7 +719,7 @@ class TokenBudget:
 
 
 # =============================================================================
-# LLM ENGINE — 3-STAGE GROUNDED PIPELINE
+# LLM ENGINE — 4-STAGE GROUNDED PIPELINE
 # =============================================================================
 class LLMQueryEngine:
     def __init__(self) -> None:
@@ -529,7 +754,7 @@ class LLMQueryEngine:
             return ATISIntent({"intent_type": "OVERVIEW", "target_entities": [], "target_entity_types": [], "max_results_hint": 20})
 
     # -----------------------------------------------------------------
-    # STAGE 1: Broad Pre-Filter
+    # STAGE 1: Source Pre-Filter
     # -----------------------------------------------------------------
     def broad_pre_filter(self, vault_mgr: ObsidianVaultManager, intent: ATISIntent,
                          perspective: PerspectiveContext) -> List[VaultNode]:
@@ -548,14 +773,13 @@ class LLMQueryEngine:
 
             node_country = (node.country or "").lower()
             path_text = str(node.absolute_path).lower()
-            if perspective.country.lower() in node_country or perspective.country.lower() in path_text:
-                score += 7.0
-            if perspective.country_code.lower() in path_text:
-                score += 2.0
+
+            # Score source-event country relevance (NOT perspective country)
             for tc in intent.target_countries:
                 if tc.lower() in node_country:
                     score += 6.0
 
+            # Do NOT boost perspective country here — perspective nodes are retrieved separately
             node_sector = (node.sector or "").lower()
             for ts in intent.target_sectors:
                 if ts.lower() in node_sector:
@@ -589,16 +813,56 @@ class LLMQueryEngine:
         return result
 
     # -----------------------------------------------------------------
-    # STAGE 2: LLM Semantic Ranking
+    # STAGE 2: Perspective-Side Retrieval (NEW)
+    # -----------------------------------------------------------------
+    def retrieve_perspective_context(self, vault_mgr: ObsidianVaultManager,
+                                     perspective: PerspectiveContext,
+                                     intent: ATISIntent) -> Tuple[List[VaultNode], List[Dict[str, Any]]]:
+        """
+        Explicitly retrieve perspective-side nodes and cross-border bridges.
+        This is separate from the semantic ranking and is NOT filtered by question relevance.
+        """
+        logger.info("STAGE 2: PERSPECTIVE-SIDE RETRIEVAL")
+
+        perspective_nodes = vault_mgr.get_perspective_nodes(perspective)
+
+        # Determine source country from intent
+        source_country = ""
+        if intent.target_countries:
+            source_country = intent.target_countries[0]
+        else:
+            # Try to infer from question entities
+            for entity in intent.target_entities:
+                entity_lower = entity.lower()
+                if "zambia" in entity_lower:
+                    source_country = "Zambia"
+                    break
+                elif "zimbabwe" in entity_lower:
+                    source_country = "Zimbabwe"
+                    break
+
+        cross_border_bridges = []
+        if source_country and source_country.lower() != perspective.country.lower():
+            cross_border_bridges = vault_mgr.get_cross_border_bridges(perspective, source_country)
+
+        logger.info("Perspective retrieval: %d nodes | %d bridges | source: %s",
+                    len(perspective_nodes), len(cross_border_bridges), source_country or "unknown")
+        return perspective_nodes, cross_border_bridges
+
+    # -----------------------------------------------------------------
+    # STAGE 3: LLM Semantic Ranking
     # -----------------------------------------------------------------
     def llm_semantic_ranking(self, question: str, intent: ATISIntent,
                              perspective: PerspectiveContext,
-                             candidates: List[VaultNode]) -> List[VaultNode]:
-        logger.info("STAGE 2: LLM SEMANTIC RANKING (%d candidates)", len(candidates))
+                             candidates: List[VaultNode],
+                             perspective_nodes: List[VaultNode],
+                             cross_border_bridges: List[Dict[str, Any]]) -> List[VaultNode]:
+        logger.info("STAGE 3: LLM SEMANTIC RANKING (%d candidates)", len(candidates))
 
         if not candidates:
             return []
 
+        # Build candidate blocks
         candidate_blocks = []
         for node in candidates:
             block = (
@@ -609,7 +873,26 @@ class LLMQueryEngine:
             )
             candidate_blocks.append(block)
 
+        # Build perspective registry block
+        perspective_blocks = []
+        perspective_blocks.append(f"=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
+        for pn in perspective_nodes[:20]:
+            perspective_blocks.append(
+                f"- {pn.uid} | type: {pn.entity_type} | summary: {pn.summary[:100]}"
+            )
+
+        # Build bridge context block
+        if cross_border_bridges:
+            perspective_blocks.append(f"=== CROSS-BORDER BRIDGE CONTEXT ===")
+            for bridge in cross_border_bridges[:15]:
+                perspective_blocks.append(
+                    f"- {bridge['from_node']} ({bridge['from_country']}) → {bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
+                )
+        else:
+            perspective_blocks.append(f"=== CROSS-BORDER BRIDGE CONTEXT ===\nNo cross-border bridges found.")
+
         candidates_text = "\n\n".join(candidate_blocks)
+        perspective_text = "\n".join(perspective_blocks)
 
         user_prompt = (
             f"## USER QUESTION\n{question}\n\n"
@@ -618,6 +901,8 @@ class LLMQueryEngine:
             f"Type: {intent.intent_type}\n"
             f"Looking for: {', '.join(intent.target_entities) or 'N/A'}\n"
             f"Entity types: {', '.join(intent.target_entity_types) or 'N/A'}\n\n"
+            f"## PERSPECTIVE CONTEXT\n"
+            f"{perspective_text}\n\n"
             f"## CANDIDATE NODES ({len(candidates)} total)\n"
             f"{candidates_text}\n\n"
             f"## TASK\n"
@@ -656,16 +941,20 @@ class LLMQueryEngine:
         return ranked_nodes
 
     # -----------------------------------------------------------------
-    # STAGE 3: Grounded Synthesis
+    # STAGE 4: Grounded Synthesis
     # -----------------------------------------------------------------
     def grounded_synthesis(self, question: str, intent: ATISIntent,
                            perspective: PerspectiveContext,
-                           ranked_nodes: List[VaultNode]) -> Dict[str, Any]:
-        logger.info("STAGE 3: GROUNDED SYNTHESIS (%d nodes)", len(ranked_nodes))
+                           ranked_nodes: List[VaultNode],
+                           perspective_nodes: List[VaultNode],
+                           cross_border_bridges: List[Dict[str, Any]]) -> Dict[str, Any]:
+        logger.info("STAGE 4: GROUNDED SYNTHESIS (%d ranked nodes, %d perspective nodes)",
+                    len(ranked_nodes), len(perspective_nodes))
 
-        if not ranked_nodes:
+        if not ranked_nodes and not perspective_nodes:
             return self._generate_empty_response(question, intent)
 
+        # Build ranked node blocks
         node_blocks = []
         for node in ranked_nodes:
             fm_fields = []
@@ -686,19 +975,45 @@ class LLMQueryEngine:
             )
             node_blocks.append(block)
 
-        context = "\n\n".join(node_blocks)
+        # Build perspective node blocks
+        perspective_blocks = []
+        perspective_blocks.append(f"=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
+        for pn in perspective_nodes[:25]:
+            fm_fields = []
+            for key in ("entity", "sector", "country", "ownership_type", "status", "capabilities"):
+                val = pn.front_matter.get(key)
+                if val:
+                    fm_fields.append(f"{key}: {val}")
+            perspective_blocks.append(
+                f"- {pn.uid} | type: {pn.entity_type} | country: {pn.country or 'N/A'} | "
+                f"frontmatter: {'; '.join(fm_fields) or 'N/A'} | summary: {pn.summary[:150]}"
+            )
+
+        # Build bridge blocks
+        if cross_border_bridges:
+            perspective_blocks.append(f"=== CROSS-BORDER BRIDGE CONTEXT ({perspective.country}) ===")
+            for bridge in cross_border_bridges[:20]:
+                perspective_blocks.append(
+                    f"- {bridge['from_node']} ({bridge['from_country']}) → {bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
+                )
+        else:
+            perspective_blocks.append(f"=== CROSS-BORDER BRIDGE CONTEXT ===\nNo cross-border bridges found.")
+
+        context = "\n\n".join(node_blocks + perspective_blocks)
 
         user_prompt = (
             f"## USER QUESTION\n{question}\n\n"
             f"## ANALYTICAL PERSPECTIVE\nPerspective country: {perspective.country}\nPerspective country code: {perspective.country_code}\n"
-            "You are answering from this perspective, not automatically from the source-event country. An external event can create a perspective-country opportunity. Every opportunity must show an evidenced actor, capability, and pathway; otherwise mark it RESEARCH_REQUIRED.\n\n"
+            "You are answering from this perspective, not automatically from the source-event country. "
+            "An external event can create a perspective-country opportunity ONLY if there is an evidenced cross-border pathway. "
+            "Every opportunity must show an evidenced actor from the PERSPECTIVE ACTOR REGISTRY, an evidenced capability, and an evidenced pathway; otherwise mark it RESEARCH_REQUIRED.\n\n"
             f"## SEARCH INTENT\n"
             f"Type: {intent.intent_type}\n"
             f"Looking for: {', '.join(intent.target_entities) or 'N/A'}\n"
             f"Entity types: {', '.join(intent.target_entity_types) or 'N/A'}\n"
             f"Countries: {', '.join(intent.target_countries) or 'N/A'}\n"
             f"Sectors: {', '.join(intent.target_sectors) or 'N/A'}\n\n"
-            f"## PROVIDED VAULT NODES ({len(ranked_nodes)} nodes)\n"
+            f"## PROVIDED VAULT NODES\n"
             f"YOU MAY ONLY USE INFORMATION FROM THESE NODES.\n"
             f"DO NOT USE EXTERNAL KNOWLEDGE.\n\n"
             f"{context}\n\n"
@@ -706,8 +1021,10 @@ class LLMQueryEngine:
             f"1. Executive summary: 6-10 sentences. Name specific entities. Explain their roles and relationships.\n"
             f"2. Every structured_intelligence row MUST have 'source_node' = exact node ID from above.\n"
             f"3. Every finding/opportunity/risk MUST have 'text' and 'source_nodes' array with node IDs.\n"
-            f"4. If information is missing, write 'Not found in vault' — do NOT invent facts.\n"
-            f"5. Output ONLY raw JSON."
+            f"4. Every opportunity MUST have perspective_actor from PERSPECTIVE ACTOR REGISTRY, perspective_capability, and evidenced pathway.\n"
+            f"5. Set opportunity_country to the actual country where the commercial value exists. Do NOT default to perspective country.\n"
+            f"6. If information is missing, write 'Not found in vault' — do NOT invent facts.\n"
+            f"7. Output ONLY raw JSON."
         )
 
         if self.token_budget.estimate(GROUNDED_SYNTHESIS_PROMPT + user_prompt) > self.token_budget.available_for_input:
@@ -720,9 +1037,11 @@ class LLMQueryEngine:
             user_prompt=user_prompt,
         )
 
-        return self._parse_grounded_response(raw_response, ranked_nodes, perspective, intent)
+        return self._parse_grounded_response(raw_response, ranked_nodes, perspective_nodes, cross_border_bridges, perspective, intent)
 
     def _parse_grounded_response(self, raw: str, source_nodes: List[VaultNode],
+                                 perspective_nodes: List[VaultNode],
+                                 cross_border_bridges: List[Dict[str, Any]],
                                  perspective: PerspectiveContext, intent: ATISIntent) -> Dict[str, Any]:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
@@ -741,11 +1060,13 @@ class LLMQueryEngine:
                 data[section] = []
 
         source_node_ids = {n.uid for n in source_nodes}
+        perspective_node_ids = {n.uid for n in perspective_nodes}
+        all_node_ids = source_node_ids | perspective_node_ids
 
         # Validate structured_intelligence citations
         validated_intel = []
         for row in data.get("structured_intelligence", []):
-            if row.get("source_node") in source_node_ids:
+            if row.get("source_node") in all_node_ids:
                 validated_intel.append(row)
             else:
                 row["source_node"] = "citation_missing"
@@ -757,7 +1078,7 @@ class LLMQueryEngine:
             validated = []
             for item in items:
                 if isinstance(item, dict):
-                    cited = [n for n in item.get("source_nodes", []) if n in source_node_ids]
+                    cited = [n for n in item.get("source_nodes", []) if n in all_node_ids]
                     if not cited:
                         item["source_nodes"] = ["citation_needed"]
                     validated.append(item)
@@ -765,11 +1086,14 @@ class LLMQueryEngine:
                     validated.append({"text": str(item), "source_nodes": ["citation_needed"]})
             data[section] = validated
 
+        # Validate opportunities with perspective-side evidence
         validated_opportunities = []
         for item in data["opportunities"]:
             if not item.get("source_country") and intent.target_countries:
                 item["source_country"] = intent.target_countries[0]
-            validated_opportunities.append(validate_opportunity(item, perspective, source_node_ids))
+            validated_opportunities.append(validate_opportunity(
+                item, perspective, all_node_ids, perspective_node_ids, cross_border_bridges
+            ))
         data["opportunities"] = validated_opportunities
 
         return {
@@ -780,6 +1104,8 @@ class LLMQueryEngine:
             "risks": data.get("risks", []),
             "key_entities": data.get("key_entities", []),
             "source_nodes": [{"id": n.uid, "type": n.entity_type} for n in source_nodes],
+            "perspective_nodes": [{"id": n.uid, "type": n.entity_type} for n in perspective_nodes],
+            "cross_border_bridges": cross_border_bridges,
         }
 
     def _generate_empty_response(self, question: str, intent: ATISIntent) -> Dict[str, Any]:
@@ -795,6 +1121,8 @@ class LLMQueryEngine:
             "risks": [{"text": "Incomplete data coverage.", "source_nodes": []}],
             "key_entities": [],
             "source_nodes": [],
+            "perspective_nodes": [],
+            "cross_border_bridges": [],
         }
 
     # -----------------------------------------------------------------
@@ -808,19 +1136,33 @@ class LLMQueryEngine:
             scored.sort(key=lambda x: x[0], reverse=True)
             all_nodes = [n for _, n in scored[:FULL_SCAN_MAX_NODES]]
 
+        # Retrieve perspective nodes for full scan too
+        perspective_nodes = vault_mgr.get_perspective_nodes(perspective)
+        cross_border_bridges = []  # No specific source country in full scan
+
         summaries = [f"{n.uid} ({n.entity_type}, {n.country or 'N/A'}): {n.summary[:150]}" for n in all_nodes]
         context = "\n".join(summaries)
 
+        perspective_blocks = []
+        perspective_blocks.append(f"=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
+        for pn in perspective_nodes[:20]:
+            perspective_blocks.append(f"- {pn.uid} | type: {pn.entity_type} | summary: {pn.summary[:100]}")
+
         system_prompt = (
             "You are the ATIS Master Intelligence Synthesizer. Given vault summaries, "
-            "produce a high-level dashboard. Output ONLY raw JSON. Every claim must cite source nodes."
+            "produce a high-level dashboard. Output ONLY raw JSON. Every claim must cite source nodes. "
+            "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
+            "You MUST set opportunity_country to the actual country where the commercial value exists."
         )
         user_prompt = (
             f"## ANALYTICAL PERSPECTIVE\nPerspective country: {perspective.country}\nPerspective country code: {perspective.country_code}\n"
             "Produce perspective-specific intelligence from the full African vault; do not turn this into a country filter.\n\n"
+            f"## PERSPECTIVE ACTOR REGISTRY\n"
+            f"{\n\n.join(perspective_blocks)}\n\n"
             f"## VAULT SUMMARY\nTotal: {len(all_nodes)}\n\n{context}\n\n"
             f"## OUTPUT\nProduce dashboard JSON with executive_summary, structured_intelligence, findings, opportunities, risks, key_entities. "
-            f"Every row must have source_node. Every finding must have source_nodes."
+            f"Every row must have source_node. Every finding must have source_nodes. "
+            f"Every opportunity must have perspective_actor from the registry, perspective_capability, and evidenced pathway."
         )
 
         if self.token_budget.estimate(system_prompt + user_prompt) > self.token_budget.available_for_input:
@@ -828,7 +1170,7 @@ class LLMQueryEngine:
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
 
         raw = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
-        result = self._parse_grounded_response(raw, all_nodes, perspective, ATISIntent({}))
+        result = self._parse_grounded_response(raw, all_nodes, perspective_nodes, cross_border_bridges, perspective, ATISIntent({}))
         result["scan_mode"] = "full_vault_capped"
         return result
 
@@ -846,8 +1188,9 @@ class LLMQueryEngine:
 
         intent = self.extract_intent(question)
         candidates = self.broad_pre_filter(vault_mgr, intent, perspective)
-        ranked_nodes = self.llm_semantic_ranking(question, intent, perspective, candidates)
-        result = self.grounded_synthesis(question, intent, perspective, ranked_nodes)
+        perspective_nodes, cross_border_bridges = self.retrieve_perspective_context(vault_mgr, perspective, intent)
+        ranked_nodes = self.llm_semantic_ranking(question, intent, perspective, candidates, perspective_nodes, cross_border_bridges)
+        result = self.grounded_synthesis(question, intent, perspective, ranked_nodes, perspective_nodes, cross_border_bridges)
 
         entity_graph = vault_mgr.build_entity_graph(ranked_nodes)
         aggregate_stats = vault_mgr.get_aggregate_stats(ranked_nodes)
@@ -866,6 +1209,8 @@ class LLMQueryEngine:
             "filter_stats": {
                 "vault_total": vault_mgr.indexed_count,
                 "candidates_after_broad_filter": len(candidates),
+                "perspective_nodes_retrieved": len(perspective_nodes),
+                "cross_border_bridges_found": len(cross_border_bridges),
                 "ranked_by_llm": len(ranked_nodes),
             },
             "entity_graph": entity_graph,
@@ -907,12 +1252,14 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
         "risks": payload.get("risks", []),
         "key_entities": payload.get("key_entities", []),
         "source_nodes": payload.get("source_nodes", []),
+        "perspective_nodes": payload.get("perspective_nodes", []),
+        "cross_border_bridges": payload.get("cross_border_bridges", []),
         "pipeline_metadata": {
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
             "model_primary": model_primary,
             "model_fallback": model_fallback,
-            "pipeline_version": "grounded_v3_1",
+            "pipeline_version": "perspective_first_v4_0",
         },
     }
 
@@ -1001,6 +1348,8 @@ def run_query_pipeline(question: str | None = None,
         "opportunities_cited": raw_opportunities,
         "risks_cited": raw_risks,
         "source_nodes": result.get("source_nodes", []),
+        "perspective_nodes": result.get("perspective_nodes", []),
+        "cross_border_bridges": result.get("cross_border_bridges", []),
         "intent": result.get("intent", {}),
         "perspective": perspective.as_dict(),
         "filter_stats": result.get("filter_stats", {}),
@@ -1018,7 +1367,7 @@ def run_query_pipeline(question: str | None = None,
 # =============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ATIS Query v3.1 — Grounded Intent-First Pipeline",
+        description="ATIS Query v4.0 — Perspective-First Grounded Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--vault_path", default="./vault", help="Path to Obsidian vault root.")
@@ -1034,7 +1383,7 @@ def main() -> None:
 
     if question:
         logger.info("=" * 70)
-        logger.info("MODE B: QUESTION-DRIVEN QUERY (Grounded v3.1)")
+        logger.info("MODE B: QUESTION-DRIVEN QUERY (Perspective-First v4.0)")
         logger.info("Question: %s", question)
         logger.info("=" * 70)
     else:
