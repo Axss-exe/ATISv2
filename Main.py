@@ -9,12 +9,15 @@ Features:
   - 60-second hard timeout on all LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Emergency kill endpoint
+  - Perspective-First Deterministic Architecture v2.1
+  - Analysis fingerprinting and knowledge-state-aware caching
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -29,13 +32,17 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# -----------------------------------------------------------------------------
-# Import ATIS pipeline modules
-# -----------------------------------------------------------------------------
+# ATIS pipeline modules
 from ATIS_News import run_news_pipeline
 from ATIS_Execute import run_execute_pipeline
 from ATIS_Query import run_query_pipeline, ObsidianVaultManager as QueryVaultManager
-from atis_context import PerspectiveContext
+from atis_context import (
+    PerspectiveContext,
+    KnowledgeState,
+    AnalysisCache,
+    ANALYSIS_VERSION,
+    SCHEMA_VERSION,
+)
 
 # =============================================================================
 # Logging
@@ -50,10 +57,14 @@ logger = logging.getLogger("ATIS_API")
 # =============================================================================
 # FastAPI App
 # =============================================================================
-app = FastAPI(title="ATIS Intelligence API")
+app = FastAPI(
+    title="ATIS Intelligence API",
+    description="Africa-wide Intelligence System with Perspective-First Deterministic Architecture",
+    version="2.1.0-perspective-deterministic",
+)
 
 # =============================================================================
-# CORS
+# CORS — specific origins (NOT wildcard)
 # =============================================================================
 app.add_middleware(
     CORSMiddleware,
@@ -69,7 +80,7 @@ app.add_middleware(
 # =============================================================================
 # Global state
 # =============================================================================
-_vault_path = Path(os.getenv("VAULT_PATH", r"C:\Users\tmaki\Documents\ATIS\vault"))
+_vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
 
 # Cache vault indexes at startup (skip re-indexing on every request)
 _query_vault: QueryVaultManager | None = None
@@ -89,10 +100,11 @@ _pipeline_in_progress = False
 
 # Simple in-memory cache for query results
 _query_cache: Dict[str, Any] = {}
+_analysis_cache = AnalysisCache()
 
-def _query_cache_key(question: str | None, perspective: PerspectiveContext) -> str:
-    """Keep identical questions isolated between analytical perspectives."""
-    material = f"{perspective.country_code}:{question or 'full_scan'}"
+def _query_cache_key(question: str | None, perspective: PerspectiveContext, knowledge_state_hash: str = "") -> str:
+    """Perspective-aware AND knowledge-state-aware cache key."""
+    material = f"{perspective.country_code}:{question or 'full_scan'}:{knowledge_state_hash}"
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 # Entity cache — rebuilds only when files change
@@ -102,6 +114,10 @@ _entities_cache_mtime: float = 0.0
 # =============================================================================
 # Request models
 # =============================================================================
+class PerspectiveModel(BaseModel):
+    country: str = "Zimbabwe"
+    country_code: str = "ZW"
+
 class NewsRequest(BaseModel):
     article_text: str
     perspective_country: str | None = None
@@ -117,6 +133,10 @@ class QueryRequest(BaseModel):
     question: str | None = None
     perspective_country: str | None = None
     perspective_country_code: str | None = None
+
+class EntityRequest(BaseModel):
+    entity_name: str
+    perspective: Optional[PerspectiveModel] = None
 
 # =============================================================================
 # Helper: Run pipeline with timeout and lock
@@ -148,7 +168,7 @@ async def _run_with_timeout(func, *args, timeout: float = 60.0, **kwargs):
         raise RuntimeError(f"Pipeline timed out after {timeout} seconds")
 
 # =============================================================================
-# NEW: Slug & decode utilities (fixes 404s and double-encoding)
+# Slug & decode utilities (fixes 404s and double-encoding)
 # =============================================================================
 def slugify(text: str) -> str:
     """Create a stable, URL-safe slug from any vault filename or title."""
@@ -172,13 +192,6 @@ def decode_entity_id(raw: str) -> str:
 def _infer_entity_type(rel_path: Path) -> str:
     """
     Guess entity category from folder structure.
-    Examples:
-      Zimbabwe/Zimbabwe Businesses/...  -> 'business'
-      Zimbabwe/Zimbabwe Commodities/... -> 'commodity'
-      Zimbabwe/Zimbabwe Government/...  -> 'government'
-      Zimbabwe/Zimbabwe Infrastructure/... -> 'infrastructure'
-      Zimbabwe/Zimbabwe People/...      -> 'person'
-      Zimbabwe/Zimbabwe Region/...      -> 'region'
     """
     parts = [p.lower() for p in rel_path.parts]
     type_hints = {
@@ -205,45 +218,35 @@ def _infer_entity_type(rel_path: Path) -> str:
 def _discover_entity_directories(vault: Path) -> List[Path]:
     """
     Auto-discover directories containing entity profiles.
-    Scans country folders (Zimbabwe, China, etc.) and their category subfolders
-    (Zimbabwe Businesses, Zimbabwe Commodities, Zimbabwe Government, etc.).
+    Scans country folders and their category subfolders.
     """
     discovered: List[Path] = []
     seen: Set[str] = set()
-    
+
     if not vault.exists():
         logger.error("Vault path does not exist: %s", vault)
         return discovered
-    
-    # --- Strategy 1: Country -> Category structure ---
-    # Vault root contains country folders. Each country has category folders.
+
     country_dirs = [d for d in vault.iterdir() if d.is_dir() and not d.name.startswith('.')]
-    
+
     for country_dir in country_dirs:
-        # Check country root for .md files (e.g., Zimbabwe.md)
         if any(country_dir.glob("*.md")):
             key = str(country_dir.resolve())
             if key not in seen:
                 seen.add(key)
                 discovered.append(country_dir)
-                logger.info("Discovered country root: %s", country_dir.relative_to(vault))
-        
-        # Check category subfolders (e.g., Zimbabwe Businesses, Zimbabwe Commodities)
+
         for category_dir in country_dir.iterdir():
             if not category_dir.is_dir() or category_dir.name.startswith('.'):
                 continue
-            
             md_count = len(list(category_dir.rglob("*.md")))
             if md_count > 0:
                 key = str(category_dir.resolve())
                 if key not in seen:
                     seen.add(key)
                     discovered.append(category_dir)
-                    logger.info("Discovered category: %s (%d .md files)", category_dir.relative_to(vault), md_count)
-    
-    # --- Strategy 2: Full recursive scan fallback ---
+
     if not discovered:
-        logger.info("No structured directories found. Scanning vault recursively...")
         for root, dirs, files in os.walk(vault):
             dirs[:] = [d for d in dirs if not d.startswith('.')]
             root_path = Path(root)
@@ -252,17 +255,14 @@ def _discover_entity_directories(vault: Path) -> List[Path]:
                 if key not in seen:
                     seen.add(key)
                     discovered.append(root_path)
-    
+
     return discovered
 
 def _load_entities_from_dirs(dirs: List[Path]) -> List[Dict[str, Any]]:
-    """
-    Load entity profiles from discovered directories.
-    RECURSIVELY searches subfolders for .md files.
-    """
+    """Load entity profiles from discovered directories."""
     entities = []
     seen_ids = set()
-    
+
     for directory in dirs:
         for f in sorted(directory.rglob("*.md")):
             if not f.is_file():
@@ -270,7 +270,7 @@ def _load_entities_from_dirs(dirs: List[Path]) -> List[Dict[str, Any]]:
             if f.stem in seen_ids:
                 continue
             seen_ids.add(f.stem)
-            
+
             try:
                 content = f.read_text(encoding="utf-8")
                 rel = f.relative_to(_vault_path)
@@ -286,21 +286,14 @@ def _load_entities_from_dirs(dirs: List[Path]) -> List[Dict[str, Any]]:
             except Exception as exc:
                 logger.warning("Could not read %s: %s", f.name, exc)
                 continue
-    
+
     return entities
 
-# =============================================================================
-# NEW: Relationship resolver (uses the graph index for backlinks & outbound links)
-# =============================================================================
 def _resolve_related_entities(node, vault: QueryVaultManager) -> List[Dict[str, Any]]:
-    """
-    Given a vault node, resolve its outbound links and backlinks into
-    traversable entity profiles with slugs, names, types, and summaries.
-    """
+    """Resolve outbound links and backlinks into traversable entity profiles."""
     related: List[Dict[str, Any]] = []
     seen: Set[str] = set()
 
-    # Outbound links
     for link in getattr(node, "outbound_links", []):
         if link in vault.nodes:
             target = vault.nodes[link]
@@ -319,7 +312,6 @@ def _resolve_related_entities(node, vault: QueryVaultManager) -> List[Dict[str, 
                 "summary": getattr(target, "summary", "")[:150],
             })
 
-    # Backlinks
     for back in getattr(node, "backlink_uids", []):
         if back in vault.nodes:
             source = vault.nodes[back]
@@ -346,13 +338,18 @@ def _resolve_related_entities(node, vault: QueryVaultManager) -> List[Dict[str, 
 
 @app.get("/health")
 async def health():
+    """Health check with detailed system status."""
+    ks = KnowledgeState(vault_root=_vault_path)
+    ks.compute()
     return {
         "status": "ok",
         "service": "ATIS API",
+        "version": "2.1.0-perspective-deterministic",
         "pipeline_busy": _pipeline_in_progress,
         "cached_queries": len(_query_cache),
         "cached_entities": _entities_cache is not None,
         "entity_count": _entities_cache["count"] if _entities_cache else 0,
+        "knowledge_state": ks.as_dict(),
     }
 
 # -----------------------------------------------------------------------------
@@ -367,7 +364,6 @@ async def list_entities():
     """
     global _entities_cache, _entities_cache_mtime
 
-    # --- Cache invalidation: check if any .md file in vault changed ---
     all_md_files = list(_vault_path.rglob("*.md"))
     current_mtime = max(
         (f.stat().st_mtime for f in all_md_files),
@@ -378,30 +374,20 @@ async def list_entities():
         logger.info("Serving entities from cache (%d profiles)", _entities_cache["count"])
         return _entities_cache
 
-    # --- Discover and build ---
     start = time.time()
     discovered_dirs = _discover_entity_directories(_vault_path)
-    
+
     if not discovered_dirs:
         logger.error("No entity directories discovered in vault: %s", _vault_path)
-        try:
-            root_contents = [p.name for p in _vault_path.iterdir()]
-            logger.error("Vault root contains: %s", root_contents)
-        except Exception:
-            pass
         raise HTTPException(
             status_code=404,
-            detail=f"No entity profiles found in vault. Checked paths and scanned subdirectories."
+            detail="No entity profiles found in vault. Checked paths and scanned subdirectories."
         )
-
-    logger.info("Discovered %d entity directories", len(discovered_dirs))
-    for d in discovered_dirs:
-        logger.info("  -> %s", d.relative_to(_vault_path))
 
     entities = _load_entities_from_dirs(discovered_dirs)
     elapsed = time.time() - start
 
-    logger.info("Entity cache built in %.3fs — %d profiles loaded from %d directories (recursive)", 
+    logger.info("Entity cache built in %.3fs — %d profiles loaded from %d directories",
                 elapsed, len(entities), len(discovered_dirs))
 
     _entities_cache = {
@@ -415,26 +401,22 @@ async def list_entities():
     return _entities_cache
 
 # -----------------------------------------------------------------------------
-# NEW: Single entity profile with backlink & outbound resolution
+# Single entity profile with backlink & outbound resolution
 # -----------------------------------------------------------------------------
 @app.get("/api/entity/{entity_id}")
 async def get_entity(entity_id: str):
     """
     Retrieve a single entity profile by ID or slug.
-    Resolves outbound links and backlinks across the entire vault
-    (businesses, laws, commodities, infrastructure, people, government, etc.).
+    Resolves outbound links and backlinks across the entire vault.
     """
     clean_id = decode_entity_id(entity_id)
     target_slug = slugify(clean_id)
     logger.info("Entity lookup | raw=%s | decoded=%s | slug=%s", entity_id, clean_id, target_slug)
 
-    # --- Strategy 1: Look in entity cache (fast path) ---
     if _entities_cache:
         for ent in _entities_cache.get("entities", []):
             if ent.get("slug") == target_slug or ent["id"] == clean_id:
                 result = dict(ent)
-
-                # Enrich with graph data from query vault
                 try:
                     vault = _get_query_vault()
                     node = vault.nodes.get(ent["id"])
@@ -449,23 +431,19 @@ async def get_entity(entity_id: str):
                         result["backlink_uids"] = []
                         result["related_entities"] = []
                 except Exception as exc:
-                    logger.warning("Failed to enrich entity %s from vault index: %s", ent["id"], exc)
+                    logger.warning("Failed to enrich entity %s: %s", ent["id"], exc)
                     result["outbound_links"] = []
                     result["backlink_uids"] = []
                     result["related_entities"] = []
-
                 return result
 
-    # --- Strategy 2: Direct vault index lookup (fallback for non-cached or cross-folder files) ---
     try:
         vault = _get_query_vault()
         node = None
 
-        # Try exact stem match
         if clean_id in vault.nodes:
             node = vault.nodes[clean_id]
         else:
-            # Try slug match across all nodes
             for stem, n in vault.nodes.items():
                 if slugify(stem) == target_slug:
                     node = n
@@ -499,14 +477,11 @@ async def get_entity(entity_id: str):
         raise HTTPException(status_code=404, detail=f"Entity not found: {entity_id}")
 
 # -----------------------------------------------------------------------------
-# NEW: Search across all vault nodes (not just entity cache)
+# Search across all vault nodes
 # -----------------------------------------------------------------------------
 @app.get("/api/search")
 async def search_entities(q: str):
-    """
-    Full-text search across the entire vault index.
-    Returns matching entities with slugs for direct navigation.
-    """
+    """Full-text search across the entire vault index."""
     vault = _get_query_vault()
     q_clean = q.lower()
     results = []
@@ -547,15 +522,25 @@ async def news_endpoint(request: NewsRequest):
 
     try:
         start = time.time()
+        perspective = PerspectiveContext.from_values(
+            request.perspective_country, request.perspective_country_code
+        )
         result = await _run_with_timeout(
             run_news_pipeline,
             request.article_text,
-            PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code),
+            _vault_path,
+            perspective,
             timeout=60.0
         )
         elapsed = time.time() - start
         logger.info("News pipeline completed in %.1fs", elapsed)
-        return {"status": "success", "elapsed_seconds": round(elapsed, 1), "data": result}
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": result
+        }
     except RuntimeError as exc:
         logger.error("News pipeline failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
@@ -578,17 +563,26 @@ async def execute_endpoint(request: ExecuteRequest):
 
     try:
         start = time.time()
+        perspective = PerspectiveContext.from_values(
+            request.perspective_country, request.perspective_country_code
+        ) if request.perspective_country or request.perspective_country_code else None
+
         result = await _run_with_timeout(
             run_execute_pipeline,
             request.dashboard_json,
             request.opportunity_id,
-            PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code)
-            if request.perspective_country or request.perspective_country_code else None,
+            perspective,
             timeout=60.0
         )
         elapsed = time.time() - start
         logger.info("Execute pipeline completed in %.1fs", elapsed)
-        return {"status": "success", "elapsed_seconds": round(elapsed, 1), "data": result}
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": result
+        }
     except RuntimeError as exc:
         logger.error("Execute pipeline failed: %s", exc)
         return {"status": "error", "detail": str(exc)}
@@ -599,19 +593,32 @@ async def execute_endpoint(request: ExecuteRequest):
         _release_pipeline_lock()
 
 # -----------------------------------------------------------------------------
-# Query pipeline (with caching)
+# Query pipeline (with knowledge-state-aware caching)
 # -----------------------------------------------------------------------------
 @app.post("/api/query")
 async def query_endpoint(request: QueryRequest):
-    perspective = PerspectiveContext.from_values(request.perspective_country, request.perspective_country_code)
-    cache_key = _query_cache_key(request.question, perspective)
+    perspective = PerspectiveContext.from_values(
+        request.perspective_country, request.perspective_country_code
+    )
+
+    # Compute knowledge state for cache key
+    knowledge_state = KnowledgeState(vault_root=_vault_path)
+    knowledge_state.compute()
+
+    cache_key = _query_cache_key(request.question, perspective, knowledge_state.knowledge_state_hash)
 
     if cache_key in _query_cache:
-        logger.info("Cache hit for query: %s", cache_key)
+        logger.info("Query cache HIT: %s", cache_key)
+        cached_result = _query_cache[cache_key]
+        cached_result["cache_hit"] = True
+        cached_result["cache_key"] = cache_key
+        cached_result["knowledge_state"] = knowledge_state.as_dict()
         return {
             "status": "success",
             "cached": True,
-            "data": _query_cache[cache_key]
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": cached_result
         }
 
     if not _acquire_pipeline_lock():
@@ -632,12 +639,20 @@ async def query_endpoint(request: QueryRequest):
         elapsed = time.time() - start
         logger.info("Query pipeline completed in %.1fs", elapsed)
 
+        result["cache_hit"] = False
+        result["cache_key"] = cache_key
+        result["knowledge_state"] = knowledge_state.as_dict()
+        result["analysis_version"] = ANALYSIS_VERSION
+        result["schema_version"] = SCHEMA_VERSION
+
         _query_cache[cache_key] = result
 
         return {
             "status": "success",
             "cached": False,
             "elapsed_seconds": round(elapsed, 1),
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "data": result
         }
     except RuntimeError as exc:
@@ -648,6 +663,51 @@ async def query_endpoint(request: QueryRequest):
         return {"status": "error", "detail": f"Pipeline failed: {str(exc)}"}
     finally:
         _release_pipeline_lock()
+
+# -----------------------------------------------------------------------------
+# Cache management endpoints
+# -----------------------------------------------------------------------------
+@app.post("/cache/invalidate")
+async def invalidate_cache(evidence_id: Optional[str] = None):
+    """Invalidate cached analyses by evidence ID or clear all."""
+    if evidence_id:
+        removed = _analysis_cache.invalidate_by_evidence(evidence_id)
+        return {
+            "status": "success",
+            "invalidated": removed,
+            "evidence_id": evidence_id,
+            "analysis_version": ANALYSIS_VERSION,
+        }
+    else:
+        removed = _analysis_cache.invalidate_all()
+        _query_cache.clear()
+        return {
+            "status": "success",
+            "invalidated": removed,
+            "scope": "all",
+            "analysis_version": ANALYSIS_VERSION,
+        }
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Cache statistics endpoint."""
+    return {
+        "query_cache_entries": len(_query_cache),
+        "analysis_cache_dir": str(_analysis_cache.cache_dir),
+        "analysis_cache_files": len(list(_analysis_cache.cache_dir.glob("analysis_*.json"))),
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+    }
+
+# -----------------------------------------------------------------------------
+# Knowledge state endpoint
+# -----------------------------------------------------------------------------
+@app.get("/knowledge-state")
+async def knowledge_state():
+    """Return current vault knowledge state."""
+    ks = KnowledgeState(vault_root=_vault_path)
+    ks.compute()
+    return ks.as_dict()
 
 # -----------------------------------------------------------------------------
 # Emergency kill endpoint
@@ -664,9 +724,12 @@ async def kill_pipeline():
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
-    logger.info("ATIS API starting up...")
+    logger.info("ATIS API v2.1.0 starting up...")
     try:
         vault = _get_query_vault()
-        logger.info("Startup complete. Vault ready with %d nodes.", vault.indexed_count)
+        ks = KnowledgeState(vault_root=_vault_path)
+        ks.compute()
+        logger.info("Startup complete. Vault ready with %d nodes. Knowledge state: %s",
+                    vault.indexed_count, ks.knowledge_state_hash[:16])
     except Exception as exc:
         logger.error("Failed to index vault on startup: %s", exc)

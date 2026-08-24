@@ -15,6 +15,14 @@ This module implements a decoupled, state-passing pipeline that:
     6. Deterministically validates every opportunity against vault evidence.
     7. Persists the final dashboard JSON to a local `./dashboards/` directory.
 
+Determinism Features:
+  - temperature=0.0, seed=42 on all LLM calls
+  - sorted vault iterations for stable ordering
+  - AnalysisCache for disk-based result caching
+  - KnowledgeState for vault versioning
+  - compute_analysis_fingerprint for stable identity
+  - compute_opportunity_identity for stable opportunity IDs
+
 Constraints:
   - Python 3.10+
   - Strict 60,000-token ceiling per API request (aggressive truncation).
@@ -28,6 +36,7 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -40,7 +49,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from llm_client import LLMClient, get_client
-from atis_context import PerspectiveContext, validate_opportunity
+from atis_context import (
+    PerspectiveContext,
+    validate_opportunity,
+    KnowledgeState,
+    AnalysisCache,
+    compute_analysis_fingerprint,
+    compute_opportunity_identity,
+    ANALYSIS_VERSION,
+    SCHEMA_VERSION,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -49,47 +67,26 @@ from atis_context import PerspectiveContext, validate_opportunity
 PROMPT_STAGE_1_EXTRACTOR: str = (
     "You are the Entity Extraction Module for an economic intelligence pipeline. "
     "Your sole objective is to extract entities from the provided text and classify them into a strict schema. "
-    "Do not analyze or interpret the text.
-"
-    "CLASSIFICATION SCHEMA:
-"
-    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.
-"
-    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.
-"
-    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.
-"
-    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.
-"
-    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.
-"
-    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.
-"
-    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).
-"
-    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.
-
-"
-    "OUTPUT INSTRUCTIONS:
-"
-    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).
-"
-    "JSON SCHEMA:
-"
-    "{
-"
-    '  "entities": [
-'
-    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}
-'
-    "  ],
-"
-    '  "core_event": "String summarizing the article main event.",
-'
-    '  "source_country": "Country where the event occurred (infer from text)",
-'
-    '  "event_country": "Country where the underlying development occurred (infer from text)"
-'
+    "Do not analyze or interpret the text.\n"
+    "CLASSIFICATION SCHEMA:\n"
+    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.\n"
+    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.\n"
+    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.\n"
+    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.\n"
+    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.\n"
+    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.\n"
+    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).\n"
+    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.\n\n"
+    "OUTPUT INSTRUCTIONS:\n"
+    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).\n"
+    "JSON SCHEMA:\n"
+    "{\n"
+    '  "entities": [\n'
+    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}\n'
+    "  ],\n"
+    '  "core_event": "String summarizing the article main event.",\n'
+    '  "source_country": "Country where the event occurred (infer from text)",\n'
+    '  "event_country": "Country where the underlying development occurred (infer from text)"\n'
     "}"
 )
 
@@ -97,101 +94,56 @@ PROMPT_STAGE_2_SOLVER: str = (
     "You are the ATIS Equilibrium and Constraint Engine. Your objective is to act as a macroeconomic constraint solver. "
     "You will be provided with a [NEW EVENT], a [PERSPECTIVE CONTEXT] containing evidenced actors and capabilities from the perspective country, "
     "and a [CROSS-BORDER BRIDGE CONTEXT] showing actual vault-documented relationships between the perspective country and the source event country. "
-    "You must calculate the systemic shifts and unfulfilled requirements caused by the event, BUT you may only propose opportunities that are grounded in the provided perspective-side evidence.
-
-"
-    "CRITICAL RULES:
-"
-    "1. You MUST select perspective_actor from the [PERSPECTIVE ACTOR REGISTRY] list below. Do not invent actors.
-"
-    "2. You MUST select perspective_capability from the capabilities listed for that actor. Do not invent capabilities.
-"
-    "3. You MUST select pathway from the [CROSS-BORDER BRIDGE CONTEXT] or from the enumerated list: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry. The pathway must be supported by evidence.
-"
-    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists — this may be the source country, the perspective country, or a third country. Do NOT default it to the perspective country.
-"
-    "5. If no perspective-side actor can respond to the event, state 'NO VALID OPPORTUNITY' and explain the gap.
-"
-    "6. Distinguish local source-country opportunities from perspective-country opportunities. A source-country event does NOT automatically create a perspective-country opportunity.
-
-"
-    "Follow this exact reasoning sequence in your markdown output:
-"
-    "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?
-"
-    "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?
-"
-    "## 3. PERSPECTIVE-SIDE CAPABILITY AUDIT: Which perspective-country actors have evidenced capabilities that could address the constraints?
-"
-    "## 4. CROSS-BORDER BRIDGE AUDIT: Which evidenced pathways connect perspective actors to the source event?
-"
-    "## 5. ECONOMIC FLOW: For validated cross-border opportunities, identify who pays, who benefits, and capital flow.
-"
+    "You must calculate the systemic shifts and unfulfilled requirements caused by the event, BUT you may only propose opportunities that are grounded in the provided perspective-side evidence.\n\n"
+    "CRITICAL RULES:\n"
+    "1. You MUST select perspective_actor from the [PERSPECTIVE ACTOR REGISTRY] list below. Do not invent actors.\n"
+    "2. You MUST select perspective_capability from the capabilities listed for that actor. Do not invent capabilities.\n"
+    "3. You MUST select pathway from the [CROSS-BORDER BRIDGE CONTEXT] or from the enumerated list: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry. The pathway must be supported by evidence.\n"
+    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists — this may be the source country, the perspective country, or a third country. Do NOT default it to the perspective country.\n"
+    "5. If no perspective-side actor can respond to the event, state 'NO VALID OPPORTUNITY' and explain the gap.\n"
+    "6. Distinguish local source-country opportunities from perspective-country opportunities. A source-country event does NOT automatically create a perspective-country opportunity.\n\n"
+    "Follow this exact reasoning sequence in your markdown output:\n"
+    "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?\n"
+    "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?\n"
+    "## 3. PERSPECTIVE-SIDE CAPABILITY AUDIT: Which perspective-country actors have evidenced capabilities that could address the constraints?\n"
+    "## 4. CROSS-BORDER BRIDGE AUDIT: Which evidenced pathways connect perspective actors to the source event?\n"
+    "## 5. ECONOMIC FLOW: For validated cross-border opportunities, identify who pays, who benefits, and capital flow.\n"
     "## 6. OPPORTUNITY CASCADE: Detail ONLY perspective-validated Primary, Secondary, and Tertiary opportunities. If none, say NONE."
 )
 
 PROMPT_STAGE_3_FORMATTER: str = (
     "You are a strict data serialization module. Your objective is to take the provided macroeconomic constraint analysis "
-    "and format it into a structured JSON payload for a commercial intelligence dashboard.
-"
-    "OUTPUT INSTRUCTIONS:
-"
+    "and format it into a structured JSON payload for a commercial intelligence dashboard.\n"
+    "OUTPUT INSTRUCTIONS:\n"
     "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json). "
-    "Calculate urgency_score and feasibility_score on a scale of 1.0 to 10.0.
-"
-    "JSON SCHEMA:
-"
-    "{
-"
-    '  "intelligence_id": "ATIS-INT-GENERIC",
-'
-    '  "trigger_event": "String",
-'
-    '  "market_equilibrium_shift": "String",
-'
-    '  "source_country": "String",
-'
-    '  "event_country": "String",
-'
-    '  "opportunities": [
-'
-    "    {
-"
-    '      "opportunity_id": "OPP-001",
-'
-    '      "title": "String",
-'
-    '      "type": "String",
-'
-    '      "perspective_country": "String", "perspective_country_code": "ISO-2",
-'
-    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",
-'
-    '      "cross_border": true, "cross_border_countries": ["String"],
-'
-    '      "perspective_actor": "MUST be from the PERSPECTIVE ACTOR REGISTRY",
-'
-    '      "perspective_capability": "MUST be a capability listed for that actor",
-'
-    '      "pathway": "MUST be from the enumerated list and supported by evidence",
-'
-    '      "source_nodes": ["Exact vault node IDs"],
-'
-    '      "urgency_score": Float,
-'
-    '      "feasibility_score": Float,
-'
-    '      "required_missing_nodes": ["String"],
-'
-    '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},
-'
-    '      "justification": "One precise sentence explaining the structural gap and the evidenced pathway."
-'
-    "    }
-"
-    "  ]"
-    "
-}"
+    "Calculate urgency_score and feasibility_score on a scale of 1.0 to 10.0.\n"
+    "JSON SCHEMA:\n"
+    "{\n"
+    '  "intelligence_id": "ATIS-INT-GENERIC",\n'
+    '  "trigger_event": "String",\n'
+    '  "market_equilibrium_shift": "String",\n'
+    '  "source_country": "String",\n'
+    '  "event_country": "String",\n'
+    '  "opportunities": [\n'
+    "    {\n"
+    '      "opportunity_id": "OPP-001",\n'
+    '      "title": "String",\n'
+    '      "type": "String",\n'
+    '      "perspective_country": "String", "perspective_country_code": "ISO-2",\n'
+    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",\n'
+    '      "cross_border": true, "cross_border_countries": ["String"],\n'
+    '      "perspective_actor": "MUST be from the PERSPECTIVE ACTOR REGISTRY",\n'
+    '      "perspective_capability": "MUST be a capability listed for that actor",\n'
+    '      "pathway": "MUST be from the enumerated list and supported by evidence",\n'
+    '      "source_nodes": ["Exact vault node IDs"],\n'
+    '      "urgency_score": Float,\n'
+    '      "feasibility_score": Float,\n'
+    '      "required_missing_nodes": ["String"],\n'
+    '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},\n'
+    '      "justification": "One precise sentence explaining the structural gap and the evidenced pathway."\n'
+    "    }\n"
+    "  ]\n"
+    "}"
 )
 
 
@@ -306,13 +258,60 @@ class TokenBudget:
 
 
 # --------------------------------------------------------------------------- #
+# Safe JSON Loader
+# --------------------------------------------------------------------------- #
+def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
+    """
+    Safely parse a JSON string with multiple fallback strategies.
+    Strips markdown fences, attempts regex recovery, and raises a clear
+    RuntimeError on absolute failure.
+    """
+    cleaned = raw_text.strip()
+
+    # Strip markdown code fences if present
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # Attempt direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as direct_err:
+        logger.warning(
+            "Direct JSON parse failed in %s: %s", stage_name, direct_err
+        )
+
+    # Fallback: greedy regex search for the outermost JSON object
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as regex_err:
+            logger.warning(
+                "Regex JSON recovery failed in %s: %s", stage_name, regex_err
+            )
+
+    # Final fallback: attempt to fix trailing commas or common syntax issues
+    heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
+    try:
+        return json.loads(heuristic)
+    except json.JSONDecodeError as heuristic_err:
+        logger.error(
+            "All JSON parsing strategies exhausted for %s.", stage_name
+        )
+        logger.error("Raw response excerpt (first 800 chars):\n%s", raw_text[:800])
+        raise RuntimeError(
+            f"Failed to parse JSON response from {stage_name}."
+        ) from heuristic_err
+
+# --------------------------------------------------------------------------- #
 # Obsidian Vault Manager (Graph & Inbound Backlink Engine)
 # --------------------------------------------------------------------------- #
 class ObsidianVaultManager:
     """
     Handles vault indexing, fuzzy filename matching, bidirectional link crawling
-    (outbound + inbound backlinks), shadow-node provisioning, and perspective-side
-    retrieval for the ATIS graph layer.
+    (outbound + inbound backlinks), and perspective-side retrieval for the ATIS
+    graph layer.
     """
 
     def __init__(self, vault_dir: Path = VAULT_DIR) -> None:
@@ -355,7 +354,8 @@ class ObsidianVaultManager:
         self.backlink_map.clear()
         self.node_metadata.clear()
 
-        md_files = list(self.vault_dir.rglob("*.md"))
+        # DETERMINISTIC: sort md files by path string
+        md_files = sorted(self.vault_dir.rglob("*.md"), key=lambda p: str(p))
         logger.info("Indexing %d existing vault files for graph matching...", len(md_files))
 
         for file_path in md_files:
@@ -466,7 +466,8 @@ class ObsidianVaultManager:
 
         # 1. OUTBOUND CONTEXT (What does this note point to?)
         links = re.findall(r"\[\[(.*?)\]\]", content)
-        for link in links:
+        # DETERMINISTIC: sort links before processing
+        for link in sorted(links):
             link_clean = link.split("|")[0].strip()
             link_canonical = self._canonicalize(link_clean)
             if link_canonical in self.file_map and link_clean not in visited:
@@ -487,7 +488,8 @@ class ObsidianVaultManager:
             bundle_parts.append(
                 f"The following existing nodes in your database are explicitly dependent on or linked to [[{actual_name}]]:"
             )
-            for inbound in inbound_stems:
+            # DETERMINISTIC: sort inbound stems
+            for inbound in sorted(inbound_stems):
                 # Grab a snippet or properties from the backlinked node to maximize context density
                 inbound_content = self.read_entity(inbound)
                 fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", inbound_content, re.DOTALL)
@@ -505,7 +507,9 @@ class ObsidianVaultManager:
         perspective_country_norm = perspective.country.lower()
         results: List[Dict[str, Any]] = []
 
-        for canonical_stem, actual_stem in self.file_map.items():
+        # DETERMINISTIC: iterate sorted by canonical stem
+        for canonical_stem in sorted(self.file_map.keys()):
+            actual_stem = self.file_map[canonical_stem]
             meta = self.node_metadata.get(canonical_stem, {})
             node_country = (meta.get("country") or "").lower()
             if node_country == perspective_country_norm:
@@ -531,7 +535,9 @@ class ObsidianVaultManager:
         source_norm = source_country.lower()
         bridges: List[Dict[str, Any]] = []
 
-        for canonical_stem, actual_stem in self.file_map.items():
+        # DETERMINISTIC: iterate sorted by canonical stem
+        for canonical_stem in sorted(self.file_map.keys()):
+            actual_stem = self.file_map[canonical_stem]
             meta = self.node_metadata.get(canonical_stem, {})
             node_country = (meta.get("country") or "").lower()
 
@@ -569,15 +575,16 @@ class ObsidianVaultManager:
                         "relationship_type": "outbound_link",
                     })
 
-        # Also check backlinks
-        for canonical_stem, actual_stem in self.file_map.items():
+        # Also check backlinks — DETERMINISTIC: sort keys
+        for canonical_stem in sorted(self.file_map.keys()):
+            actual_stem = self.file_map[canonical_stem]
             meta = self.node_metadata.get(canonical_stem, {})
             node_country = (meta.get("country") or "").lower()
             if node_country != perspective_norm:
                 continue
 
             inbound_stems = self.backlink_map.get(canonical_stem, set())
-            for inbound in inbound_stems:
+            for inbound in sorted(inbound_stems):
                 inbound_canonical = self._canonicalize(inbound)
                 inbound_meta = self.node_metadata.get(inbound_canonical, {})
                 inbound_country = (inbound_meta.get("country") or "").lower()
@@ -602,10 +609,12 @@ class ObsidianVaultManager:
         global_parts: List[str] = []
         canonical_explicits = {self._canonicalize(name) for name in explicit_names}
 
-        for canonical_stem, actual_stem in self.file_map.items():
+        # DETERMINISTIC: iterate sorted by canonical stem
+        for canonical_stem in sorted(self.file_map.keys()):
             if canonical_stem in canonical_explicits:
                 continue
 
+            actual_stem = self.file_map[canonical_stem]
             meta = self.node_metadata.get(canonical_stem, {})
             front_matter = ""
             summary = meta.get("summary", "")
@@ -623,50 +632,6 @@ class ObsidianVaultManager:
         if not global_parts:
             return "No additional background nodes detected."
         return "\n".join(global_parts)
-
-    # -- Shadow Node Provisioning ------------------------------------------- #
-    def provision_shadow_node(self, entity_name: str, classification: str) -> str:
-        if self.entity_exists(entity_name):
-            return ""
-
-        content = self._generate_shadow_template(entity_name, classification)
-        self.write_entity(entity_name, content)
-        logger.info("Provisioned shadow node: %s (%s)", entity_name, classification)
-        return content
-
-    def _generate_shadow_template(self, entity_name: str, classification: str) -> str:
-        if classification == "[MINING_REFINERY]":
-            return (
-                f"---\n"
-                f"node_type: PRIVATE_CONGLOMERATE\n"
-                f"sub_type: MINING_REFINERY\n"
-                f"status: shadow\n"
-                f"---\n"
-                f"# {entity_name}\n\n"
-                f"- Requires [[Continuous Baseload Power Grid]]\n"
-                f"- Requires [[Industrial Bulk Water Source]]\n"
-                f"- Regulated by [[Environmental Management Agency]]\n"
-            )
-        elif classification == "[GOVERNMENT_AGENCY]":
-            return (
-                f"---\n"
-                f"node_type: GOVERNMENT_AGENCY\n"
-                f"status: shadow\n"
-                f"---\n"
-                f"# {entity_name}\n\n"
-                f"- Overseen by [[Overseeing Government Ministry]]\n"
-                f"- Established under [[Act of Parliament]]\n"
-            )
-        else:
-            clean_class = classification.strip("[]")
-            return (
-                f"---\n"
-                f"node_type: {clean_class}\n"
-                f"status: shadow\n"
-                f"---\n"
-                f"# {entity_name}\n\n"
-                f"- Shadow node for context matching.\n"
-            )
 
     # -- Graph Context Builder ---------------------------------------------- #
     def build_graph_context(self, entities: List[Dict[str, str]], perspective: PerspectiveContext) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -694,9 +659,10 @@ class ObsidianVaultManager:
                     f"\n=== MATCHED EXISTING NODE: {self.file_map[canonical]} ===\n{node_context}"
                 )
             else:
-                shadow_content = self.provision_shadow_node(name, classification)
+                # Shadow node provisioning REMOVED per requirements
                 context_parts.append(
-                    f"\n=== PROVISIONED SHADOW NODE: {name} ===\n{shadow_content}"
+                    f"\n=== UNMATCHED ENTITY: {name} ===\n"
+                    f"Entity not found in vault. No shadow node created."
                 )
 
         # Compile the remaining vault assets into the tracking registry
@@ -738,14 +704,16 @@ class ObsidianVaultManager:
         # Build perspective context block
         perspective_blocks: List[str] = []
         perspective_blocks.append(f"\n=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
-        for pn in perspective_nodes[:30]:  # Cap for token budget
+        # DETERMINISTIC: sort perspective nodes by node_id before capping
+        for pn in sorted(perspective_nodes, key=lambda x: x["node_id"])[:30]:  # Cap for token budget
             perspective_blocks.append(
                 f"- {pn['node_id']} | type: {pn['type']} | summary: {pn['summary'][:100]}"
             )
 
         if cross_border_bridges:
             perspective_blocks.append(f"\n=== CROSS-BORDER BRIDGE CONTEXT ({perspective.country} ↔ {source_country}) ===")
-            for bridge in cross_border_bridges[:20]:  # Cap for token budget
+            # DETERMINISTIC: sort bridges before capping
+            for bridge in sorted(cross_border_bridges, key=lambda b: (b["from_node"], b["to_node"]))[:20]:  # Cap for token budget
                 perspective_blocks.append(
                     f"- {bridge['from_node']} ({bridge['from_country']}) → {bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
                 )
@@ -755,55 +723,6 @@ class ObsidianVaultManager:
         combined_context = source_context + "\n" + "\n".join(perspective_blocks)
 
         return combined_context, perspective_nodes, cross_border_bridges
-
-
-# --------------------------------------------------------------------------- #
-# Safe JSON Loader
-# --------------------------------------------------------------------------- #
-def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
-    """
-    Safely parse a JSON string with multiple fallback strategies.
-    Strips markdown fences, attempts regex recovery, and raises a clear
-    RuntimeError on absolute failure.
-    """
-    cleaned = raw_text.strip()
-
-    # Strip markdown code fences if present
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-
-    # Attempt direct parse
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as direct_err:
-        logger.warning(
-            "Direct JSON parse failed in %s: %s", stage_name, direct_err
-        )
-
-    # Fallback: greedy regex search for the outermost JSON object
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError as regex_err:
-            logger.warning(
-                "Regex JSON recovery failed in %s: %s", stage_name, regex_err
-            )
-
-    # Final fallback: attempt to fix trailing commas or common syntax issues
-    heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
-    try:
-        return json.loads(heuristic)
-    except json.JSONDecodeError as heuristic_err:
-        logger.error(
-            "All JSON parsing strategies exhausted for %s.", stage_name
-        )
-        logger.error("Raw response excerpt (first 800 chars):\n%s", raw_text[:800])
-        raise RuntimeError(
-            f"Failed to parse JSON response from {stage_name}."
-        ) from heuristic_err
-
 
 # --------------------------------------------------------------------------- #
 # LLM Pipeline Wrapper
@@ -817,13 +736,15 @@ class LLMPipeline:
         self.client: LLMClient = get_client()
         self.config = self.client.config
         self.token_budget: TokenBudget = TokenBudget()
+        self.cache = AnalysisCache()
 
     # -- Low-level API call with retries ------------------------------------ #
     def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        # DETERMINISM: force temperature=0.0 and seed=42
         return self.client.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ])
+        ], temperature=0.0, seed=42)
 
     # -- Stage 1: Entity Extraction ----------------------------------------- #
     def stage_1_extract(self, article_text: str) -> Dict[str, Any]:
@@ -898,17 +819,19 @@ class LLMPipeline:
         return raw_analysis
 
     # -- Stage 3: Dashboard Formatting -------------------------------------- #
-    def stage_3_format(self, stage_2_analysis: str, perspective: PerspectiveContext) -> Dict[str, Any]:
+    def stage_3_format(self, stage_2_analysis: str, graph_context: str,
+                       perspective: PerspectiveContext) -> Dict[str, Any]:
         """
-        Stage 3 — Send the Stage-2 markdown analysis to the strict
+        Stage 3 — Send the Stage-2 markdown analysis + graph_context to the strict
         data-serialisation module. Returns a structured dashboard JSON dict.
         """
         logger.info("=" * 60)
         logger.info("STAGE 3: DASHBOARD FORMATTING")
         logger.info("=" * 60)
 
+        combined_input = stage_2_analysis + "\n\n" + graph_context
         estimated = self.token_budget.estimate(
-            PROMPT_STAGE_3_FORMATTER + stage_2_analysis
+            PROMPT_STAGE_3_FORMATTER + combined_input
         )
         logger.info("Estimated Stage-3 input tokens: %d", estimated)
 
@@ -932,12 +855,12 @@ class LLMPipeline:
             "You MUST set opportunity_country to the actual country where the commercial value exists. "
             "Do NOT default opportunity_country to the perspective country. "
             "Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
+            f"## GRAPH CONTEXT\n{graph_context}\n\n"
             + stage_2_analysis,
         )
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
         logger.info("Stage 3 complete. Dashboard JSON generated.")
         return dashboard
-
 
 # --------------------------------------------------------------------------- #
 # Main Orchestration Entry Point
@@ -993,6 +916,9 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
         logger.critical("%s", exc)
         raise
 
+    # Compute knowledge state for determinism
+    knowledge_state = KnowledgeState.compute(vault_manager)
+
     # ------------------------------------------------------------------ #
     # 2. Stage 1 — Entity Extraction
     # ------------------------------------------------------------------ #
@@ -1026,23 +952,55 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
     # Build sets for deterministic validation
     perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
 
-    # ------------------------------------------------------------------ #
-    # 4. Stage 2 — Constraint Solving
-    # ------------------------------------------------------------------ #
-    try:
-        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
-    except Exception as exc:
-        logger.critical("STAGE 2 FAILED: %s", exc)
-        raise
+    # Build evidence IDs for fingerprint
+    evidence_ids = sorted([e.get("name", "") for e in entities])
+    entity_ids = sorted(list(set(
+        [perspective.country, source_country, event_country] +
+        [pn["node_id"] for pn in perspective_nodes]
+    )))
+    relationship_ids = sorted(list(set(
+        [b["from_node"] for b in cross_border_bridges] +
+        [b["to_node"] for b in cross_border_bridges]
+    )))
+
+    # Compute analysis fingerprint after stage 1
+    analysis_fingerprint = compute_analysis_fingerprint(
+        story_id=core_event,
+        perspective=perspective.country,
+        evidence_ids=[e for e in evidence_ids if e],
+        entity_ids=[e for e in entity_ids if e],
+        relationship_ids=[r for r in relationship_ids if r],
+        knowledge_state_hash=knowledge_state.hash,
+    )
+    logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
 
     # ------------------------------------------------------------------ #
-    # 5. Stage 3 — Dashboard Formatting
+    # 4. Stage 2 — Constraint Solving (with cache check)
     # ------------------------------------------------------------------ #
-    try:
-        dashboard_payload = pipeline.stage_3_format(stage_2_analysis, perspective)
-    except Exception as exc:
-        logger.critical("STAGE 3 FAILED: %s", exc)
-        raise
+    # Check cache before stage 2
+    cached_dashboard = pipeline.cache.get(analysis_fingerprint)
+    if cached_dashboard is not None:
+        logger.info("Cache HIT for fingerprint %s. Returning cached dashboard.", analysis_fingerprint)
+        dashboard_payload = cached_dashboard
+    else:
+        logger.info("Cache MISS for fingerprint %s. Running stages 2 and 3.", analysis_fingerprint)
+        try:
+            stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
+        except Exception as exc:
+            logger.critical("STAGE 2 FAILED: %s", exc)
+            raise
+
+        # ------------------------------------------------------------------ #
+        # 5. Stage 3 — Dashboard Formatting (receives stage 2 output + graph_context)
+        # ------------------------------------------------------------------ #
+        try:
+            dashboard_payload = pipeline.stage_3_format(stage_2_analysis, graph_context, perspective)
+        except Exception as exc:
+            logger.critical("STAGE 3 FAILED: %s", exc)
+            raise
+
+        # Store in cache after dashboard build
+        pipeline.cache.set(analysis_fingerprint, dashboard_payload)
 
     # ------------------------------------------------------------------ #
     # 6. Enrich & Persist — WITH DETERMINISTIC VALIDATION
@@ -1061,6 +1019,18 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
                 perspective_node_ids=perspective_node_ids,
                 cross_border_bridges=cross_border_bridges,
             )
+            # Replace sequential ID with stable ID
+            stable_id = compute_opportunity_identity(
+                title=validated.get("title", ""),
+                perspective_country=perspective.country,
+                source_country=validated.get("source_country", ""),
+                event_country=validated.get("event_country", ""),
+                opportunity_country=validated.get("opportunity_country", ""),
+                pathway=validated.get("pathway", ""),
+                perspective_actor=validated.get("perspective_actor", ""),
+            )
+            validated["opportunity_id"] = stable_id
+            validated["stable_opportunity_id"] = stable_id
             validated_opportunities.append(validated)
     dashboard_payload["opportunities"] = validated_opportunities
 
@@ -1077,18 +1047,22 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
         "cross_border_bridges_found": len(cross_border_bridges),
         "model_primary": pipeline.config.model,
         "model_fallback": pipeline.config.fallback_model,
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "analysis_fingerprint": analysis_fingerprint,
+        "knowledge_state": knowledge_state.to_dict(),
     }
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_filename = f"atis_dashboard_{timestamp}.json"
-    output_path = DASHBOARDS_DIR / output_filename
+    output_path_file = DASHBOARDS_DIR / output_filename
 
     try:
-        output_path.write_text(
+        output_path_file.write_text(
             json.dumps(dashboard_payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        logger.info("Dashboard persisted: %s", output_path.resolve())
+        logger.info("Dashboard persisted: %s", output_path_file.resolve())
     except Exception as exc:
         logger.error("Failed to write dashboard JSON: %s", exc)
         raise
@@ -1098,7 +1072,6 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
     logger.info("=" * 70)
 
     return dashboard_payload
-
 
 # --------------------------------------------------------------------------- #
 # CLI Entry Point
@@ -1123,12 +1096,21 @@ def main() -> None:
         logger.critical("Pipeline terminated with fatal error: %s", exc)
         sys.exit(1)
 
+
 # =============================================================================
 # Web entry point
 # =============================================================================
 def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
+
+    DETERMINISM FEATURES:
+      - Computes KnowledgeState at pipeline start
+      - Computes analysis_fingerprint after stage 1
+      - Checks AnalysisCache before stage 2
+      - Sets AnalysisCache after stage 3
+      - Uses compute_opportunity_identity for stable IDs
+      - Includes analysis_version, schema_version, analysis_fingerprint, knowledge_state in output
     """
     logger.info("=" * 70)
     perspective = perspective or PerspectiveContext()
@@ -1141,6 +1123,9 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
     except ValueError as exc:
         logger.critical("%s", exc)
         raise
+
+    # Compute knowledge state for determinism
+    knowledge_state = KnowledgeState.compute(vault_manager)
 
     # Stage 1
     try:
@@ -1158,19 +1143,52 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
     graph_context, perspective_nodes, cross_border_bridges = vault_manager.build_graph_context(entities, perspective)
     perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
 
-    # Stage 2
-    try:
-        stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
-    except Exception as exc:
-        logger.critical("STAGE 2 FAILED: %s", exc)
-        raise
+    # Build evidence IDs for fingerprint
+    evidence_ids = sorted([e.get("name", "") for e in entities])
+    entity_ids = sorted(list(set(
+        [perspective.country, source_country, event_country] +
+        [pn["node_id"] for pn in perspective_nodes]
+    )))
+    relationship_ids = sorted(list(set(
+        [b["from_node"] for b in cross_border_bridges] +
+        [b["to_node"] for b in cross_border_bridges]
+    )))
 
-    # Stage 3
-    try:
-        dashboard_payload = pipeline.stage_3_format(stage_2_analysis, perspective)
-    except Exception as exc:
-        logger.critical("STAGE 3 FAILED: %s", exc)
-        raise
+    # Compute analysis fingerprint after stage 1
+    analysis_fingerprint = compute_analysis_fingerprint(
+        story_id=core_event,
+        perspective=perspective.country,
+        evidence_ids=[e for e in evidence_ids if e],
+        entity_ids=[e for e in entity_ids if e],
+        relationship_ids=[r for r in relationship_ids if r],
+        knowledge_state_hash=knowledge_state.hash,
+    )
+    logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
+
+    # Check cache before stage 2
+    cached_dashboard = pipeline.cache.get(analysis_fingerprint)
+    if cached_dashboard is not None:
+        logger.info("Cache HIT for fingerprint %s. Returning cached dashboard.", analysis_fingerprint)
+        dashboard_payload = cached_dashboard
+    else:
+        logger.info("Cache MISS for fingerprint %s. Running stages 2 and 3.", analysis_fingerprint)
+
+        # Stage 2
+        try:
+            stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
+        except Exception as exc:
+            logger.critical("STAGE 2 FAILED: %s", exc)
+            raise
+
+        # Stage 3 — receives stage 2 output + graph_context
+        try:
+            dashboard_payload = pipeline.stage_3_format(stage_2_analysis, graph_context, perspective)
+        except Exception as exc:
+            logger.critical("STAGE 3 FAILED: %s", exc)
+            raise
+
+        # Store in cache after dashboard build
+        pipeline.cache.set(analysis_fingerprint, dashboard_payload)
 
     # Enrich with deterministic validation
     dashboard_payload["perspective"] = perspective.as_dict()
@@ -1187,6 +1205,18 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
                 perspective_node_ids=perspective_node_ids,
                 cross_border_bridges=cross_border_bridges,
             )
+            # Replace sequential ID with stable ID
+            stable_id = compute_opportunity_identity(
+                title=validated.get("title", ""),
+                perspective_country=perspective.country,
+                source_country=validated.get("source_country", ""),
+                event_country=validated.get("event_country", ""),
+                opportunity_country=validated.get("opportunity_country", ""),
+                pathway=validated.get("pathway", ""),
+                perspective_actor=validated.get("perspective_actor", ""),
+            )
+            validated["opportunity_id"] = stable_id
+            validated["stable_opportunity_id"] = stable_id
             validated_opportunities.append(validated)
     dashboard_payload["opportunities"] = validated_opportunities
 
@@ -1203,18 +1233,22 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         "cross_border_bridges_found": len(cross_border_bridges),
         "model_primary": pipeline.config.model,
         "model_fallback": pipeline.config.fallback_model,
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "analysis_fingerprint": analysis_fingerprint,
+        "knowledge_state": knowledge_state.to_dict(),
     }
 
     # Persist to disk (optional, ephemeral on Render)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_filename = f"atis_dashboard_{timestamp}.json"
-    output_path = DASHBOARDS_DIR / output_filename
+    output_path_file = DASHBOARDS_DIR / output_filename
     try:
-        output_path.write_text(
+        output_path_file.write_text(
             json.dumps(dashboard_payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        logger.info("Dashboard persisted: %s", output_path)
+        logger.info("Dashboard persisted: %s", output_path_file)
     except Exception as exc:
         logger.error("Failed to write dashboard: %s", exc)
 

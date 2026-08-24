@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v4.0 — Perspective-First Grounded Architecture
+ATIS_Query.py v4.1 — Perspective-First Grounded Architecture + Determinism
 
 4-STAGE PIPELINE:
   0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
@@ -11,6 +11,15 @@ ATIS_Query.py v4.0 — Perspective-First Grounded Architecture
   3. LLM SEMANTIC RANKING: LLM reads combined candidates → ranks top 20 by relevance (1 call)
   4. GROUNDED SYNTHESIS:   LLM synthesizes dashboard from ranked nodes ONLY,
      with mandatory perspective actor/capability/pathway evidence (1 call)
+
+DETERMINISM FEATURES (v4.1):
+  - All LLM calls: temperature=0.0, seed=42
+  - All vault iterations: sorted(..., key=lambda n: n.uid)
+  - AnalysisCache: disk-based caching (check before LLM, set after generation)
+  - KnowledgeState: vault versioning computed at pipeline start
+  - compute_analysis_fingerprint: stable result identity
+  - compute_opportunity_identity: stable opportunity IDs (non-sequential)
+  - analysis_version, schema_version, analysis_fingerprint, knowledge_state in all outputs
 
 BACKWARD COMPATIBILITY:
   - findings/opportunities/risks returned as STRING arrays (v0 compatible)
@@ -40,7 +49,12 @@ from typing import Any, Dict, List, Tuple, Set
 from datetime import date, datetime, timezone
 
 from llm_client import LLMClient, get_client
-from atis_context import PerspectiveContext, validate_opportunity
+from atis_context import (
+    PerspectiveContext, validate_opportunity,
+    KnowledgeState, AnalysisCache,
+    compute_analysis_fingerprint, compute_opportunity_identity,
+    ANALYSIS_VERSION, SCHEMA_VERSION,
+)
 
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
@@ -61,9 +75,7 @@ except ImportError:
     _MISSING_DEPS.append("PyYAML (pip install pyyaml)")
 
 if _MISSING_DEPS:
-    print("FATAL: Missing required dependencies:
-  - " + "
-  - ".join(_MISSING_DEPS), file=sys.stderr)
+        print("FATAL: Missing required dependencies:\n  - " + "\n  - ".join(_MISSING_DEPS), file=sys.stderr)
     sys.exit(1)
 
 # =============================================================================
@@ -88,257 +100,141 @@ def _sanitize_for_json(data):
 # =============================================================================
 # PROMPTS
 # =============================================================================
-INTENT_EXTRACTION_PROMPT: str = (
-    "You are the ATIS Intent Extraction Engine. Analyze the user's question and extract "
-    "a structured search intent. Output ONLY valid raw JSON. No markdown fences. No commentary.
+INTENT_EXTRACTION_PROMPT: str = """
+You are the ATIS Intent Extraction Engine. Analyze the user's question and extract a structured search intent. Output ONLY valid raw JSON. No markdown fences. No commentary.
 
-"
-    "OUTPUT SCHEMA:
-"
-    "{
-"
-    '  "intent_type": "OVERVIEW|SPECIFIC_ENTITY|FILTERED_LIST|RELATIONSHIP|COMPARISON",
-'
-    '  "target_entities": ["concrete nouns to search for"],
-'
-    '  "target_entity_types": ["mining_refinery|government_agency|commodity|policy_framework|infrastructure_node|private_conglomerate|government_ministry|academic_institution"],
-'
-    '  "target_countries": ["country names if mentioned"],
-'
-    '  "target_sectors": ["sector names if mentioned"],
-'
-    '  "target_attributes": {"status": "operational|planned|under_construction", "ownership": "state_owned|private"},
-'
-    '  "relationship_type": "regulates|owns|funds|operates|licenses|null",
-'
-    '  "output_format": "structured_table|summary|entity_profile|relationship_graph",
-'
-    '  "max_results_hint": 5|10|15|20|30
-'
-    "}
+OUTPUT SCHEMA:
+{
+  "intent_type": "OVERVIEW|SPECIFIC_ENTITY|FILTERED_LIST|RELATIONSHIP|COMPARISON",
+  "target_entities": ["concrete nouns to search for"],
+  "target_entity_types": ["mining_refinery|government_agency|commodity|policy_framework|infrastructure_node|private_conglomerate|government_ministry|academic_institution"],
+  "target_countries": ["country names if mentioned"],
+  "target_sectors": ["sector names if mentioned"],
+  "target_attributes": {"status": "operational|planned|under_construction", "ownership": "state_owned|private"},
+  "relationship_type": "regulates|owns|funds|operates|licenses|null",
+  "output_format": "structured_table|summary|entity_profile|relationship_graph",
+  "max_results_hint": 5|10|15|20|30
+}
 
-"
-    "RULES:
-"
-    "- intent_type: OVERVIEW for broad summaries, SPECIFIC_ENTITY for 'who is X', FILTERED_LIST for 'which X are Y', RELATIONSHIP for 'who regulates X'.
-"
-    "- target_entities: extract ONLY concrete nouns. Strip vague words like overview, intelligence, information, data, summary, landscape.
-"
-    "- max_results_hint: OVERVIEW=20, SPECIFIC_ENTITY=3, FILTERED_LIST=15, RELATIONSHIP=8.
-"
-    "- target_countries: infer the SOURCE/EVENT country from the question, NOT the perspective country.
-"
-    "- Output ONLY raw JSON."
-)
+RULES:
+- intent_type: OVERVIEW for broad summaries, SPECIFIC_ENTITY for 'who is X', FILTERED_LIST for 'which X are Y', RELATIONSHIP for 'who regulates X'.
+- target_entities: extract ONLY concrete nouns. Strip vague words like overview, intelligence, information, data, summary, landscape.
+- max_results_hint: OVERVIEW=20, SPECIFIC_ENTITY=3, FILTERED_LIST=15, RELATIONSHIP=8.
+- target_countries: infer the SOURCE/EVENT country from the question, NOT the perspective country.
+- Output ONLY raw JSON.
+"""
 
-SEMANTIC_RANKING_PROMPT: str = (
-    "You are a Semantic Relevance Engine for the ATIS Intelligence System. "
-    "Your job is to rank vault nodes by their relevance to the user's question from the selected analytical perspective.
+SEMANTIC_RANKING_PROMPT: str = """
+You are a Semantic Relevance Engine for the ATIS Intelligence System. Your job is to rank vault nodes by their relevance to the user's question from the selected analytical perspective.
 
-"
-    "You will be given:
-"
-    "1. The user's question
-"
-    "2. The analytical perspective country
-"
-    "3. A list of candidate vault nodes (each with id, type, country, sector, summary)
-"
-    "4. A PERSPECTIVE ACTOR REGISTRY of evidenced actors from the perspective country
-"
-    "5. A CROSS-BORDER BRIDGE CONTEXT showing actual relationships between perspective and source countries
+You will be given:
+1. The user's question
+2. The analytical perspective country
+3. A list of candidate vault nodes (each with id, type, country, sector, summary)
+4. A PERSPECTIVE ACTOR REGISTRY of evidenced actors from the perspective country
+5. A CROSS-BORDER BRIDGE CONTEXT showing actual relationships between perspective and source countries
 
-"
-    "Your task:
-"
-    "- Read each candidate carefully
-"
-    "- Score relevance from 1.0 to 10.0 based on how directly the node answers the question
-"
-    "- Prioritize nodes that: (1) directly answer the question, (2) are from the perspective country, (3) have cross-border bridge evidence
-"
-    "- Select the top N most relevant nodes
-"
-    "- Provide 1-sentence reasoning for each selection
+Your task:
+- Read each candidate carefully
+- Score relevance from 1.0 to 10.0 based on how directly the node answers the question
+- Prioritize nodes that: (1) directly answer the question, (2) are from the perspective country, (3) have cross-border bridge evidence
+- Select the top N most relevant nodes
+- Provide 1-sentence reasoning for each selection
 
-"
-    "SCORING CRITERIA (in priority order):
-"
-    "- 10.0: Directly answers the question AND is a perspective-country actor with cross-border bridge
-"
-    "- 8.0-9.0: Directly answers the question (exact entity, regulator, parent company)
-"
-    "- 6.0-7.0: Perspective-country actor with capability relevant to the question
-"
-    "- 4.0-5.0: Moderately relevant (same sector, related commodity, same country)
-"
-    "- 1.0-3.0: Weakly relevant (tangential connection)
-"
-    "- 0.0: Not relevant at all
+SCORING CRITERIA (in priority order):
+- 10.0: Directly answers the question AND is a perspective-country actor with cross-border bridge
+- 8.0-9.0: Directly answers the question (exact entity, regulator, parent company)
+- 6.0-7.0: Perspective-country actor with capability relevant to the question
+- 4.0-5.0: Moderately relevant (same sector, related commodity, same country)
+- 1.0-3.0: Weakly relevant (tangential connection)
+- 0.0: Not relevant at all
 
-"
-    "OUTPUT SCHEMA (raw JSON only):
-"
-    "{
-"
-    '  "ranked_nodes": [
-'
-    '    {
-'
-    '      "rank": 1,
-'
-    '      "node_id": "exact_filename_no_extension",
-'
-    '      "relevance_score": 9.5,
-'
-    '      "reasoning": "One sentence explaining why this node is relevant"
-'
-    '    }
-'
-    '  ],
-'
-    '  "excluded_count": 45
-'
-    "}
+OUTPUT SCHEMA (raw JSON only):
+{
+  "ranked_nodes": [
+    {
+      "rank": 1,
+      "node_id": "exact_filename_no_extension",
+      "relevance_score": 9.5,
+      "reasoning": "One sentence explaining why this node is relevant"
+    }
+  ],
+  "excluded_count": 45
+}
 
-"
-    "RULES:
-"
-    "- Use the EXACT node_id as provided. Do not modify filenames.
-"
-    "- If a node is not relevant, do not include it.
-"
-    "- Be strict. A score of 10.0 should be rare.
-"
-    "- Output ONLY raw JSON. No markdown fences."
-)
+RULES:
+- Use the EXACT node_id as provided. Do not modify filenames.
+- If a node is not relevant, do not include it.
+- Be strict. A score of 10.0 should be rare.
+- Output ONLY raw JSON. No markdown fences.
+"""
 
-GROUNDED_SYNTHESIS_PROMPT: str = (
-    "You are the ATIS Grounded Synthesis Engine. You have access ONLY to the provided vault nodes. "
-    "You MUST NOT use any external knowledge. If information is not in the provided nodes, say 'Not found in vault'.
+GROUNDED_SYNTHESIS_PROMPT: str = """
+You are the ATIS Grounded Synthesis Engine. You have access ONLY to the provided vault nodes. You MUST NOT use any external knowledge. If information is not in the provided nodes, say 'Not found in vault'.
 
-"
-    "ANTI-HALLUCINATION RULES (violation = invalid output):
-"
-    "1. Every claim in structured_intelligence MUST have a 'source_node' field containing the exact node ID.
-"
-    "2. Every item in findings[], opportunities[], risks[] MUST have a 'text' field and a 'source_nodes' array with at least one node ID.
-"
-    "3. Every entity in key_entities[] MUST correspond to a provided node and have a 'source_node' field.
-"
-    "4. The executive_summary MUST reference specific entities by their exact names and explain their roles.
-"
-    "5. If you cannot verify a claim from the provided nodes, output 'Not found in vault' for that field.
-"
-    "6. Do NOT invent statistics, dates, or facts not present in the nodes.
+ANTI-HALLUCINATION RULES (violation = invalid output):
+1. Every claim in structured_intelligence MUST have a 'source_node' field containing the exact node ID.
+2. Every item in findings[], opportunities[], risks[] MUST have a 'text' field and a 'source_nodes' array with at least one node ID.
+3. Every entity in key_entities[] MUST correspond to a provided node and have a 'source_node' field.
+4. The executive_summary MUST reference specific entities by their exact names and explain their roles.
+5. If you cannot verify a claim from the provided nodes, output 'Not found in vault' for that field.
+6. Do NOT invent statistics, dates, or facts not present in the nodes.
 
-"
-    "PERSPECTIVE RULES:
-"
-    "7. You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. Do not invent actors.
-"
-    "8. You MUST select perspective_capability from the capabilities evidenced for that actor in the vault.
-"
-    "9. You MUST select pathway from the CROSS-BORDER BRIDGE CONTEXT or from: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry.
-"
-    "10. You MUST set opportunity_country to the actual country where the commercial value exists. Do NOT default to the perspective country.
-"
-    "11. If no perspective-side actor can respond to the event, mark the opportunity RESEARCH_REQUIRED and explain the gap.
-"
-    "12. A source-country event does NOT automatically create a perspective-country opportunity. There must be an evidenced cross-border pathway.
+PERSPECTIVE RULES:
+7. You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. Do not invent actors.
+8. You MUST select perspective_capability from the capabilities evidenced for that actor in the vault.
+9. You MUST select pathway from the CROSS-BORDER BRIDGE CONTEXT or from: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry.
+10. You MUST set opportunity_country to the actual country where the commercial value exists. Do NOT default to the perspective country.
+11. If no perspective-side actor can respond to the event, mark the opportunity RESEARCH_REQUIRED and explain the gap.
+12. A source-country event does NOT automatically create a perspective-country opportunity. There must be an evidenced cross-border pathway.
 
-"
-    "EXECUTIVE SUMMARY REQUIREMENTS:
-"
-    "- Length: 6-10 sentences
-"
-    "- Must explain: the overall landscape, key players and their specific roles, regulatory context, "
-    "structural gaps, primary opportunities, and key risks
-"
-    "- Must name specific entities (e.g., 'ZESA Holdings operates the national grid under ZERA regulation')
-"
-    "- Must connect entities to each other (e.g., 'Bikita Minerals is regulated by the Ministry of Mines')
-"
-    "- Must explain WHY the dashboard findings matter
+EXECUTIVE SUMMARY REQUIREMENTS:
+- Length: 6-10 sentences
+- Must explain: the overall landscape, key players and their specific roles, regulatory context, structural gaps, primary opportunities, and key risks
+- Must name specific entities (e.g., 'ZESA Holdings operates the national grid under ZERA regulation')
+- Must connect entities to each other (e.g., 'Bikita Minerals is regulated by the Ministry of Mines')
+- Must explain WHY the dashboard findings matter
 
-"
-    "OUTPUT SCHEMA (raw JSON only):
-"
-    "{
-"
-    '  "executive_summary": "6-10 sentence comprehensive narrative...",
-'
-    '  "structured_intelligence": [
-'
-    '    {
-'
-    '      "entity": "Entity Name",
-'
-    '      "type": "entity_type",
-'
-    '      "country": "Zimbabwe",
-'
-    '      "relationship": "regulates",
-'
-    '      "status": "Operational",
-'
-    '      "priority": "Critical|High|Medium|Low",
-'
-    '      "insight": "One precise sentence.",
-'
-    '      "source_node": "Exact_Node_ID"
-'
-    '    }
-'
-    '  ],
-'
-    '  "findings": [
-'
-    '    {"text": "Finding statement.", "source_nodes": ["Node_ID_1", "Node_ID_2"]}
-'
-    '  ],
-'
-    '  "opportunities": [
-'
-    '    {"opportunity_id": "OPP-001", "title": "Opportunity statement", "type": "String", "perspective_country": "Zimbabwe", "perspective_country_code": "ZW", "source_country": "String", "event_country": "String", "opportunity_country": "String", "cross_border": true, "cross_border_countries": ["Zimbabwe", "String"], "perspective_actor": "MUST be from PERSPECTIVE ACTOR REGISTRY", "perspective_capability": "MUST be evidenced capability", "pathway": "MUST be evidenced pathway", "urgency_score": 0.0, "feasibility_score": 0.0, "required_missing_nodes": [], "capital_flow": {"beneficiary": "String", "likely_funder": "String"}, "justification": "String", "source_nodes": ["Node_ID"]}
-'
-    '  ],
-'
-    '  "risks": [
-'
-    '    {"text": "Risk statement.", "source_nodes": ["Node_ID"]}
-'
-    '  ],
-'
-    '  "key_entities": [
-'
-    '    {
-'
-    '      "entity_name": "Exact Name",
-'
-    '      "entity_type": "type",
-'
-    '      "country": "Zimbabwe",
-'
-    '      "sector": "Energy",
-'
-    '      "significance_score": 9,
-'
-    '      "related_count": 5,
-'
-    '      "summary": "Description from vault.",
-'
-    '      "source_node": "Exact_Node_ID"
-'
-    '    }
-'
-    '  ]
-'
-    "}
+OUTPUT SCHEMA (raw JSON only):
+{
+  "executive_summary": "6-10 sentence comprehensive narrative...",
+  "structured_intelligence": [
+    {
+      "entity": "Entity Name",
+      "type": "entity_type",
+      "country": "Zimbabwe",
+      "relationship": "regulates",
+      "status": "Operational",
+      "priority": "Critical|High|Medium|Low",
+      "insight": "One precise sentence.",
+      "source_node": "Exact_Node_ID"
+    }
+  ],
+  "findings": [
+    {"text": "Finding statement.", "source_nodes": ["Node_ID_1", "Node_ID_2"]}
+  ],
+  "opportunities": [
+    {"opportunity_id": "AUTO", "title": "Opportunity statement", "type": "String", "perspective_country": "Zimbabwe", "perspective_country_code": "ZW", "source_country": "String", "event_country": "String", "opportunity_country": "String", "cross_border": true, "cross_border_countries": ["Zimbabwe", "String"], "perspective_actor": "MUST be from PERSPECTIVE ACTOR REGISTRY", "perspective_capability": "MUST be evidenced capability", "pathway": "MUST be evidenced pathway", "urgency_score": 0.0, "feasibility_score": 0.0, "required_missing_nodes": [], "capital_flow": {"beneficiary": "String", "likely_funder": "String"}, "justification": "String", "source_nodes": ["Node_ID"]}
+  ],
+  "risks": [
+    {"text": "Risk statement.", "source_nodes": ["Node_ID"]}
+  ],
+  "key_entities": [
+    {
+      "entity_name": "Exact Name",
+      "entity_type": "type",
+      "country": "Zimbabwe",
+      "sector": "Energy",
+      "significance_score": 9,
+      "related_count": 5,
+      "summary": "Description from vault.",
+      "source_node": "Exact_Node_ID"
+    }
+  ]
+}
 
-"
-    "Output ONLY raw JSON. No markdown fences. No commentary outside JSON."
-)
+Output ONLY raw JSON. No markdown fences. No commentary outside JSON.
+"""
 
 
 # =============================================================================
@@ -452,7 +348,7 @@ class ObsidianVaultManager:
                 for item in val:
                     if isinstance(item, str):
                         aliases.append(item)
-        return aliases
+        return sorted(list(set(aliases)))
 
     def _infer_entity_metadata(self, front_matter: Dict[str, Any], body: str) -> Tuple[str, str, str]:
         entity_type = front_matter.get("node_type", "") or front_matter.get("type", "") or front_matter.get("entity_type", "")
@@ -488,7 +384,7 @@ class ObsidianVaultManager:
         if not self.vault_root.exists():
             raise FileNotFoundError(f"Vault root does not exist: {self.vault_root}")
 
-        md_files = list(self.vault_root.rglob("*.md"))
+        md_files = sorted(list(self.vault_root.rglob("*.md")), key=lambda p: str(p))
         logger.info("Located %d markdown files.", len(md_files))
 
         for md_path in md_files:
@@ -531,7 +427,7 @@ class ObsidianVaultManager:
             if sector:
                 self._sector_set.add(sector.lower())
 
-        for node in self.nodes.values():
+        for node in sorted(self.nodes.values(), key=lambda n: n.uid):
             resolved: List[str] = []
             seen: set = set()
             for link in node.outbound_links:
@@ -563,7 +459,7 @@ class ObsidianVaultManager:
                     len(self._commodity_set), len(self._country_set), len(self._sector_set))
 
     def get_aggregate_stats(self, node_subset: List[VaultNode] | None = None) -> Dict[str, Any]:
-        nodes = node_subset if node_subset is not None else list(self.nodes.values())
+        nodes = node_subset if node_subset is not None else sorted(self.nodes.values(), key=lambda n: n.uid)
         entity_type_counts: Dict[str, int] = {}
         for node in nodes:
             et = node.entity_type or "unknown"
@@ -579,7 +475,7 @@ class ObsidianVaultManager:
         }
 
     def build_entity_graph(self, node_subset: List[VaultNode] | None = None) -> Dict[str, Any]:
-        nodes = node_subset if node_subset is not None else list(self.nodes.values())
+        nodes = node_subset if node_subset is not None else sorted(self.nodes.values(), key=lambda n: n.uid)
         subset_uids = {n.uid for n in nodes}
         graph_nodes: List[Dict[str, Any]] = []
         graph_edges: List[Dict[str, Any]] = []
@@ -616,14 +512,14 @@ class ObsidianVaultManager:
         return {"viewBox": "0 0 700 280", "height": 280, "nodes": graph_nodes, "edges": graph_edges}
 
     def get_all_nodes_as_context(self) -> List[VaultNode]:
-        return list(self.nodes.values())
+        return sorted(self.nodes.values(), key=lambda n: n.uid)
 
     # -- Perspective-Side Retrieval (NEW) ----------------------------------- #
     def get_perspective_nodes(self, perspective: PerspectiveContext) -> List[VaultNode]:
         """Retrieve all vault nodes that belong to the perspective country."""
         perspective_norm = perspective.country.lower()
         results: List[VaultNode] = []
-        for node in self.nodes.values():
+        for node in sorted(self.nodes.values(), key=lambda n: n.uid):
             if (node.country or "").lower() == perspective_norm:
                 results.append(node)
         logger.info("Retrieved %d perspective-side nodes for %s", len(results), perspective.country)
@@ -638,7 +534,7 @@ class ObsidianVaultManager:
         source_norm = source_country.lower()
         bridges: List[Dict[str, Any]] = []
 
-        for node in self.nodes.values():
+        for node in sorted(self.nodes.values(), key=lambda n: n.uid):
             node_country = (node.country or "").lower()
             if node_country not in (perspective_norm, source_norm):
                 continue
@@ -665,7 +561,7 @@ class ObsidianVaultManager:
                         })
 
         # Check backlinks
-        for uid, node in self.nodes.items():
+        for uid, node in sorted(self.nodes.items(), key=lambda x: x[0]):
             node_country = (node.country or "").lower()
             if node_country != perspective_norm:
                 continue
@@ -683,7 +579,7 @@ class ObsidianVaultManager:
                         })
 
         logger.info("Found %d cross-border bridges between %s and %s", len(bridges), perspective.country, source_country)
-        return bridges
+        return sorted(bridges, key=lambda b: (b.get("from_node", ""), b.get("to_node", "")))
 
 
 # =============================================================================
@@ -725,12 +621,17 @@ class LLMQueryEngine:
     def __init__(self) -> None:
         self.client: LLMClient = get_client()
         self.token_budget = TokenBudget()
+        self.cache: AnalysisCache = AnalysisCache()
 
     def _call_api(self, system_prompt: str, user_prompt: str) -> str:
-        return self.client.chat([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ])
+        return self.client.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            seed=42,
+        )
 
     # -----------------------------------------------------------------
     # STAGE 0: Intent Extraction
@@ -759,7 +660,7 @@ class LLMQueryEngine:
     def broad_pre_filter(self, vault_mgr: ObsidianVaultManager, intent: ATISIntent,
                          perspective: PerspectiveContext) -> List[VaultNode]:
         logger.info("STAGE 1: BROAD PRE-FILTER")
-        all_nodes = list(vault_mgr.nodes.values())
+        all_nodes = sorted(vault_mgr.nodes.values(), key=lambda n: n.uid)
         scored: List[Tuple[float, VaultNode]] = []
 
         for node in all_nodes:
@@ -806,7 +707,7 @@ class LLMQueryEngine:
             if score > 0:
                 scored.append((score, node))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored.sort(key=lambda x: (-x[0], x[1].uid))
         cap = min(BROAD_FILTER_MAX_CANDIDATES, len(scored))
         result = [node for _, node in scored[:cap]]
         logger.info("Broad filter: %d scored → %d candidates", len(scored), len(result))
@@ -1091,9 +992,12 @@ class LLMQueryEngine:
         for item in data["opportunities"]:
             if not item.get("source_country") and intent.target_countries:
                 item["source_country"] = intent.target_countries[0]
-            validated_opportunities.append(validate_opportunity(
+            validated = validate_opportunity(
                 item, perspective, all_node_ids, perspective_node_ids, cross_border_bridges
-            ))
+            )
+            # Assign stable opportunity ID via compute_opportunity_identity
+            validated["opportunity_id"] = compute_opportunity_identity(validated)
+            validated_opportunities.append(validated)
         data["opportunities"] = validated_opportunities
 
         return {
@@ -1108,7 +1012,8 @@ class LLMQueryEngine:
             "cross_border_bridges": cross_border_bridges,
         }
 
-    def _generate_empty_response(self, question: str, intent: ATISIntent) -> Dict[str, Any]:
+    def _generate_empty_response(self, question: str, intent: ATISIntent,
+                                  knowledge_state_hash: str = "") -> Dict[str, Any]:
         return {
             "executive_summary": (
                 f"No vault nodes matched the search for: '{question}'. "
@@ -1117,12 +1022,17 @@ class LLMQueryEngine:
             ),
             "structured_intelligence": [],
             "findings": [{"text": "No matching entities found.", "source_nodes": []}],
-            "opportunities": [{"text": "Consider expanding the vault.", "source_nodes": []}],
+            "opportunities": [],
             "risks": [{"text": "Incomplete data coverage.", "source_nodes": []}],
             "key_entities": [],
             "source_nodes": [],
             "perspective_nodes": [],
             "cross_border_bridges": [],
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "analysis_fingerprint": "",
+            "knowledge_state": {"hash": knowledge_state_hash},
+            "cache_hit": False,
         }
 
     # -----------------------------------------------------------------
@@ -1133,7 +1043,7 @@ class LLMQueryEngine:
         all_nodes = vault_mgr.get_all_nodes_as_context()
         if len(all_nodes) > FULL_SCAN_MAX_NODES:
             scored = [(len(n.outbound_links) + len(n.backlink_uids), n) for n in all_nodes]
-            scored.sort(key=lambda x: x[0], reverse=True)
+            scored.sort(key=lambda x: (-x[0], x[1].uid))
             all_nodes = [n for _, n in scored[:FULL_SCAN_MAX_NODES]]
 
         # Retrieve perspective nodes for full scan too
@@ -1181,8 +1091,27 @@ class LLMQueryEngine:
                                question: str | None = None,
                                perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
         perspective = perspective or PerspectiveContext()
+
+        # Compute vault knowledge state for versioning
+        knowledge_state = KnowledgeState(vault_mgr.vault_root)
+        knowledge_state_hash = getattr(knowledge_state, "hash", getattr(knowledge_state, "state_hash", ""))
+
+        # Build deterministic cache key
+        cache_payload = f"{question or 'FULL_SCAN'}|{perspective.country}|{perspective.country_code}|{knowledge_state_hash}"
+        cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
+
+        # Check cache before any LLM work
+        cached_result = self.cache.check(cache_key)
+        if cached_result is not None:
+            logger.info("Cache hit for query key %s", cache_key[:16])
+            cached_result["analysis_version"] = ANALYSIS_VERSION
+            cached_result["schema_version"] = SCHEMA_VERSION
+            cached_result["knowledge_state"] = {"hash": knowledge_state_hash}
+            cached_result["cache_hit"] = True
+            return cached_result
+
         if not question:
-            result = self.full_vault_scan(vault_mgr, perspective)
+            result = self.full_vault_scan(vault_mgr, perspective, knowledge_state, knowledge_state_hash, cache_key)
             result["perspective"] = perspective.as_dict()
             return result
 
@@ -1192,10 +1121,24 @@ class LLMQueryEngine:
         ranked_nodes = self.llm_semantic_ranking(question, intent, perspective, candidates, perspective_nodes, cross_border_bridges)
         result = self.grounded_synthesis(question, intent, perspective, ranked_nodes, perspective_nodes, cross_border_bridges)
 
+        # Compute analysis fingerprint after evidence is gathered
+        story_id = hashlib.sha256((question or "").encode()).hexdigest()[:16]
+        evidence_ids = sorted([n.uid for n in ranked_nodes])
+        entity_ids = sorted(list(set([n.uid for n in ranked_nodes + perspective_nodes])))
+        relationship_ids = sorted([f"{b['from_node']}->{b['to_node']}" for b in cross_border_bridges])
+        analysis_fingerprint = compute_analysis_fingerprint(
+            story_id=story_id,
+            perspective=perspective,
+            evidence_ids=evidence_ids,
+            entity_ids=entity_ids,
+            relationship_ids=relationship_ids,
+            knowledge_state_hash=knowledge_state_hash,
+        )
+
         entity_graph = vault_mgr.build_entity_graph(ranked_nodes)
         aggregate_stats = vault_mgr.get_aggregate_stats(ranked_nodes)
 
-        return {
+        payload = {
             **result,
             "intent": {
                 "type": intent.intent_type,
@@ -1216,7 +1159,16 @@ class LLMQueryEngine:
             "entity_graph": entity_graph,
             "stats": aggregate_stats,
             "perspective": perspective.as_dict(),
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "analysis_fingerprint": analysis_fingerprint,
+            "knowledge_state": {"hash": knowledge_state_hash},
+            "cache_hit": False,
         }
+
+        # Persist to cache after generation
+        self.cache.set(cache_key, payload)
+        return payload
 
 
 # =============================================================================
@@ -1254,12 +1206,17 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
         "source_nodes": payload.get("source_nodes", []),
         "perspective_nodes": payload.get("perspective_nodes", []),
         "cross_border_bridges": payload.get("cross_border_bridges", []),
+        "analysis_version": payload.get("analysis_version", ANALYSIS_VERSION),
+        "schema_version": payload.get("schema_version", SCHEMA_VERSION),
+        "analysis_fingerprint": payload.get("analysis_fingerprint", ""),
+        "knowledge_state": payload.get("knowledge_state", {}),
+        "cache_hit": payload.get("cache_hit", False),
         "pipeline_metadata": {
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
             "model_primary": model_primary,
             "model_fallback": model_fallback,
-            "pipeline_version": "perspective_first_v4_0",
+            "pipeline_version": "perspective_first_v4_1",
         },
     }
 
@@ -1355,6 +1312,11 @@ def run_query_pipeline(question: str | None = None,
         "filter_stats": result.get("filter_stats", {}),
         "entity_graph": entity_graph,
         "stats": aggregate_stats,
+        "analysis_version": result.get("analysis_version", ANALYSIS_VERSION),
+        "schema_version": result.get("schema_version", SCHEMA_VERSION),
+        "analysis_fingerprint": result.get("analysis_fingerprint", ""),
+        "knowledge_state": result.get("knowledge_state", {}),
+        "cache_hit": result.get("cache_hit", False),
         "files_written": {
             "dashboard_json": str(json_path),
             "graph_json": str(graph_path),

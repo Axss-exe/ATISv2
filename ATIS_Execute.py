@@ -13,10 +13,18 @@ actors, capabilities, and pathways are eligible for execution. RESEARCH_REQUIRED
 opportunities are rejected with a research recommendation.
 
 Map-Reduce Architecture:
-  1. MAP: Split vault nodes into 4-node chunks. Extract legal waivers,
+  1. MAP: Split vault nodes into chunks. Extract legal waivers,
      restrictions, and tactical facts per chunk.
   2. REDUCE: Feed condensed chunk summaries into a final synthesis prompt
      to generate the master roadmap.
+
+Determinism Features:
+  - temperature=0.0, seed=42 on all LLM calls
+  - sorted vault iterations for stable ordering
+  - AnalysisCache for disk-based result caching
+  - KnowledgeState for vault versioning
+  - compute_analysis_fingerprint for stable identity
+  - compute_opportunity_identity for stable opportunity IDs
 
 Usage:
     python ATIS_Execute.py \
@@ -27,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -35,11 +44,19 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import date, datetime
 
 from llm_client import LLMClient, get_client
-from atis_context import PerspectiveContext
+from atis_context import (
+    PerspectiveContext,
+    KnowledgeState,
+    AnalysisCache,
+    compute_analysis_fingerprint,
+    compute_opportunity_identity,
+    ANALYSIS_VERSION,
+    SCHEMA_VERSION,
+)
 
 # =============================================================================
 # Token Budget Configuration
@@ -62,10 +79,8 @@ except ImportError:
 
 if _MISSING_DEPS:
     print(
-        "FATAL: Missing required dependencies:
-  - "
-        + "
-  - ".join(_MISSING_DEPS),
+        "FATAL: Missing required dependencies:\n  - "
+        + "\n  - ".join(_MISSING_DEPS),
         file=sys.stderr,
     )
     sys.exit(1)
@@ -120,6 +135,79 @@ class VaultNode:
     backlink_uids: List[str] = field(default_factory=list)
     country: str = ""
 
+
+# =============================================================================
+# Token Budget Manager
+# =============================================================================
+@dataclass(frozen=True)
+class TokenBudget:
+    max_tokens: int = MAX_TOKENS_PER_REQUEST
+    response_reserve: int = RESPONSE_RESERVE
+    safety_buffer: int = SAFETY_BUFFER
+
+    @property
+    def available_for_input(self) -> int:
+        return self.max_tokens - self.response_reserve - self.safety_buffer
+
+    @staticmethod
+    def estimate(text: str) -> int:
+        if not text:
+            return 0
+        return int(len(text) / 3.2) + 1
+
+    def truncate_payload(
+        self,
+        system_prompt: str,
+        article_text: str,
+        graph_context: str,
+        min_article_ratio: float = 0.25,
+    ) -> Tuple[str, str]:
+        total_estimated = self.estimate(system_prompt + article_text + graph_context)
+        if total_estimated <= self.available_for_input:
+            return article_text, graph_context
+
+        available_chars = int(self.available_for_input * 3.2) - len(system_prompt)
+        if available_chars <= 0:
+            raise RuntimeError("System prompt alone exceeds the token budget.")
+
+        min_article_chars = int(available_chars * min_article_ratio)
+        article_chars = min(len(article_text), min_article_chars)
+        graph_chars = available_chars - article_chars
+
+        truncated_article = article_text
+        truncated_graph = graph_context
+
+        if len(article_text) > article_chars:
+            truncated_article = (
+                article_text[:article_chars]
+                + "\n\n[ARTICLE TRUNCATED TO RESPECT TOKEN BUDGET]"
+            )
+            logger.warning(
+                "Article truncated from %d to ~%d chars to fit token budget.",
+                len(article_text),
+                article_chars,
+            )
+
+        if len(graph_context) > graph_chars:
+            truncated_graph = (
+                graph_context[:graph_chars]
+                + "\n\n[GRAPH CONTEXT TRUNCATED TO RESPECT TOKEN BUDGET]"
+            )
+            logger.warning(
+                "Graph context truncated from %d to ~%d chars to fit token budget.",
+                len(graph_context),
+                graph_chars,
+            )
+
+        revised_estimate = self.estimate(
+            system_prompt + truncated_article + truncated_graph
+        )
+        logger.info(
+            "Revised payload estimate after truncation: %d tokens (budget: %d)",
+            revised_estimate,
+            self.available_for_input,
+        )
+        return truncated_article, truncated_graph
 
 # =============================================================================
 # ObsidianVaultManager
@@ -218,7 +306,7 @@ class ObsidianVaultManager:
         if not self.vault_root.exists():
             raise FileNotFoundError(f"Vault root does not exist: {self.vault_root}")
 
-        md_files = list(self.vault_root.rglob("*.md"))
+        md_files = sorted(self.vault_root.rglob("*.md"), key=lambda p: str(p))
         logger.info("Located %d markdown files.", len(md_files))
 
         for md_path in md_files:
@@ -265,7 +353,8 @@ class ObsidianVaultManager:
             for alias in self._extract_aliases(front_matter):
                 self._link_resolver[self.canonicalize(alias)] = uid
 
-        for node in self.nodes.values():
+        # Resolve outbound links deterministically
+        for node in sorted(self.nodes.values(), key=lambda n: n.uid):
             resolved: List[str] = []
             seen: set = set()
             for link in node.outbound_links:
@@ -281,14 +370,19 @@ class ObsidianVaultManager:
                         resolved.append(link)
             node.outbound_links = resolved
 
-        for uid, node in self.nodes.items():
+        # Build backlink map deterministically
+        for uid, node in sorted(self.nodes.items(), key=lambda item: item[0]):
             for target in node.outbound_links:
                 if target in self.nodes:
                     if target not in self.backlink_map:
                         self.backlink_map[target] = []
                     self.backlink_map[target].append(uid)
 
-        for uid, node in self.nodes.items():
+        # Sort backlink lists for determinism
+        for uid in self.backlink_map:
+            self.backlink_map[uid] = sorted(self.backlink_map[uid])
+
+        for uid, node in sorted(self.nodes.items(), key=lambda item: item[0]):
             node.backlink_uids = self.backlink_map.get(uid, [])
 
         self.indexed_count = len(self.nodes)
@@ -326,7 +420,8 @@ class ObsidianVaultManager:
         scored: List[Tuple[int, VaultNode]] = []
         MIN_TOKEN_MATCHES = 1
 
-        for node in self.nodes.values():
+        # DETERMINISTIC: iterate nodes sorted by uid
+        for node in sorted(self.nodes.values(), key=lambda n: n.uid):
             aliases = self._extract_aliases(node.front_matter)
             alias_text = " ".join(aliases)
             text_block = f"{node.uid} {alias_text} {node.summary}".lower()
@@ -353,7 +448,7 @@ class ObsidianVaultManager:
             if overlap_score >= MIN_TOKEN_MATCHES:
                 scored.append((overlap_score, node))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored.sort(key=lambda x: (x[0], x[1].uid), reverse=True)
         k = min(5, len(scored))
         top_anchors = [node for _, node in scored[:k]]
 
@@ -370,15 +465,18 @@ class ObsidianVaultManager:
 
     def _crawl_subgraph(self, anchors: List[VaultNode]) -> Dict[str, VaultNode]:
         cluster: Dict[str, VaultNode] = {}
-        for anchor in anchors:
+        # DETERMINISTIC: sort anchors by uid before processing
+        for anchor in sorted(anchors, key=lambda n: n.uid):
             anchor.is_anchor = True
             cluster[anchor.uid] = anchor
 
-            for target_uid in anchor.outbound_links:
+            # DETERMINISTIC: sort outbound links
+            for target_uid in sorted(anchor.outbound_links):
                 if target_uid in self.nodes and target_uid not in cluster:
                     cluster[target_uid] = self.nodes[target_uid]
 
-            for source_uid in self.backlink_map.get(anchor.uid, []):
+            # DETERMINISTIC: sort backlink sources
+            for source_uid in sorted(self.backlink_map.get(anchor.uid, [])):
                 if source_uid in self.nodes and source_uid not in cluster:
                     cluster[source_uid] = self.nodes[source_uid]
 
@@ -391,7 +489,8 @@ class ObsidianVaultManager:
             return []
 
         cluster = self._crawl_subgraph(anchors)
-        nodes = list(cluster.values())
+        # DETERMINISTIC: return nodes sorted by uid
+        nodes = sorted(cluster.values(), key=lambda n: n.uid)
         logger.info(
             "Vault search returned %d nodes (%d anchors, %d related).",
             len(nodes), len(anchors), len(nodes) - len(anchors)
@@ -486,78 +585,43 @@ def expand_keywords(opportunity: Dict[str, Any]) -> List[str]:
 
 
 # =============================================================================
-# Token Budget Manager
+# Opportunity validation for execution
 # =============================================================================
-@dataclass(frozen=True)
-class TokenBudget:
-    max_tokens: int = MAX_TOKENS_PER_REQUEST
-    response_reserve: int = RESPONSE_RESERVE
-    safety_buffer: int = SAFETY_BUFFER
+def validate_opportunity_for_execution(opportunity: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate that an opportunity is eligible for execution.
+    Only VALID opportunities with evidenced perspective-side actors can be executed.
 
-    @property
-    def available_for_input(self) -> int:
-        return self.max_tokens - self.response_reserve - self.safety_buffer
+    Returns (is_valid, message).
+    """
+    status = opportunity.get("status", "")
+    if status != "VALID":
+        return False, f"Opportunity status is '{status}'. Only VALID opportunities can be executed. RESEARCH_REQUIRED opportunities need additional vault evidence before execution."
 
-    @staticmethod
-    def estimate(text: str) -> int:
-        if not text:
-            return 0
-        return int(len(text) / 3.2) + 1
+    perspective_actor = opportunity.get("perspective_actor", "")
+    perspective_capability = opportunity.get("perspective_capability", "")
+    pathway = opportunity.get("pathway", "")
 
-    def truncate_payload(
-        self,
-        system_prompt: str,
-        article_text: str,
-        graph_context: str,
-        min_article_ratio: float = 0.25,
-    ) -> Tuple[str, str]:
-        total_estimated = self.estimate(system_prompt + article_text + graph_context)
-        if total_estimated <= self.available_for_input:
-            return article_text, graph_context
+    if not perspective_actor:
+        return False, "Missing perspective_actor. Cannot execute without an evidenced actor."
 
-        available_chars = int(self.available_for_input * 3.2) - len(system_prompt)
-        if available_chars <= 0:
-            raise RuntimeError("System prompt alone exceeds the token budget.")
+    if not perspective_capability:
+        return False, "Missing perspective_capability. Cannot execute without evidenced capability."
 
-        min_article_chars = int(available_chars * min_article_ratio)
-        article_chars = min(len(article_text), min_article_chars)
-        graph_chars = available_chars - article_chars
+    if not pathway:
+        return False, "Missing pathway. Cannot execute without an evidenced mechanism."
 
-        truncated_article = article_text
-        truncated_graph = graph_context
+    # Check evidence flags
+    if not opportunity.get("perspective_actor_evidence", False):
+        return False, f"Perspective actor '{perspective_actor}' is not evidenced in the vault."
 
-        if len(article_text) > article_chars:
-            truncated_article = (
-                article_text[:article_chars]
-                + "\n\n[ARTICLE TRUNCATED TO RESPECT TOKEN BUDGET]"
-            )
-            logger.warning(
-                "Article truncated from %d to ~%d chars to fit token budget.",
-                len(article_text),
-                article_chars,
-            )
+    if not opportunity.get("perspective_capability_evidence", False):
+        return False, "Perspective capability is not evidenced."
 
-        if len(graph_context) > graph_chars:
-            truncated_graph = (
-                graph_context[:graph_chars]
-                + "\n\n[GRAPH CONTEXT TRUNCATED TO RESPECT TOKEN BUDGET]"
-            )
-            logger.warning(
-                "Graph context truncated from %d to ~%d chars to fit token budget.",
-                len(graph_context),
-                graph_chars,
-            )
+    if not opportunity.get("pathway_evidence", False):
+        return False, "Pathway is not evidenced."
 
-        revised_estimate = self.estimate(
-            system_prompt + truncated_article + truncated_graph
-        )
-        logger.info(
-            "Revised payload estimate after truncation: %d tokens (budget: %d)",
-            revised_estimate,
-            self.available_for_input,
-        )
-        return truncated_article, truncated_graph
-
+    return True, "Opportunity validated for execution."
 
 # =============================================================================
 # LLM Integration Layer — Map-Reduce Chunked Execution
@@ -573,12 +637,14 @@ class LLMExecutionEngine:
     def __init__(self) -> None:
         self.client: LLMClient = get_client()
         self.token_budget = TokenBudget()
+        self.cache = AnalysisCache()
 
     def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        # DETERMINISM: force temperature=0.0 and seed=42
         return self.client.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ])
+        ], temperature=0.0, seed=42)
 
     # ---------------------------------------------------------------------
     # MAP: Chunk extraction
@@ -602,7 +668,7 @@ class LLMExecutionEngine:
             len(chunk_nodes),
         )
 
-        # Build dense chunk context
+        # Build dense chunk context — DETERMINISTIC: nodes already sorted by uid
         node_blocks: List[str] = []
         for node in chunk_nodes:
             node_blocks.append(
@@ -784,7 +850,7 @@ class LLMExecutionEngine:
                 "compiled_lineage_traces": compiled_lineage_traces,
             }
 
-        # Split into chunks
+        # Split into chunks — vault_nodes already sorted by uid from vault_mgr.search()
         chunks: List[List[VaultNode]] = []
         for i in range(0, len(vault_nodes), CHUNK_SIZE):
             chunks.append(vault_nodes[i : i + CHUNK_SIZE])
@@ -846,7 +912,6 @@ class LLMExecutionEngine:
             "compiled_lineage_traces": compiled_lineage_traces,
         }
 
-
 # =============================================================================
 # Output persistence
 # =============================================================================
@@ -855,11 +920,16 @@ def persist_outputs(
     final_roadmap: str,
     ui_thinking_graph_raw: str,
     compiled_lineage_traces: List[Dict[str, Any]],
+    analysis_fingerprint: str = "",
+    knowledge_state: Optional[Dict[str, Any]] = None,
+    perspective: Optional[PerspectiveContext] = None,
 ) -> Tuple[Path, Path]:
     """
     Twin-file persistence:
       1. Markdown execution roadmap.
       2. Structured JSON companion for React Flow UI.
+
+    DETERMINISM: JSON includes analysis_fingerprint and knowledge_state.
     """
     output_dir = Path(os.getenv("OUTPUT_DIR", "./output/roadmaps"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -871,9 +941,13 @@ def persist_outputs(
 Generated by ATIS_Execute.py  
 Opportunity ID: `{opportunity_id}`
 
----
-
 """
+    if analysis_fingerprint:
+        header += f"Analysis Fingerprint: `{analysis_fingerprint}`\n"
+    if knowledge_state:
+        header += f"Knowledge State Hash: `{knowledge_state.get('vault_hash', 'N/A')}`\n"
+    header += "\n---\n\n"
+
     md_path.write_text(header + final_roadmap, encoding="utf-8")
     logger.info("Roadmap persisted to: %s", md_path)
 
@@ -886,6 +960,15 @@ Opportunity ID: `{opportunity_id}`
 
         # Inject granular lineage traces
         thinking_graph["compiled_lineage_traces"] = compiled_lineage_traces
+
+        # DETERMINISM: inject metadata
+        thinking_graph["analysis_fingerprint"] = analysis_fingerprint
+        thinking_graph["analysis_version"] = ANALYSIS_VERSION
+        thinking_graph["schema_version"] = SCHEMA_VERSION
+        if knowledge_state:
+            thinking_graph["knowledge_state"] = knowledge_state
+        if perspective:
+            thinking_graph["perspective"] = perspective.as_dict()
 
         json_path.write_text(
             json.dumps(thinking_graph, indent=2, default=str),
@@ -910,7 +993,15 @@ Opportunity ID: `{opportunity_id}`
             "compiled_lineage_traces": compiled_lineage_traces,
             "metrics": {},
             "convergence_flow": {},
+            "analysis_fingerprint": analysis_fingerprint,
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
         }
+        if knowledge_state:
+            fallback["knowledge_state"] = knowledge_state
+        if perspective:
+            fallback["perspective"] = perspective.as_dict()
+
         json_path.write_text(
             json.dumps(fallback, indent=2, default=str),
             encoding="utf-8",
@@ -918,46 +1009,6 @@ Opportunity ID: `{opportunity_id}`
         logger.info("Fallback reasoning JSON persisted to: %s", json_path)
 
     return md_path, json_path
-
-
-# =============================================================================
-# Opportunity validation for execution
-# =============================================================================
-def validate_opportunity_for_execution(opportunity: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Validate that an opportunity is eligible for execution.
-    Only VALID opportunities with evidenced perspective-side actors can be executed.
-
-    Returns (is_valid, message).
-    """
-    status = opportunity.get("status", "")
-    if status != "VALID":
-        return False, f"Opportunity status is '{status}'. Only VALID opportunities can be executed. RESEARCH_REQUIRED opportunities need additional vault evidence before execution."
-
-    perspective_actor = opportunity.get("perspective_actor", "")
-    perspective_capability = opportunity.get("perspective_capability", "")
-    pathway = opportunity.get("pathway", "")
-
-    if not perspective_actor:
-        return False, "Missing perspective_actor. Cannot execute without an evidenced actor."
-
-    if not perspective_capability:
-        return False, "Missing perspective_capability. Cannot execute without evidenced capability."
-
-    if not pathway:
-        return False, "Missing pathway. Cannot execute without an evidenced mechanism."
-
-    # Check evidence flags
-    if not opportunity.get("perspective_actor_evidence", False):
-        return False, f"Perspective actor '{perspective_actor}' is not evidenced in the vault."
-
-    if not opportunity.get("perspective_capability_evidence", False):
-        return False, "Perspective capability is not evidenced."
-
-    if not opportunity.get("pathway_evidence", False):
-        return False, "Pathway is not evidenced."
-
-    return True, "Opportunity validated for execution."
 
 
 # =============================================================================
@@ -1020,7 +1071,10 @@ def main() -> None:
         logger.error("Vault indexing failed: %s", exc)
         sys.exit(1)
 
-    # 4. Expand keywords and search (Anchor + Crawl)
+    # 4. Compute knowledge state for determinism
+    knowledge_state = KnowledgeState.compute(vault_mgr)
+
+    # 5. Expand keywords and search (Anchor + Crawl)
     seed_terms = expand_keywords(opportunity)
     try:
         matches = vault_mgr.search(opportunity, seed_terms)
@@ -1028,21 +1082,54 @@ def main() -> None:
         logger.error("Vault search failed: %s", exc)
         sys.exit(1)
 
-    # 5. LLM generation — Map-Reduce
-    engine = LLMExecutionEngine()
-    try:
-        result = engine.generate_roadmap(opportunity, matches)
-    except Exception as exc:
-        logger.error("Roadmap generation failed: %s", exc)
-        sys.exit(1)
+    # 6. Build evidence IDs for fingerprint
+    evidence_ids = sorted([node.uid for node in matches])
+    entity_ids = sorted(list(set(
+        [opportunity.get("perspective_actor", "")] +
+        [opportunity.get("source_country", "")] +
+        [opportunity.get("event_country", "")] +
+        [opportunity.get("opportunity_country", "")]
+    )))
+    relationship_ids = sorted(list(set(
+        opportunity.get("cross_border_countries", []) +
+        [opportunity.get("pathway", "")]
+    )))
 
-    # 6. Persist twin files
+    # 7. Compute analysis fingerprint
+    analysis_fingerprint = compute_analysis_fingerprint(
+        story_id=opportunity.get("story_id", opportunity.get("id", args.opportunity_id)),
+        perspective=opportunity.get("perspective_country", "Unknown"),
+        evidence_ids=evidence_ids,
+        entity_ids=[e for e in entity_ids if e],
+        relationship_ids=[r for r in relationship_ids if r],
+        knowledge_state_hash=knowledge_state.hash,
+    )
+
+    # 8. Check cache before LLM generation
+    engine = LLMExecutionEngine()
+    cached_result = engine.cache.get(analysis_fingerprint)
+    if cached_result is not None:
+        logger.info("Cache HIT for fingerprint %s. Returning cached roadmap.", analysis_fingerprint)
+        result = cached_result
+    else:
+        logger.info("Cache MISS for fingerprint %s. Running Map-Reduce generation.", analysis_fingerprint)
+        try:
+            result = engine.generate_roadmap(opportunity, matches)
+            # Store in cache
+            engine.cache.set(analysis_fingerprint, result)
+        except Exception as exc:
+            logger.error("Roadmap generation failed: %s", exc)
+            sys.exit(1)
+
+    # 9. Persist twin files with determinism metadata
     try:
         md_path, json_path = persist_outputs(
             args.opportunity_id,
             result["final_roadmap"],
             result["ui_thinking_graph"],
             result["compiled_lineage_traces"],
+            analysis_fingerprint=analysis_fingerprint,
+            knowledge_state=knowledge_state.to_dict(),
         )
     except Exception as exc:
         logger.error("Failed to persist outputs: %s", exc)
@@ -1050,23 +1137,38 @@ def main() -> None:
 
     print(f"\nSUCCESS: Execution roadmap written to:\n  {md_path}")
     print(f"SUCCESS: Reasoning JSON written to:\n  {json_path}")
-
+    print(f"Analysis Fingerprint: {analysis_fingerprint}")
+    print(f"Knowledge State Hash: {knowledge_state.hash}")
 
 # =============================================================================
 # Web entry point
 # =============================================================================
-def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
-                         perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
+def run_execute_pipeline(
+    dashboard_json: Dict[str, Any],
+    opportunity_id: str,
+    perspective: Optional[PerspectiveContext] = None,
+) -> Dict[str, Any]:
     """
     Web-compatible entry point. Accepts dashboard dict and opportunity ID.
     Returns dict with final_roadmap, ui_thinking_graph, and compiled_lineage_traces.
 
     CRITICAL: Validates that the opportunity is VALID before executing.
     RESEARCH_REQUIRED opportunities are rejected with an explanation.
+
+    DETERMINISM FEATURES:
+      - Computes KnowledgeState at pipeline start
+      - Computes analysis_fingerprint for stable identity
+      - Checks AnalysisCache before LLM generation
+      - Sets AnalysisCache after generation
+      - Uses compute_opportunity_identity for stable IDs
+      - Includes analysis_version, schema_version, analysis_fingerprint, knowledge_state in output
     """
     vault_path = Path(os.getenv("VAULT_PATH", "./vault"))
     vault_mgr = ObsidianVaultManager(vault_path)
     vault_mgr.build_index()
+
+    # Compute knowledge state for vault versioning
+    knowledge_state = KnowledgeState.compute(vault_mgr)
 
     dashboard_perspective = PerspectiveContext.from_payload(dashboard_json)
     if perspective and perspective != dashboard_perspective:
@@ -1101,24 +1203,75 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
                 "convergence_flow": {"tier_1_anchors": [], "tier_2_processing_chunks": [], "tier_3_synthesis_logic": "Execution blocked due to insufficient perspective-side evidence."},
             }),
             "compiled_lineage_traces": [],
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "analysis_fingerprint": "",
+            "knowledge_state": knowledge_state.to_dict(),
         }
 
     seed_terms = expand_keywords(opportunity)
     matches = vault_mgr.search(opportunity, seed_terms)
 
-    engine = LLMExecutionEngine()
-    result = engine.generate_roadmap(opportunity, matches)
+    # Build evidence IDs for fingerprint
+    evidence_ids = sorted([node.uid for node in matches])
+    entity_ids = sorted(list(set(
+        [opportunity.get("perspective_actor", "")] +
+        [opportunity.get("source_country", "")] +
+        [opportunity.get("event_country", "")] +
+        [opportunity.get("opportunity_country", "")]
+    )))
+    relationship_ids = sorted(list(set(
+        opportunity.get("cross_border_countries", []) +
+        [opportunity.get("pathway", "")]
+    )))
 
-    # Persist
+    # Compute stable opportunity identity
+    stable_opp_id = compute_opportunity_identity(
+        title=opportunity.get("title", opportunity.get("name", "")),
+        perspective_country=perspective.country,
+        source_country=opportunity.get("source_country", ""),
+        event_country=opportunity.get("event_country", ""),
+        opportunity_country=opportunity.get("opportunity_country", ""),
+        pathway=opportunity.get("pathway", ""),
+        perspective_actor=opportunity.get("perspective_actor", ""),
+    )
+
+    # Compute analysis fingerprint
+    analysis_fingerprint = compute_analysis_fingerprint(
+        story_id=opportunity.get("story_id", opportunity.get("id", opportunity_id)),
+        perspective=perspective.country,
+        evidence_ids=evidence_ids,
+        entity_ids=[e for e in entity_ids if e],
+        relationship_ids=[r for r in relationship_ids if r],
+        knowledge_state_hash=knowledge_state.hash,
+    )
+
+    # Check cache before LLM generation
+    engine = LLMExecutionEngine()
+    cached_result = engine.cache.get(analysis_fingerprint)
+    if cached_result is not None:
+        logger.info("Cache HIT for fingerprint %s. Returning cached roadmap.", analysis_fingerprint)
+        result = cached_result
+    else:
+        logger.info("Cache MISS for fingerprint %s. Running Map-Reduce generation.", analysis_fingerprint)
+        result = engine.generate_roadmap(opportunity, matches)
+        # Store in cache
+        engine.cache.set(analysis_fingerprint, result)
+
+    # Persist with determinism metadata
     md_path, json_path = persist_outputs(
         opportunity_id,
         result["final_roadmap"],
         result["ui_thinking_graph"],
         result["compiled_lineage_traces"],
+        analysis_fingerprint=analysis_fingerprint,
+        knowledge_state=knowledge_state.to_dict(),
+        perspective=perspective,
     )
 
     return {
         "opportunity_id": opportunity_id,
+        "stable_opportunity_id": stable_opp_id,
         "status": "EXECUTED",
         "validation_message": validation_message,
         "final_roadmap": result["final_roadmap"],
@@ -1128,7 +1281,11 @@ def run_execute_pipeline(dashboard_json: Dict[str, Any], opportunity_id: str,
         "files_written": {
             "roadmap_md": str(md_path),
             "reasoning_json": str(json_path),
-        }
+        },
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "analysis_fingerprint": analysis_fingerprint,
+        "knowledge_state": knowledge_state.to_dict(),
     }
 
 
