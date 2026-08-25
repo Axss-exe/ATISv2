@@ -114,8 +114,7 @@ class KnowledgeState:
             rel = str(md_path.relative_to(self.vault_path))
             mtime = str(md_path.stat().st_mtime)
             size = str(md_path.stat().st_size)
-            hasher.update(f"{rel}|{mtime}|{size}
-".encode("utf-8"))
+            hasher.update(f"{rel}|{mtime}|{size}\n".encode("utf-8"))
         self.knowledge_state_hash = hasher.hexdigest()[:32]
 
         evidence_hasher = hashlib.sha256()
