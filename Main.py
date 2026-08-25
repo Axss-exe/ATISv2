@@ -12,6 +12,7 @@ Features:
   - Perspective-First Deterministic Architecture v2.2
   - Analysis fingerprinting and knowledge-state-aware caching
   - Investigation / Query String backend layer
+  - INVESTIGATION REPORT GENERATION (payload-based, no local persistence)
 """
 
 from __future__ import annotations
@@ -54,6 +55,9 @@ from investigation_manager import (
     generate_investigation_report,
     INVESTIGATIONS_DIR,
 )
+
+# NEW: Payload-based report generation (no local persistence)
+from report_generator import generate_investigation_report as generate_report_from_payload
 
 # =============================================================================
 # Logging
@@ -158,6 +162,10 @@ class CreateInvestigationRequest(BaseModel):
 class AddQueryRequest(BaseModel):
     question: str
     parent_query_id: str | None = None
+
+# NEW: Payload-based report generation request model
+class GenerateReportRequest(BaseModel):
+    investigation: dict
 
 # =============================================================================
 # Helper: Run pipeline with timeout and lock
@@ -790,7 +798,7 @@ async def get_investigation_endpoint(investigation_id: str):
 
 @app.post("/api/investigations/{investigation_id}/report")
 async def generate_report_endpoint(investigation_id: str):
-    """Generate a Knowledge Report for an investigation."""
+    """Generate a Knowledge Report for an investigation (local file-based)."""
     if not _acquire_pipeline_lock():
         return {
             "status": "busy",
@@ -823,6 +831,51 @@ async def generate_report_endpoint(investigation_id: str):
     except Exception as exc:
         logger.error("Report generation failed: %s", exc)
         return {"status": "error", "detail": f"Report generation failed: {str(exc)}"}
+    finally:
+        _release_pipeline_lock()
+
+
+# =============================================================================
+# NEW: Payload-based report generation endpoint (no local persistence)
+# =============================================================================
+
+@app.post("/api/investigation/report")
+async def generate_report_from_payload_endpoint(request: GenerateReportRequest):
+    """
+    Generate a Knowledge Report from a complete Investigation payload.
+
+    This endpoint does NOT read from local persistence.
+    The frontend sends the complete investigation state.
+    """
+    if not _acquire_pipeline_lock():
+        return {
+            "status": "busy",
+            "detail": "Another pipeline is running. Please wait and retry."
+        }
+
+    try:
+        start = time.time()
+        report = await _run_with_timeout(
+            generate_report_from_payload,
+            request.investigation,
+            timeout=120.0,
+        )
+        elapsed = time.time() - start
+        logger.info("Report generated from payload in %.1fs", elapsed)
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "report": report,
+        }
+    except ValueError as exc:
+        logger.warning("Invalid report payload: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        logger.error("Report generation failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Report generation unexpected error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(exc)}")
     finally:
         _release_pipeline_lock()
 
