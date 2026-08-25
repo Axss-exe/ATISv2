@@ -9,8 +9,9 @@ Features:
   - 60-second hard timeout on all LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Emergency kill endpoint
-  - Perspective-First Deterministic Architecture v2.1
+  - Perspective-First Deterministic Architecture v2.2
   - Analysis fingerprinting and knowledge-state-aware caching
+  - Investigation / Query String backend layer
 """
 
 from __future__ import annotations
@@ -44,6 +45,16 @@ from atis_context import (
     SCHEMA_VERSION,
 )
 
+# Investigation layer
+from investigation_manager import (
+    create_investigation,
+    add_query_to_investigation,
+    get_investigation,
+    list_investigations,
+    generate_investigation_report,
+    INVESTIGATIONS_DIR,
+)
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -60,7 +71,7 @@ logger = logging.getLogger("ATIS_API")
 app = FastAPI(
     title="ATIS Intelligence API",
     description="Africa-wide Intelligence System with Perspective-First Deterministic Architecture",
-    version="2.1.0-perspective-deterministic",
+    version="2.2.0-perspective-deterministic",
 )
 
 # =============================================================================
@@ -137,6 +148,16 @@ class QueryRequest(BaseModel):
 class EntityRequest(BaseModel):
     entity_name: str
     perspective: Optional[PerspectiveModel] = None
+
+# --- Investigation request models ---
+class CreateInvestigationRequest(BaseModel):
+    question: str
+    perspective_country: str | None = None
+    perspective_country_code: str | None = None
+
+class AddQueryRequest(BaseModel):
+    question: str
+    parent_query_id: str | None = None
 
 # =============================================================================
 # Helper: Run pipeline with timeout and lock
@@ -344,7 +365,7 @@ async def health():
     return {
         "status": "ok",
         "service": "ATIS API",
-        "version": "2.1.0-perspective-deterministic",
+        "version": "2.2.0-perspective-deterministic",
         "pipeline_busy": _pipeline_in_progress,
         "cached_queries": len(_query_cache),
         "cached_entities": _entities_cache is not None,
@@ -528,7 +549,6 @@ async def news_endpoint(request: NewsRequest):
         result = await _run_with_timeout(
             run_news_pipeline,
             request.article_text,
-            _vault_path,
             perspective,
             timeout=60.0
         )
@@ -664,9 +684,162 @@ async def query_endpoint(request: QueryRequest):
     finally:
         _release_pipeline_lock()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Investigation endpoints
+# =============================================================================
+
+@app.post("/api/investigations")
+async def create_investigation_endpoint(request: CreateInvestigationRequest):
+    """
+    Create a new investigation and execute the initial query.
+    The initial question becomes Query #1.
+    """
+    if not _acquire_pipeline_lock():
+        return {
+            "status": "busy",
+            "detail": "Another pipeline is running. Please wait and retry."
+        }
+
+    try:
+        start = time.time()
+        investigation = await _run_with_timeout(
+            create_investigation,
+            request.question,
+            request.perspective_country,
+            request.perspective_country_code,
+            _vault_path,
+            timeout=60.0,
+        )
+        elapsed = time.time() - start
+        logger.info("Investigation created in %.1fs | id=%s", elapsed, investigation["investigation_id"])
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "investigation": investigation,
+        }
+    except ValueError as exc:
+        logger.warning("Invalid investigation request: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        logger.error("Investigation creation timed out: %s", exc)
+        return {"status": "error", "detail": str(exc)}
+    except Exception as exc:
+        logger.error("Investigation creation failed: %s", exc)
+        return {"status": "error", "detail": f"Investigation creation failed: {str(exc)}"}
+    finally:
+        _release_pipeline_lock()
+
+
+@app.post("/api/investigations/{investigation_id}/queries")
+async def add_query_to_investigation_endpoint(investigation_id: str, request: AddQueryRequest):
+    """
+    Add a new query to an existing investigation.
+    Executes the existing ATIS query engine and updates aggregated knowledge.
+    """
+    if not _acquire_pipeline_lock():
+        return {
+            "status": "busy",
+            "detail": "Another pipeline is running. Please wait and retry."
+        }
+
+    try:
+        start = time.time()
+        investigation = await _run_with_timeout(
+            add_query_to_investigation,
+            investigation_id,
+            request.question,
+            request.parent_query_id,
+            _vault_path,
+            timeout=60.0,
+        )
+        elapsed = time.time() - start
+        logger.info("Query added to investigation %s in %.1fs | total_queries=%d",
+                    investigation_id, elapsed, len(investigation["queries"]))
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "investigation": investigation,
+        }
+    except FileNotFoundError as exc:
+        logger.warning("Investigation not found: %s", investigation_id)
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        logger.warning("Invalid query request: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        logger.error("Query addition timed out: %s", exc)
+        return {"status": "error", "detail": str(exc)}
+    except Exception as exc:
+        logger.error("Query addition failed: %s", exc)
+        return {"status": "error", "detail": f"Query addition failed: {str(exc)}"}
+    finally:
+        _release_pipeline_lock()
+
+
+@app.get("/api/investigations/{investigation_id}")
+async def get_investigation_endpoint(investigation_id: str):
+    """Retrieve a complete investigation by ID."""
+    investigation = get_investigation(investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail=f"Investigation not found: {investigation_id}")
+    return {
+        "status": "success",
+        "investigation": investigation,
+    }
+
+
+@app.post("/api/investigations/{investigation_id}/report")
+async def generate_report_endpoint(investigation_id: str):
+    """Generate a Knowledge Report for an investigation."""
+    if not _acquire_pipeline_lock():
+        return {
+            "status": "busy",
+            "detail": "Another pipeline is running. Please wait and retry."
+        }
+
+    try:
+        start = time.time()
+        report = await _run_with_timeout(
+            generate_investigation_report,
+            investigation_id,
+            timeout=60.0,
+        )
+        elapsed = time.time() - start
+        logger.info("Report generated for investigation %s in %.1fs", investigation_id, elapsed)
+        return {
+            "status": "success",
+            "elapsed_seconds": round(elapsed, 1),
+            "report": report,
+        }
+    except FileNotFoundError as exc:
+        logger.warning("Investigation not found for report: %s", investigation_id)
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        logger.warning("Invalid report request: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        logger.error("Report generation timed out: %s", exc)
+        return {"status": "error", "detail": str(exc)}
+    except Exception as exc:
+        logger.error("Report generation failed: %s", exc)
+        return {"status": "error", "detail": f"Report generation failed: {str(exc)}"}
+    finally:
+        _release_pipeline_lock()
+
+
+@app.get("/api/investigations")
+async def list_investigations_endpoint():
+    """List all investigations (lightweight summary)."""
+    investigations = list_investigations()
+    return {
+        "status": "success",
+        "count": len(investigations),
+        "investigations": investigations,
+    }
+
+# =============================================================================
 # Cache management endpoints
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/cache/invalidate")
 async def invalidate_cache(evidence_id: Optional[str] = None):
     """Invalidate cached analyses by evidence ID or clear all."""
@@ -724,7 +897,7 @@ async def kill_pipeline():
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
-    logger.info("ATIS API v2.1.0 starting up...")
+    logger.info("ATIS API v2.2.0 starting up...")
     try:
         vault = _get_query_vault()
         ks = KnowledgeState(vault_root=_vault_path)
