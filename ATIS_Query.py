@@ -75,7 +75,7 @@ except ImportError:
     _MISSING_DEPS.append("PyYAML (pip install pyyaml)")
 
 if _MISSING_DEPS:
-        print("FATAL: Missing required dependencies:\n  - " + "\n  - ".join(_MISSING_DEPS), file=sys.stderr)
+    print("FATAL: Missing required dependencies:\n  - " + "\n  - ".join(_MISSING_DEPS), file=sys.stderr)
     sys.exit(1)
 
 # =============================================================================
@@ -1111,8 +1111,9 @@ class LLMQueryEngine:
             return cached_result
 
         if not question:
-            result = self.full_vault_scan(vault_mgr, perspective, knowledge_state, knowledge_state_hash, cache_key)
-            result["perspective"] = perspective.as_dict()
+            result = self.full_vault_scan(vault_mgr, perspective)
+            result["knowledge_state_hash"] = knowledge_state_hash
+            result["cache_key"] = cache_key
             return result
 
         intent = self.extract_intent(question)
