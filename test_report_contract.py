@@ -494,33 +494,34 @@ def test_full_report_generation():
 
 
 def test_error_handling():
-    """Test 4: Error handling for bad LLM output."""
+    """Test 4: Error handling for bad LLM output — fallback chain."""
     print("\n=== TEST 4: Error Handling ===")
 
     investigation = make_sample_investigation()
     import report_generator as rg
     original_get_client = rg.get_client
 
-    # Test bad JSON
+    # Test bad JSON — should trigger fallback chain and return a valid report
     rg.get_client = lambda: BadJSONLLMClient()
     try:
-        try:
-            generate_investigation_report(investigation)
-            assert False, "Should have raised RuntimeError"
-        except RuntimeError as e:
-            assert "invalid JSON" in str(e).lower() or "parse" in str(e).lower()
-            print("✓ Bad JSON correctly rejected with diagnostic info")
+        report = generate_investigation_report(investigation)
+        # Fallback report is returned instead of raising
+        assert isinstance(report, InvestigationReport)
+        assert report.title == "Where can mine lithium in Zimbabwe"
+        assert len(report.key_findings) > 0  # Fallback constructs findings from raw data
+        print("✓ Bad JSON triggers fallback chain — valid report returned")
+        print(f"  Fallback findings: {len(report.key_findings)}")
+        print(f"  Fallback entities: {len(report.important_entities)}")
     finally:
         rg.get_client = original_get_client
 
-    # Test empty report
+    # Test empty report — fallback should also handle this
     rg.get_client = lambda: EmptyReportLLMClient()
     try:
-        try:
-            generate_investigation_report(investigation)
-            assert False, "Should have raised RuntimeError"
-        except RuntimeError as e:
-            print(f"✓ Empty report correctly rejected: {str(e)[:100]}")
+        report = generate_investigation_report(investigation)
+        assert isinstance(report, InvestigationReport)
+        assert report.title == "Where can mine lithium in Zimbabwe"
+        print("✓ Empty report triggers fallback — valid report returned")
     finally:
         rg.get_client = original_get_client
 

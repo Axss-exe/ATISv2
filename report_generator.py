@@ -235,7 +235,7 @@ def _is_json_truncated(raw: str) -> bool:
     if not raw:
         return True
     # Check for common truncation signatures
-    if raw.endswith("...") or raw.endswith("\"') or raw.endswith('"'):
+    if raw.endswith("...") or raw.endswith("\\") or raw.endswith('"'):
         return True
     # Check if braces are balanced
     open_braces = raw.count("{") - raw.count("}")
