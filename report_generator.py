@@ -408,6 +408,10 @@ def _construct_fallback_report(
         })
 
     report_data = dict(deterministic_fields)
+    # Ensure original_question is never empty in fallback
+    if not report_data.get("original_question"):
+        report_data["original_question"] = report_data.get("title", "Investigation Report")
+
     report_data.update({
         "executive_summary": (
             f"This report was generated as a fallback due to LLM generation failure. "
@@ -416,7 +420,7 @@ def _construct_fallback_report(
             f"Error: {error if error else 'Unknown'}"
         ),
         "implications": "Unable to synthesize implications due to generation failure.",
-        "investigation_narrative": f"Investigation comprised {len(queries)} queries exploring: {deterministic_fields.get('original_question', '')}",
+        "investigation_narrative": f"Investigation comprised {len(queries)} queries exploring: {report_data.get('original_question', '')}",
         "confidence_and_limitations": (
             f"Low confidence — this is a fallback report. "
             f"Original error: {error if error else 'None'}. "
@@ -443,9 +447,12 @@ def _extract_deterministic_fields(normalized: Dict[str, Any]) -> Dict[str, Any]:
     entities = normalized.get("entities", [])
     sources = normalized.get("sources", [])
 
+    title = normalized.get("title", "Investigation Report") or "Investigation Report"
+    original_question = normalized.get("original_question", "") or title
+
     return {
-        "title": normalized.get("title", "Investigation Report"),
-        "original_question": normalized.get("original_question", ""),
+        "title": title,
+        "original_question": original_question,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "based_on_queries": len(queries),
         "evidence_sources_count": len(sources),
@@ -486,6 +493,10 @@ def _normalize_investigation(inv: Dict[str, Any]) -> Dict[str, Any]:
     }
     if not normalized["title"] and normalized["original_question"]:
         normalized["title"] = _generate_title(normalized["original_question"])
+    # Derive original_question if missing (frontend may only send title)
+    if not normalized["original_question"] and normalized["title"]:
+        normalized["original_question"] = normalized["title"]
+
     return normalized
 
 
