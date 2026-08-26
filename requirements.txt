@@ -3,4 +3,4 @@ uvicorn[standard]
 pydantic
 pyyaml
 python-dotenv
-mistralai>=1.0.0
+mistralai==1.2.5

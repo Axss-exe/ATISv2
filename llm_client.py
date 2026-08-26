@@ -876,6 +876,11 @@ class LLMClient:
                 )
                 return content
 
+            except LLMConfigError:
+                # Configuration errors (missing SDK, invalid model, etc.) are NEVER retryable.
+                # Re-raise immediately without wrapping in LLMProviderError.
+                raise
+
             except Exception as exc:
                 elapsed = time.time() - start_time
                 normalized = self.adapter._normalize_error(exc, payload)
