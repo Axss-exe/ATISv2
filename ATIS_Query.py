@@ -243,17 +243,16 @@ Output ONLY raw JSON. No markdown fences. No commentary outside JSON.
 # =============================================================================
 class ATISIntent:
     def __init__(self, raw_json: dict):
-        self.intent_type: str = raw_json.get("intent_type", "OVERVIEW") or "OVERVIEW"
-        # Sanitize: filter out None/empty values from LLM JSON arrays
-        self.target_entities: List[str] = [str(e).strip() for e in raw_json.get("target_entities", []) if e]
-        self.target_entity_types: List[str] = [str(t).strip() for t in raw_json.get("target_entity_types", []) if t]
-        self.target_countries: List[str] = [str(c).strip().lower() for c in raw_json.get("target_countries", []) if c]
-        self.target_sectors: List[str] = [str(s).strip().lower() for s in raw_json.get("target_sectors", []) if s]
-        self.target_attributes: Dict[str, str] = {str(k): str(v) for k, v in raw_json.get("target_attributes", {}).items() if v is not None}
+        self.intent_type: str = raw_json.get("intent_type", "OVERVIEW")
+        self.target_entities: List[str] = raw_json.get("target_entities", [])
+        self.target_entity_types: List[str] = raw_json.get("target_entity_types", [])
+        self.target_countries: List[str] = [c.lower() for c in raw_json.get("target_countries", [])]
+        self.target_sectors: List[str] = [s.lower() for s in raw_json.get("target_sectors", [])]
+        self.target_attributes: Dict[str, str] = raw_json.get("target_attributes", {})
         self.relationship_type: str | None = raw_json.get("relationship_type")
-        self.output_format: str = raw_json.get("output_format", "structured_table") or "structured_table"
-        self.max_results_hint: int = raw_json.get("max_results_hint", 20) or 20
-        self.perspective_country: str = raw_json.get("perspective_country", "") or ""
+        self.output_format: str = raw_json.get("output_format", "structured_table")
+        self.max_results_hint: int = raw_json.get("max_results_hint", 20)
+        self.perspective_country: str = raw_json.get("perspective_country", "")
 
     def __repr__(self) -> str:
         return f"ATISIntent({self.intent_type}, entities={self.target_entities}, types={self.target_entity_types})"
@@ -700,7 +699,7 @@ class LLMQueryEngine:
                     score += 2.0
 
             for attr_key, attr_val in intent.target_attributes.items():
-                if attr_val and attr_val.lower() in content:
+                if attr_val.lower() in content:
                     score += 3.0
 
             if intent.intent_type == "OVERVIEW":
@@ -951,11 +950,7 @@ class LLMQueryEngine:
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\s*```$", "", cleaned)
 
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            data = json.loads(match.group(0)) if match else {}
+        data = self._safe_json_loads(cleaned, "grounded_synthesis")
 
         # Ensure all sections are lists
         for section in ["structured_intelligence", "findings", "opportunities", "risks", "key_entities"]:
@@ -1012,6 +1007,66 @@ class LLMQueryEngine:
             "source_nodes": [{"id": n.uid, "type": n.entity_type} for n in source_nodes],
             "perspective_nodes": [{"id": n.uid, "type": n.entity_type} for n in perspective_nodes],
             "cross_border_bridges": cross_border_bridges,
+        }
+
+    def _safe_json_loads(self, raw_text: str, stage_name: str) -> Dict[str, Any]:
+        """
+        Safely parse LLM JSON with multiple recovery strategies.
+        Fixes trailing commas, unquoted keys, and extracts JSON from markdown.
+        """
+        cleaned = raw_text.strip()
+
+        # Strip markdown code fences
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # Strategy 1: Direct parse
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.warning("Direct JSON parse failed in %s: %s", stage_name, e)
+
+        # Strategy 2: Greedy regex extraction (outermost braces)
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError as e:
+                logger.warning("Regex JSON recovery failed in %s: %s", stage_name, e)
+
+        # Strategy 3: Fix trailing commas (most common LLM error)
+        heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
+        try:
+            return json.loads(heuristic)
+        except json.JSONDecodeError as e:
+            logger.warning("Trailing comma fix failed in %s: %s", stage_name, e)
+
+        # Strategy 4: Fix double commas
+        heuristic2 = re.sub(r",+\s*", ", ", heuristic)
+        try:
+            return json.loads(heuristic2)
+        except json.JSONDecodeError as e:
+            logger.warning("Double comma fix failed in %s: %s", stage_name, e)
+
+        # Strategy 5: Extract first valid JSON object (non-greedy)
+        match = re.search(r"\{[\s\S]*?\}", cleaned)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError as e:
+                logger.warning("Non-greedy extraction failed in %s: %s", stage_name, e)
+
+        # All strategies exhausted — log and return minimal valid structure
+        logger.error("All JSON recovery strategies exhausted for %s.", stage_name)
+        logger.error("Raw excerpt (first 1000 chars):\n%s", raw_text[:1000])
+        return {
+            "executive_summary": f"[JSON parse error in {stage_name}. Raw response could not be parsed.]",
+            "structured_intelligence": [],
+            "findings": [],
+            "opportunities": [],
+            "risks": [],
+            "key_entities": [],
         }
 
     def _generate_empty_response(self, question: str, intent: ATISIntent,

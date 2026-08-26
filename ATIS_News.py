@@ -426,8 +426,17 @@ class ObsidianVaultManager:
         canonical = self._canonicalize(entity_name)
         actual_name = self.file_map.get(canonical)
         if actual_name:
-            path = self.vault_dir / f"{actual_name}.md"
-            return path.read_text(encoding="utf-8")
+            # Use stored relative path to handle nested subdirectories
+            meta = self.node_metadata.get(canonical, {})
+            rel_path = meta.get("path", f"{actual_name}.md")
+            path = self.vault_dir / rel_path
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+            # Fallback: search by rglob if stored path is stale
+            for found in self.vault_dir.rglob(f"{actual_name}.md"):
+                if found.exists():
+                    return found.read_text(encoding="utf-8")
+            logger.warning("Entity file not found: %s (looked at %s and via rglob)", actual_name, path)
         return ""
 
     def write_entity(self, entity_name: str, content: str) -> None:
@@ -616,8 +625,19 @@ class ObsidianVaultManager:
 
             actual_stem = self.file_map[canonical_stem]
             meta = self.node_metadata.get(canonical_stem, {})
-            front_matter = ""
             summary = meta.get("summary", "")
+
+            # Verify file exists before including (handles stale index entries)
+            rel_path = meta.get("path", f"{actual_stem}.md")
+            full_path = self.vault_dir / rel_path
+            if not full_path.exists():
+                # Try rglob fallback
+                found = list(self.vault_dir.rglob(f"{actual_stem}.md"))
+                if not found:
+                    logger.debug("Skipping stale index entry: %s", actual_stem)
+                    continue
+                # Update stored path
+                meta["path"] = str(found[0].relative_to(self.vault_dir))
 
             metadata_str = f"- **{actual_stem}**"
             if meta.get("country"):
@@ -1126,9 +1146,8 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         raise
 
     # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
+    knowledge_state = KnowledgeState.compute(vault_path=vault_manager.vault_dir)
     knowledge_state.compute()
-    knowledge_state_hash = knowledge_state.knowledge_state_hash
 
     # Stage 1
     try:
