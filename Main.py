@@ -4,15 +4,14 @@ ATIS Intelligence API — Render Web Service Entry Point
 
 Features:
   - CORS configured for Vercel frontend
-  - Vault entity listing with recursive subfolder discovery & full profile content
-  - SINGLE ENTITY LOOKUP with slug-based IDs, backlink resolution & related vault traversal
-  - 60-second hard timeout on all LLM pipelines
+  60-second hard timeout on all LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Emergency kill endpoint
   - Perspective-First Deterministic Architecture v2.2
   - Analysis fingerprinting and knowledge-state-aware caching
   - Investigation / Query String backend layer
   - INVESTIGATION REPORT GENERATION (payload-based, no local persistence)
+    with strict Pydantic schema validation
 """
 
 from __future__ import annotations
@@ -52,12 +51,15 @@ from investigation_manager import (
     add_query_to_investigation,
     get_investigation,
     list_investigations,
-    generate_investigation_report,
+    generate_investigation_report as generate_file_based_report,
     INVESTIGATIONS_DIR,
 )
 
-# NEW: Payload-based report generation (no local persistence)
-from report_generator import generate_investigation_report as generate_report_from_payload
+# Payload-based report generation with strict Pydantic validation
+from report_generator import (
+    generate_investigation_report as generate_report_from_payload,
+    InvestigationReport,
+)
 
 # =============================================================================
 # Logging
@@ -163,7 +165,7 @@ class AddQueryRequest(BaseModel):
     question: str
     parent_query_id: str | None = None
 
-# NEW: Payload-based report generation request model
+# Payload-based report generation request model
 class GenerateReportRequest(BaseModel):
     investigation: dict
 
@@ -808,7 +810,7 @@ async def generate_report_endpoint(investigation_id: str):
     try:
         start = time.time()
         report = await _run_with_timeout(
-            generate_investigation_report,
+            generate_file_based_report,
             investigation_id,
             timeout=60.0,
         )
@@ -837,36 +839,43 @@ async def generate_report_endpoint(investigation_id: str):
 
 # =============================================================================
 # NEW: Payload-based report generation endpoint (no local persistence)
+# Returns the strict InvestigationReport schema directly — NO wrapper.
 # =============================================================================
 
-@app.post("/api/investigation/report")
+@app.post("/api/investigation/report", response_model=InvestigationReport)
 async def generate_report_from_payload_endpoint(request: GenerateReportRequest):
     """
-    Generate a Knowledge Report from a complete Investigation payload.
+    Generate a validated Investigation Report from a complete Investigation payload.
 
     This endpoint does NOT read from local persistence.
     The frontend sends the complete investigation state.
+
+    Returns the InvestigationReport object directly (no wrapper).
+    All fields are validated against the canonical schema before returning HTTP 200.
     """
     if not _acquire_pipeline_lock():
-        return {
-            "status": "busy",
-            "detail": "Another pipeline is running. Please wait and retry."
-        }
+        raise HTTPException(
+            status_code=503,
+            detail="Another pipeline is running. Please wait and retry."
+        )
 
     try:
         start = time.time()
-        report = await _run_with_timeout(
+        report: InvestigationReport = await _run_with_timeout(
             generate_report_from_payload,
             request.investigation,
             timeout=120.0,
         )
         elapsed = time.time() - start
-        logger.info("Report generated from payload in %.1fs", elapsed)
-        return {
-            "status": "success",
-            "elapsed_seconds": round(elapsed, 1),
-            "report": report,
-        }
+        logger.info(
+            "Report generated from payload in %.1fs | findings=%d entities=%d relationships=%d",
+            elapsed,
+            len(report.key_findings),
+            len(report.important_entities),
+            len(report.important_relationships),
+        )
+        # FastAPI automatically serializes the Pydantic model to JSON
+        return report
     except ValueError as exc:
         logger.warning("Invalid report payload: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
