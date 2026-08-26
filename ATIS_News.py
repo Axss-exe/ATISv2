@@ -1126,8 +1126,9 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         raise
 
     # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState.compute(vault_path=vault_manager.vault_dir)
+    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
     knowledge_state.compute()
+    knowledge_state_hash = knowledge_state.knowledge_state_hash
 
     # Stage 1
     try:

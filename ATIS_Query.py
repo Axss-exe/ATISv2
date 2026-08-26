@@ -243,16 +243,17 @@ Output ONLY raw JSON. No markdown fences. No commentary outside JSON.
 # =============================================================================
 class ATISIntent:
     def __init__(self, raw_json: dict):
-        self.intent_type: str = raw_json.get("intent_type", "OVERVIEW")
-        self.target_entities: List[str] = raw_json.get("target_entities", [])
-        self.target_entity_types: List[str] = raw_json.get("target_entity_types", [])
-        self.target_countries: List[str] = [c.lower() for c in raw_json.get("target_countries", [])]
-        self.target_sectors: List[str] = [s.lower() for s in raw_json.get("target_sectors", [])]
-        self.target_attributes: Dict[str, str] = raw_json.get("target_attributes", {})
+        self.intent_type: str = raw_json.get("intent_type", "OVERVIEW") or "OVERVIEW"
+        # Sanitize: filter out None/empty values from LLM JSON arrays
+        self.target_entities: List[str] = [str(e).strip() for e in raw_json.get("target_entities", []) if e]
+        self.target_entity_types: List[str] = [str(t).strip() for t in raw_json.get("target_entity_types", []) if t]
+        self.target_countries: List[str] = [str(c).strip().lower() for c in raw_json.get("target_countries", []) if c]
+        self.target_sectors: List[str] = [str(s).strip().lower() for s in raw_json.get("target_sectors", []) if s]
+        self.target_attributes: Dict[str, str] = {str(k): str(v) for k, v in raw_json.get("target_attributes", {}).items() if v is not None}
         self.relationship_type: str | None = raw_json.get("relationship_type")
-        self.output_format: str = raw_json.get("output_format", "structured_table")
-        self.max_results_hint: int = raw_json.get("max_results_hint", 20)
-        self.perspective_country: str = raw_json.get("perspective_country", "")
+        self.output_format: str = raw_json.get("output_format", "structured_table") or "structured_table"
+        self.max_results_hint: int = raw_json.get("max_results_hint", 20) or 20
+        self.perspective_country: str = raw_json.get("perspective_country", "") or ""
 
     def __repr__(self) -> str:
         return f"ATISIntent({self.intent_type}, entities={self.target_entities}, types={self.target_entity_types})"
@@ -699,7 +700,7 @@ class LLMQueryEngine:
                     score += 2.0
 
             for attr_key, attr_val in intent.target_attributes.items():
-                if attr_val.lower() in content:
+                if attr_val and attr_val.lower() in content:
                     score += 3.0
 
             if intent.intent_type == "OVERVIEW":
