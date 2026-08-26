@@ -630,7 +630,7 @@ async def query_endpoint(request: QueryRequest):
     )
 
     # Compute knowledge state for cache key
-    knowledge_state = KnowledgeState(vault_root=_vault_path)
+    knowledge_state = KnowledgeState(vault_path=_vault_path)
     knowledge_state.compute()
 
     cache_key = _query_cache_key(request.question, perspective, knowledge_state.knowledge_state_hash)
