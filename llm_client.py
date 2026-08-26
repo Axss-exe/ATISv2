@@ -306,8 +306,17 @@ class LLMConfig:
     retry_max_delay: float = 30.0
 
     @classmethod
-    def from_env(cls) -> "LLMConfig":
-        """Build config from environment variables."""
+    def from_env(cls, _dotenv_loaded: bool = False) -> "LLMConfig":
+        """Build config from environment variables, with .env fallback."""
+        # Attempt to load .env file if python-dotenv is available
+        # This helps in containerized or development environments
+        if not _dotenv_loaded:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(override=False)
+            except ImportError:
+                pass  # python-dotenv not installed — proceed with os.environ
+
         provider_str = os.getenv("LLM_PROVIDER", "mistral").lower()
         try:
             provider = LLMProvider(provider_str)
@@ -320,8 +329,19 @@ class LLMConfig:
         base_url = os.getenv("LLM_BASE_URL") or None
 
         if not api_key:
+            # Build a detailed diagnostic message
+            checked = []
+            if "LLM_API_KEY" in os.environ:
+                checked.append("LLM_API_KEY=<<empty>>")
+            else:
+                checked.append("LLM_API_KEY=<not set>")
+            if "MISTRAL_API_KEY" in os.environ:
+                checked.append("MISTRAL_API_KEY=<<empty>>")
+            else:
+                checked.append("MISTRAL_API_KEY=<not set>")
             raise LLMConfigError(
-                "No API key found. Set LLM_API_KEY or MISTRAL_API_KEY."
+                f"No API key found. Checked: {', '.join(checked)}. "
+                f"Set LLM_API_KEY or MISTRAL_API_KEY environment variable."
             )
 
         return cls(
@@ -464,7 +484,13 @@ class MistralAdapter(ProviderAdapter):
     """Adapter for Mistral AI (labs-leanstral-1-5, mistral-small-latest, etc.)."""
 
     def _init_client(self) -> Any:
-        from mistralai import Mistral
+        try:
+            from mistralai import Mistral
+        except ImportError as e:
+            raise LLMConfigError(
+                "The 'mistralai' Python SDK is not installed. "
+                "Install it with: pip install mistralai"
+            ) from e
         kwargs = {"api_key": self.config.api_key}
         if self.config.base_url:
             kwargs["server_url"] = self.config.base_url
@@ -551,6 +577,10 @@ class MistralAdapter(ProviderAdapter):
         elif status_code and status_code >= 500:
             error_type = "server_error"
             retryable = True
+        elif isinstance(exception, (ImportError, ModuleNotFoundError)):
+            error_type = "sdk_not_installed"
+            retryable = False
+            message = f"SDK not installed: {message}"
         else:
             error_type = "network_or_unknown"
             retryable = True
@@ -575,7 +605,13 @@ class OpenAIAdapter(ProviderAdapter):
     """Adapter for OpenAI-compatible APIs."""
 
     def _init_client(self) -> Any:
-        import openai
+        try:
+            import openai
+        except ImportError as e:
+            raise LLMConfigError(
+                "The 'openai' Python SDK is not installed. "
+                "Install it with: pip install openai"
+            ) from e
         kwargs = {"api_key": self.config.api_key}
         if self.config.base_url:
             kwargs["base_url"] = self.config.base_url
@@ -653,7 +689,13 @@ class CerebrasAdapter(ProviderAdapter):
 
     def _init_client(self) -> Any:
         # Cerebras uses the OpenAI SDK with a different base URL
-        import openai
+        try:
+            import openai
+        except ImportError as e:
+            raise LLMConfigError(
+                "The 'openai' Python SDK is required for Cerebras. "
+                "Install it with: pip install openai"
+            ) from e
         kwargs = {"api_key": self.config.api_key}
         if self.config.base_url:
             kwargs["base_url"] = self.config.base_url
@@ -867,10 +909,21 @@ class LLMClient:
 
     def diagnostics(self) -> Dict[str, Any]:
         """Return client diagnostics."""
+        # Check SDK availability
+        sdk_status = "unknown"
+        try:
+            self.adapter._init_client()
+            sdk_status = "available"
+        except LLMConfigError as e:
+            sdk_status = f"missing: {str(e)}"
+        except Exception as e:
+            sdk_status = f"error: {str(e)}"
+
         return {
             "provider": self.config.provider.value,
             "model": self.config.model,
             "fallback_model": self.config.fallback_model,
+            "sdk_status": sdk_status,
             "capabilities": {
                 "supports_seed": self.adapter.capabilities.supports_seed,
                 "seed_param_name": self.adapter.capabilities.seed_param_name,
@@ -888,10 +941,11 @@ class LLMClient:
         Run a safe diagnostic sequence against the configured provider.
 
         Tests:
-        1. Authentication + minimal generation
-        2. Requested token generation (40 tokens)
-        3. JSON generation (if supported)
-        4. Error normalization
+        1. SDK availability
+        2. Authentication + minimal generation
+        3. Requested token generation (40 tokens)
+        4. JSON generation (if supported)
+        5. Error normalization
 
         Returns a dict with test results.
         """
@@ -901,6 +955,19 @@ class LLMClient:
             "tests": {},
             "overall": "unknown",
         }
+
+        # Test 0: SDK availability
+        try:
+            self.adapter._init_client()
+            results["tests"]["sdk_availability"] = {"status": "PASS"}
+        except LLMConfigError as e:
+            results["tests"]["sdk_availability"] = {"status": "FAIL", "reason": "SDK_NOT_INSTALLED", "detail": str(e)}
+            results["overall"] = "SDK_NOT_INSTALLED"
+            return results
+        except Exception as e:
+            results["tests"]["sdk_availability"] = {"status": "FAIL", "reason": "SDK_ERROR", "detail": str(e)}
+            results["overall"] = "SDK_ERROR"
+            return results
 
         # Test 1: Minimal generation (auth + connectivity)
         try:
@@ -995,8 +1062,22 @@ class LLMClient:
 # Maintain the same import interface as the old client
 # so pipelines do not need to change.
 
-def get_client() -> LLMClient:
-    """Factory function — same signature as legacy client."""
+def get_client(api_key: Optional[str] = None) -> LLMClient:
+    """
+    Factory function — same signature as legacy client, with optional api_key override.
+
+    Args:
+        api_key: Optional explicit API key. If provided, bypasses environment lookup.
+    """
+    if api_key:
+        config = LLMConfig(
+            model=os.getenv("LLM_MODEL", "labs-leanstral-1-5"),
+            fallback_model=os.getenv("LLM_FALLBACK_MODEL") or None,
+            provider=LLMProvider(os.getenv("LLM_PROVIDER", "mistral").lower()),
+            api_key=api_key,
+            base_url=os.getenv("LLM_BASE_URL") or None,
+        )
+        return LLMClient(config)
     return LLMClient()
 
 
