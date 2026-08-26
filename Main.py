@@ -368,7 +368,7 @@ def _resolve_related_entities(node, vault: QueryVaultManager) -> List[Dict[str, 
 @app.get("/health")
 async def health():
     """Health check with detailed system status."""
-    ks = KnowledgeState(vault_root=_vault_path)
+    ks = KnowledgeState(vault_path=_vault_path)
     ks.compute()
     return {
         "status": "ok",
@@ -931,7 +931,7 @@ async def cache_stats():
 @app.get("/knowledge-state")
 async def knowledge_state():
     """Return current vault knowledge state."""
-    ks = KnowledgeState(vault_root=_vault_path)
+    ks = KnowledgeState(vault_path=_vault_path)
     ks.compute()
     return ks.as_dict()
 
@@ -953,7 +953,7 @@ async def startup_event():
     logger.info("ATIS API v2.2.0 starting up...")
     try:
         vault = _get_query_vault()
-        ks = KnowledgeState(vault_root=_vault_path)
+        ks = KnowledgeState(vault_path=_vault_path)
         ks.compute()
         logger.info("Startup complete. Vault ready with %d nodes. Knowledge state: %s",
                     vault.indexed_count, ks.knowledge_state_hash[:16])

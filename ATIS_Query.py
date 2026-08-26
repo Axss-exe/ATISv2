@@ -1064,11 +1064,12 @@ class LLMQueryEngine:
             "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
             "You MUST set opportunity_country to the actual country where the commercial value exists."
         )
+        perspective_registry_text = "\n\n".join(perspective_blocks)
         user_prompt = (
             f"## ANALYTICAL PERSPECTIVE\nPerspective country: {perspective.country}\nPerspective country code: {perspective.country_code}\n"
             "Produce perspective-specific intelligence from the full African vault; do not turn this into a country filter.\n\n"
             f"## PERSPECTIVE ACTOR REGISTRY\n"
-            f"{\n\n.join(perspective_blocks)}\n\n"
+            f"{perspective_registry_text}\n\n"
             f"## VAULT SUMMARY\nTotal: {len(all_nodes)}\n\n{context}\n\n"
             f"## OUTPUT\nProduce dashboard JSON with executive_summary, structured_intelligence, findings, opportunities, risks, key_entities. "
             f"Every row must have source_node. Every finding must have source_nodes. "
@@ -1101,7 +1102,7 @@ class LLMQueryEngine:
         cache_key = hashlib.sha256(cache_payload.encode()).hexdigest()
 
         # Check cache before any LLM work
-        cached_result = self.cache.check(cache_key)
+        cached_result = self.cache.get(cache_key)
         if cached_result is not None:
             logger.info("Cache hit for query key %s", cache_key[:16])
             cached_result["analysis_version"] = ANALYSIS_VERSION
