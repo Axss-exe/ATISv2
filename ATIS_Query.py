@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set

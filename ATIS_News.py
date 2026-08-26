@@ -150,7 +150,7 @@ PROMPT_STAGE_3_FORMATTER: str = (
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-VAULT_DIR: Path = Path(r"C:\Users\tmaki\Documents\ATIS\Data")
+VAULT_DIR: Path = Path(os.getenv(r"C:\Users\tmaki\Documents\ATIS\Data", "./vault"))
 DASHBOARDS_DIR: Path = Path("./dashboards")
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
@@ -917,7 +917,8 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
         raise
 
     # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState.compute(vault_manager)
+    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
+    knowledge_state.compute()
 
     # ------------------------------------------------------------------ #
     # 2. Stage 1 — Entity Extraction
@@ -966,11 +967,11 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
     # Compute analysis fingerprint after stage 1
     analysis_fingerprint = compute_analysis_fingerprint(
         story_id=core_event,
-        perspective=perspective.country,
+        perspective=perspective,
         evidence_ids=[e for e in evidence_ids if e],
         entity_ids=[e for e in entity_ids if e],
         relationship_ids=[r for r in relationship_ids if r],
-        knowledge_state_hash=knowledge_state.hash,
+        knowledge_state_hash=knowledge_state_hash,
     )
     logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
 
@@ -1050,7 +1051,7 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
         "analysis_version": ANALYSIS_VERSION,
         "schema_version": SCHEMA_VERSION,
         "analysis_fingerprint": analysis_fingerprint,
-        "knowledge_state": knowledge_state.to_dict(),
+        "knowledge_state": knowledge_state.as_dict(),
     }
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1125,7 +1126,8 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         raise
 
     # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState.compute(vault_manager)
+    knowledge_state = KnowledgeState.compute(vault_path=vault_manager.vault_dir)
+    knowledge_state.compute()
 
     # Stage 1
     try:
@@ -1157,11 +1159,11 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
     # Compute analysis fingerprint after stage 1
     analysis_fingerprint = compute_analysis_fingerprint(
         story_id=core_event,
-        perspective=perspective.country,
+        perspective=perspective,
         evidence_ids=[e for e in evidence_ids if e],
         entity_ids=[e for e in entity_ids if e],
         relationship_ids=[r for r in relationship_ids if r],
-        knowledge_state_hash=knowledge_state.hash,
+        knowledge_state_hash=knowledge_state_hash,
     )
     logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
 
@@ -1236,7 +1238,7 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         "analysis_version": ANALYSIS_VERSION,
         "schema_version": SCHEMA_VERSION,
         "analysis_fingerprint": analysis_fingerprint,
-        "knowledge_state": knowledge_state.to_dict(),
+        "knowledge_state": knowledge_state.as_dict(),
     }
 
     # Persist to disk (optional, ephemeral on Render)

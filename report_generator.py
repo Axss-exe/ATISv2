@@ -70,8 +70,7 @@ def generate_investigation_report(investigation: Dict[str, Any]) -> Dict[str, An
                 {"role": "user", "content": synthesis_context},
             ],
             temperature=0.0,
-            max_tokens=8192,
-            seed=42,
+            max_tokens=4096,
         )
     except LLMRequestError as exc:
         logger.error("LLM report generation failed: %s", exc)
