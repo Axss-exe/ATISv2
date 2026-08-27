@@ -150,7 +150,7 @@ PROMPT_STAGE_3_FORMATTER: str = (
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-VAULT_DIR: Path = Path(os.getenv("ATIS_VAULT_DIR", "./vault"))
+VAULT_DIR: Path = Path(os.getenv(r"C:\Users\tmaki\Documents\ATIS\Data", "./vault"))
 DASHBOARDS_DIR: Path = Path("./dashboards")
 MAX_TOKENS_PER_REQUEST: int = 60_000
 RESPONSE_RESERVE: int = 8_000
@@ -258,121 +258,51 @@ class TokenBudget:
 
 
 # --------------------------------------------------------------------------- #
-# Safe JSON Loader — Brace-Balancing Engine
+# Safe JSON Loader
 # --------------------------------------------------------------------------- #
-def _strip_markdown_fences(text: str) -> str:
-    """Remove markdown code fences and surrounding whitespace."""
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^~~~(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n?```\s*$', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n?~~~\s*$', '', text, flags=re.IGNORECASE)
-    return text.strip()
-
-
-def _extract_balanced_json(text: str) -> str:
-    """
-    Extract the largest balanced JSON object or array from raw text.
-    Uses character-level brace/bracket tracking with full string/escape awareness.
-    This avoids the greedy-regex bug that grabs from first '{' to last '}'.
-    """
-    in_string = False
-    escape_next = False
-    brace_stack: List[str] = []
-    start_idx = -1
-    candidates: List[str] = []
-
-    for i, char in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-
-        if char == '\\' and in_string:
-            escape_next = True
-            continue
-
-        if char == '"':
-            in_string = not in_string
-            continue
-
-        if in_string:
-            continue
-
-        if char in '{[':
-            if not brace_stack:
-                start_idx = i
-            brace_stack.append(char)
-        elif char in '}]':
-            if not brace_stack:
-                continue
-            opener = brace_stack.pop()
-            if (opener == '{' and char != '}') or (opener == '[' and char != ']'):
-                brace_stack = []
-                start_idx = -1
-                continue
-            if not brace_stack and start_idx != -1:
-                candidates.append(text[start_idx : i + 1])
-
-    if not candidates:
-        return ""
-    return max(candidates, key=len)
-
-
-def _fix_common_json_errors(text: str) -> str:
-    """Apply safe heuristics to fix common LLM JSON syntax errors."""
-    text = re.sub(r',(\s*[\}\]])', r'\1', text)
-    text = re.sub(r',+(\s*)', r',', text)
-    return text
-
-
 def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
     """
-    Safely parse a JSON string with deterministic, layered fallback strategies.
-    Strips markdown fences, extracts balanced structures, fixes trailing commas,
-    and raises a clear RuntimeError on absolute failure.
+    Safely parse a JSON string with multiple fallback strategies.
+    Strips markdown fences, attempts regex recovery, and raises a clear
+    RuntimeError on absolute failure.
     """
-    if not raw_text or not raw_text.strip():
-        raise RuntimeError(f"Empty response received from {stage_name}")
+    cleaned = raw_text.strip()
 
-    original = raw_text.strip()
-    logger.debug("safe_json_loads called for %s (len=%d)", stage_name, len(original))
+    # Strip markdown code fences if present
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    cleaned = _strip_markdown_fences(original)
+    # Attempt direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as direct_err:
-        logger.warning("Direct JSON parse failed in %s: %s", stage_name, direct_err)
+        logger.warning(
+            "Direct JSON parse failed in %s: %s", stage_name, direct_err
+        )
 
-    balanced = _extract_balanced_json(cleaned)
-    if balanced:
-        try:
-            return json.loads(balanced)
-        except json.JSONDecodeError as bal_err:
-            logger.warning("Balanced JSON extraction failed in %s: %s", stage_name, bal_err)
-
-        fixed = _fix_common_json_errors(balanced)
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError as fix_err:
-            logger.warning("Fixed balanced JSON failed in %s: %s", stage_name, fix_err)
-
-    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', cleaned, re.DOTALL)
+    # Fallback: greedy regex search for the outermost JSON object
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError as regex_err:
-            logger.warning("Non-greedy regex JSON recovery failed in %s: %s", stage_name, regex_err)
+            logger.warning(
+                "Regex JSON recovery failed in %s: %s", stage_name, regex_err
+            )
 
-    heuristic = re.sub(r',(\s*[\}\]])', r'\1', cleaned)
+    # Final fallback: attempt to fix trailing commas or common syntax issues
+    heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
     try:
         return json.loads(heuristic)
     except json.JSONDecodeError as heuristic_err:
-        logger.error("All JSON parsing strategies exhausted for %s.", stage_name)
-        logger.error("Raw response excerpt (first 1000 chars):\n%s", original[:1000])
+        logger.error(
+            "All JSON parsing strategies exhausted for %s.", stage_name
+        )
+        logger.error("Raw response excerpt (first 800 chars):\n%s", raw_text[:800])
         raise RuntimeError(
-            f"Failed to parse JSON response from {stage_name} after all recovery strategies."
+            f"Failed to parse JSON response from {stage_name}."
         ) from heuristic_err
-
 
 # --------------------------------------------------------------------------- #
 # Obsidian Vault Manager (Graph & Inbound Backlink Engine)
@@ -847,7 +777,7 @@ class LLMPipeline:
             return True
         return False
 
-    def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
+    def _call_api(self, system_prompt: str, user_prompt: str, max_tokens=None):
         if max_tokens is None:
             max_tokens = 4096
         cap = self._model_output_cap()
@@ -857,13 +787,7 @@ class LLMPipeline:
             {"role": "user", "content": user_prompt},
         ], temperature=0.0, seed=42, max_tokens=max_tokens)
 
-    def _call_api_with_retry(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        max_tokens: int = 4096,
-        stage_name: str = "LLM call",
-    ) -> str:
+    def _call_api_with_retry(self, system_prompt: str, user_prompt: str, max_tokens: int, stage_name: str):
         cap = self._model_output_cap()
         max_tokens = min(max_tokens, cap)
         raw = self._call_api(system_prompt, user_prompt, max_tokens=max_tokens)
@@ -917,12 +841,8 @@ class LLMPipeline:
         return data
 
     # -- Stage 2: Constraint Solving ---------------------------------------- #
-    def stage_2_solve(
-        self,
-        article_text: str,
-        graph_context: str,
-        perspective: Any,
-    ) -> str:
+    def stage_2_solve(self, article_text: str, graph_context: str,
+                      perspective: PerspectiveContext) -> str:
         """
         Stage 2 — Send the [NEW EVENT] + [GRAPH CONTEXT] to the
         Equilibrium and Constraint Engine. Returns raw markdown analysis.
@@ -955,12 +875,8 @@ class LLMPipeline:
         return raw_analysis
 
     # -- Stage 3: Dashboard Formatting -------------------------------------- #
-    def stage_3_format(
-        self,
-        stage_2_analysis: str,
-        graph_context: str,
-        perspective: Any,
-    ) -> Dict[str, Any]:
+    def stage_3_format(self, stage_2_analysis: str, graph_context: str,
+                       perspective: PerspectiveContext) -> Dict[str, Any]:
         """
         Stage 3 — Send the Stage-2 markdown analysis + graph_context to the strict
         data-serialisation module. Returns a structured dashboard JSON dict.
@@ -986,7 +902,8 @@ class LLMPipeline:
                 "Stage-2 analysis truncated to fit Stage-3 token budget."
             )
 
-        user_prompt = (
+        raw_response = self._call_api_with_retry(
+            PROMPT_STAGE_3_FORMATTER,
             f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n"
             "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
             "You MUST select perspective_capability from the capabilities listed for that actor. "
@@ -995,14 +912,7 @@ class LLMPipeline:
             "Do NOT default opportunity_country to the perspective country. "
             "Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
             f"## GRAPH CONTEXT\n{graph_context}\n\n"
-            + stage_2_analysis
-        )
-
-        raw_response = self._call_api_with_retry(
-            PROMPT_STAGE_3_FORMATTER,
-            user_prompt,
-            max_tokens=4096,
-            stage_name="Stage 3",
+            + stage_2_analysis,
         )
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
         logger.info("Stage 3 complete. Dashboard JSON generated.")
@@ -1011,10 +921,7 @@ class LLMPipeline:
 # --------------------------------------------------------------------------- #
 # Main Orchestration Entry Point
 # --------------------------------------------------------------------------- #
-def process_article_pipeline(
-    article_path: str,
-    perspective: Any | None = None,
-) -> Dict[str, Any]:
+def process_article_pipeline(article_path: str, perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Primary orchestration function for the ATIS pipeline.
 
@@ -1177,8 +1084,10 @@ def process_article_pipeline(
                 source_country=validated.get("source_country", ""),
                 event_country=validated.get("event_country", ""),
                 opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
                 perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
             )
             validated["opportunity_id"] = stable_id
             validated["stable_opportunity_id"] = stable_id
@@ -1251,10 +1160,7 @@ def main() -> None:
 # =============================================================================
 # Web entry point
 # =============================================================================
-def run_news_pipeline(
-    article_text: str,
-    perspective: Any | None = None,
-) -> Dict[str, Any]:
+def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None = None) -> Dict[str, Any]:
     """
     Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
 
@@ -1368,8 +1274,10 @@ def run_news_pipeline(
                 source_country=validated.get("source_country", ""),
                 event_country=validated.get("event_country", ""),
                 opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
                 perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
             )
             validated["opportunity_id"] = stable_id
             validated["stable_opportunity_id"] = stable_id
