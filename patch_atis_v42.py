@@ -759,48 +759,12 @@ class LLMPipeline:
         self.cache = AnalysisCache()
 
     # -- Low-level API call with retries ------------------------------------ #
-        def _model_output_cap(self) -> int:
-        return self.client.adapter.capabilities.max_output_tokens
-
-    def _is_truncated(self, raw: str) -> bool:
-        text = raw.strip()
-        if not text:
-            return False
-        if text.endswith("..."):
-            return True
-        if text[-1] not in {"}", "]", "\"", ">", "'"}:
-            if not (text[-1].isdigit() or text[-1].lower() in {"e", "l"}):
-                return True
-        open_braces = text.count("{") - text.count("}")
-        open_brackets = text.count("[") - text.count("]")
-        if open_braces > 0 or open_brackets > 0:
-            return True
-        return False
-
-    def _call_api(self, system_prompt: str, user_prompt: str, max_tokens=None):
-        if max_tokens is None:
-            max_tokens = 4096
-        cap = self._model_output_cap()
-        max_tokens = min(max_tokens, cap)
+    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+        # DETERMINISM: force temperature=0.0 and seed=42
         return self.client.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ], temperature=0.0, seed=42, max_tokens=max_tokens)
-
-    def _call_api_with_retry(self, system_prompt: str, user_prompt: str, max_tokens: int, stage_name: str):
-        cap = self._model_output_cap()
-        max_tokens = min(max_tokens, cap)
-        raw = self._call_api(system_prompt, user_prompt, max_tokens=max_tokens)
-        if self._is_truncated(raw):
-            retry_tokens = min(max_tokens * 2, cap)
-            if retry_tokens > max_tokens:
-                logger.warning("%s truncated (len=%d). Retrying with %d tokens.", stage_name, len(raw), retry_tokens)
-                raw = self._call_api(system_prompt, user_prompt, max_tokens=retry_tokens)
-                if self._is_truncated(raw):
-                    logger.error("%s still truncated after retry.", stage_name)
-            else:
-                logger.error("%s truncated at model cap (%d).", stage_name, cap)
-        return raw
+        ], temperature=0.0, seed=42)
 
     # -- Stage 1: Entity Extraction ----------------------------------------- #
     def stage_1_extract(self, article_text: str) -> Dict[str, Any]:
@@ -902,7 +866,7 @@ class LLMPipeline:
                 "Stage-2 analysis truncated to fit Stage-3 token budget."
             )
 
-        raw_response = self._call_api_with_retry(
+        raw_response = self._call_api(
             PROMPT_STAGE_3_FORMATTER,
             f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n"
             "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
@@ -975,7 +939,6 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
     # Compute knowledge state for determinism
     knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
     knowledge_state.compute()
-    knowledge_state_hash = knowledge_state.knowledge_state_hash
 
     # ------------------------------------------------------------------ #
     # 2. Stage 1 — Entity Extraction
