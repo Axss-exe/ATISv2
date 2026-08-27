@@ -341,7 +341,7 @@ class ObsidianVaultManager:
         Removes spaces, underscores, hyphens, and casing variations to eliminate matching bugs.
         e.g., "Lithium carbonate", "lithium_carbonate", and "LITHIUM-CARBONATE" all become "lithiumcarbonate"
         """
-        return re.sub(r"[^a-zA-Z0-9]", "", name).lower()
+        return re.sub(r"[^a-zA-Z0-9]", "", str(name or "")).lower()
 
     # -- Institutional Memory Vault Indexer ---------------------------------- #
     def _index_vault(self) -> None:
@@ -1146,8 +1146,9 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         raise
 
     # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState.compute(vault_path=vault_manager.vault_dir)
+    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
     knowledge_state.compute()
+    knowledge_state_hash = knowledge_state.knowledge_state_hash
 
     # Stage 1
     try:

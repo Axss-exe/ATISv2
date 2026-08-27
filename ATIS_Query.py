@@ -664,11 +664,18 @@ class LLMQueryEngine:
         all_nodes = sorted(vault_mgr.nodes.values(), key=lambda n: n.uid)
         scored: List[Tuple[float, VaultNode]] = []
 
+        # DEFENSIVE: sanitize intent lists to guarantee no None values
+        safe_entity_types = [str(t).strip().lower() for t in intent.target_entity_types if t is not None]
+        safe_countries = [str(c).strip().lower() for c in intent.target_countries if c is not None]
+        safe_sectors = [str(s).strip().lower() for s in intent.target_sectors if s is not None]
+        safe_entities = [str(e).strip().lower() for e in intent.target_entities if e is not None]
+        safe_attrs = {str(k).strip(): str(v).strip() for k, v in intent.target_attributes.items() if v is not None}
+
         for node in all_nodes:
             score = 0.0
             node_type = (node.entity_type or "").lower()
-            for target_type in intent.target_entity_types:
-                tt = target_type.lower().replace("_", "")
+            for target_type in safe_entity_types:
+                tt = target_type.replace("_", "")
                 nt = node_type.replace("_", "")
                 if tt == nt or tt in nt or nt in tt:
                     score += 8.0
@@ -677,28 +684,27 @@ class LLMQueryEngine:
             path_text = str(node.absolute_path).lower()
 
             # Score source-event country relevance (NOT perspective country)
-            for tc in intent.target_countries:
-                if tc.lower() in node_country:
+            for tc in safe_countries:
+                if tc in node_country:
                     score += 6.0
 
             # Do NOT boost perspective country here — perspective nodes are retrieved separately
             node_sector = (node.sector or "").lower()
-            for ts in intent.target_sectors:
-                if ts.lower() in node_sector:
+            for ts in safe_sectors:
+                if ts in node_sector:
                     score += 5.0
 
             node_name = node.uid.lower().replace("_", " ").replace("-", " ")
             content = f"{node.summary} {node.body_preview}".lower()
-            for entity in intent.target_entities:
-                ec = entity.lower()
-                if ec in node_name:
+            for entity in safe_entities:
+                if entity in node_name:
                     score += 10.0
-                elif any(w in node_name for w in ec.split()):
+                elif any(w in node_name for w in entity.split()):
                     score += 4.0
-                if ec in content:
+                if entity in content:
                     score += 2.0
 
-            for attr_key, attr_val in intent.target_attributes.items():
+            for attr_key, attr_val in safe_attrs.items():
                 if attr_val.lower() in content:
                     score += 3.0
 
