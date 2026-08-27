@@ -1113,8 +1113,23 @@ class LLMQueryEngine:
             validated = validate_opportunity(
                 item, perspective, all_node_ids, perspective_node_ids, cross_border_bridges
             )
-            # Assign stable opportunity ID via compute_opportunity_identity
-            validated["opportunity_id"] = compute_opportunity_identity(validated)
+            # Assign a deterministic stable opportunity ID using the canonical
+            # identity fields required by atis_context.compute_opportunity_identity.
+            # Do NOT pass the whole dict as a positional argument: the identity
+            # function intentionally requires each component explicitly.
+            stable_id = compute_opportunity_identity(
+                title=validated.get("title", ""),
+                perspective_country=validated.get("perspective_country", perspective.country),
+                source_country=validated.get("source_country", ""),
+                event_country=validated.get("event_country", ""),
+                opportunity_country=validated.get("opportunity_country", ""),
+                perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
+            )
+            validated["opportunity_id"] = stable_id
+            validated["stable_opportunity_id"] = stable_id
             validated_opportunities.append(validated)
         data["opportunities"] = validated_opportunities
 
