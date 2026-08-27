@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v4.1 — Perspective-First Grounded Architecture + Determinism
+ATIS_Query.py v4.2 — Perspective-First Grounded Architecture + Determinism
 
 4-STAGE PIPELINE:
   0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
@@ -12,7 +12,7 @@ ATIS_Query.py v4.1 — Perspective-First Grounded Architecture + Determinism
   4. GROUNDED SYNTHESIS:   LLM synthesizes dashboard from ranked nodes ONLY,
      with mandatory perspective actor/capability/pathway evidence (1 call)
 
-DETERMINISM FEATURES (v4.1):
+DETERMINISM FEATURES (v4.2):
   - All LLM calls: temperature=0.0, seed=42
   - All vault iterations: sorted(..., key=lambda n: n.uid)
   - AnalysisCache: disk-based caching (check before LLM, set after generation)
@@ -37,14 +37,15 @@ ANTI-HALLUCINATION:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
 import time
-import hashlib
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set
 from datetime import date, datetime, timezone
@@ -96,6 +97,127 @@ def _sanitize_for_json(data):
     elif isinstance(data, list):
         return [_sanitize_for_json(item) for item in data]
     return data
+
+
+# =============================================================================
+# Safe JSON Loader — Brace-Balancing Engine (Shared with ATIS_News)
+# =============================================================================
+def _strip_markdown_fences(text: str) -> str:
+    """Remove markdown code fences and surrounding whitespace."""
+    text = text.strip()
+    text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^~~~(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\n?```\s*$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\n?~~~\s*$', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _extract_balanced_json(text: str) -> str:
+    """
+    Extract the largest balanced JSON object or array from raw text.
+    Uses character-level brace/bracket tracking with full string/escape awareness.
+    """
+    in_string = False
+    escape_next = False
+    brace_stack: List[str] = []
+    start_idx = -1
+    candidates: List[str] = []
+
+    for i, char in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char in '{[':
+            if not brace_stack:
+                start_idx = i
+            brace_stack.append(char)
+        elif char in '}]':
+            if not brace_stack:
+                continue
+            opener = brace_stack.pop()
+            if (opener == '{' and char != '}') or (opener == '[' and char != ']'):
+                brace_stack = []
+                start_idx = -1
+                continue
+            if not brace_stack and start_idx != -1:
+                candidates.append(text[start_idx : i + 1])
+
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+
+def _fix_common_json_errors(text: str) -> str:
+    """Apply safe heuristics to fix common LLM JSON syntax errors."""
+    text = re.sub(r',(\s*[\}\]])', r'\1', text)
+    text = re.sub(r',+(\s*)', r',', text)
+    return text
+
+
+def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
+    """
+    Safely parse a JSON string with deterministic, layered fallback strategies.
+    Strips markdown fences, extracts balanced structures, fixes trailing commas,
+    and raises a clear RuntimeError on absolute failure.
+    """
+    if not raw_text or not raw_text.strip():
+        raise RuntimeError(f"Empty response received from {stage_name}")
+
+    original = raw_text.strip()
+    logger.debug("safe_json_loads called for %s (len=%d)", stage_name, len(original))
+
+    # Strategy 1: Direct parse after stripping fences
+    cleaned = _strip_markdown_fences(original)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as direct_err:
+        logger.warning("Direct JSON parse failed in %s: %s", stage_name, direct_err)
+
+    # Strategy 2: Extract largest balanced JSON object/array
+    balanced = _extract_balanced_json(cleaned)
+    if balanced:
+        try:
+            return json.loads(balanced)
+        except json.JSONDecodeError as bal_err:
+            logger.warning("Balanced JSON extraction failed in %s: %s", stage_name, bal_err)
+
+        # Strategy 3: Fix common syntax errors on the balanced extract
+        fixed = _fix_common_json_errors(balanced)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError as fix_err:
+            logger.warning("Fixed balanced JSON failed in %s: %s", stage_name, fix_err)
+
+    # Strategy 4: Non-greedy regex fallback
+    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as regex_err:
+            logger.warning("Non-greedy regex JSON recovery failed in %s: %s", stage_name, regex_err)
+
+    # Strategy 5: Trailing-comma fix on full text as last resort
+    heuristic = re.sub(r',(\s*[\}\]])', r'\1', cleaned)
+    try:
+        return json.loads(heuristic)
+    except json.JSONDecodeError as heuristic_err:
+        logger.error("All JSON parsing strategies exhausted for %s.", stage_name)
+        logger.error("Raw response excerpt (first 1000 chars):\n%s", original[:1000])
+        raise RuntimeError(
+            f"Failed to parse JSON response from {stage_name} after all recovery strategies."
+        ) from heuristic_err
 
 
 # =============================================================================
@@ -373,11 +495,6 @@ class ObsidianVaultManager:
                     entity_type = etype
                     break
 
-        # Infer country from path if not in frontmatter
-        if not country:
-            # This will be set during build_index
-            pass
-
         return entity_type, country, sector
 
     def build_index(self) -> None:
@@ -647,11 +764,11 @@ class LLMQueryEngine:
         )
 
         try:
-            intent_json = json.loads(raw_response)
+            intent_json = safe_json_loads(raw_response, stage_name="Intent Extraction")
             intent = ATISIntent(intent_json)
             logger.info("Intent: %s", intent)
             return intent
-        except (json.JSONDecodeError, KeyError) as exc:
+        except (RuntimeError, KeyError) as exc:
             logger.warning("Failed to parse intent JSON: %s. Raw: %s", exc, raw_response[:200])
             return ATISIntent({"intent_type": "OVERVIEW", "target_entities": [], "target_entity_types": [], "max_results_hint": 20})
 
@@ -829,9 +946,9 @@ class LLMQueryEngine:
         )
 
         try:
-            ranking_data = json.loads(raw_response)
+            ranking_data = safe_json_loads(raw_response, stage_name="Semantic Ranking")
             ranked_list = ranking_data.get("ranked_nodes", [])
-        except (json.JSONDecodeError, KeyError) as exc:
+        except RuntimeError as exc:
             logger.warning("Failed to parse ranking JSON: %s. Using top candidates by score.", exc)
             return candidates[:LLM_RANKING_MAX_RESULTS]
 
@@ -951,12 +1068,10 @@ class LLMQueryEngine:
                                  perspective_nodes: List[VaultNode],
                                  cross_border_bridges: List[Dict[str, Any]],
                                  perspective: PerspectiveContext, intent: ATISIntent) -> Dict[str, Any]:
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-
-        data = self._safe_json_loads(cleaned, "grounded_synthesis")
+        try:
+            data = safe_json_loads(raw, stage_name="Grounded Synthesis")
+        except RuntimeError:
+            return self._generate_empty_response("JSON parse failed", intent)
 
         # Ensure all sections are lists
         for section in ["structured_intelligence", "findings", "opportunities", "risks", "key_entities"]:
@@ -1013,66 +1128,6 @@ class LLMQueryEngine:
             "source_nodes": [{"id": n.uid, "type": n.entity_type} for n in source_nodes],
             "perspective_nodes": [{"id": n.uid, "type": n.entity_type} for n in perspective_nodes],
             "cross_border_bridges": cross_border_bridges,
-        }
-
-    def _safe_json_loads(self, raw_text: str, stage_name: str) -> Dict[str, Any]:
-        """
-        Safely parse LLM JSON with multiple recovery strategies.
-        Fixes trailing commas, unquoted keys, and extracts JSON from markdown.
-        """
-        cleaned = raw_text.strip()
-
-        # Strip markdown code fences
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-
-        # Strategy 1: Direct parse
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            logger.warning("Direct JSON parse failed in %s: %s", stage_name, e)
-
-        # Strategy 2: Greedy regex extraction (outermost braces)
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError as e:
-                logger.warning("Regex JSON recovery failed in %s: %s", stage_name, e)
-
-        # Strategy 3: Fix trailing commas (most common LLM error)
-        heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
-        try:
-            return json.loads(heuristic)
-        except json.JSONDecodeError as e:
-            logger.warning("Trailing comma fix failed in %s: %s", stage_name, e)
-
-        # Strategy 4: Fix double commas
-        heuristic2 = re.sub(r",+\s*", ", ", heuristic)
-        try:
-            return json.loads(heuristic2)
-        except json.JSONDecodeError as e:
-            logger.warning("Double comma fix failed in %s: %s", stage_name, e)
-
-        # Strategy 5: Extract first valid JSON object (non-greedy)
-        match = re.search(r"\{[\s\S]*?\}", cleaned)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError as e:
-                logger.warning("Non-greedy extraction failed in %s: %s", stage_name, e)
-
-        # All strategies exhausted — log and return minimal valid structure
-        logger.error("All JSON recovery strategies exhausted for %s.", stage_name)
-        logger.error("Raw excerpt (first 1000 chars):\n%s", raw_text[:1000])
-        return {
-            "executive_summary": f"[JSON parse error in {stage_name}. Raw response could not be parsed.]",
-            "structured_intelligence": [],
-            "findings": [],
-            "opportunities": [],
-            "risks": [],
-            "key_entities": [],
         }
 
     def _generate_empty_response(self, question: str, intent: ATISIntent,
@@ -1158,6 +1213,7 @@ class LLMQueryEngine:
 
         # Compute vault knowledge state for versioning
         knowledge_state = KnowledgeState(vault_mgr.vault_root)
+        knowledge_state.compute()
         knowledge_state_hash = getattr(knowledge_state, "hash", getattr(knowledge_state, "state_hash", ""))
 
         # Build deterministic cache key
@@ -1281,7 +1337,7 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
             "model_primary": model_primary,
             "model_fallback": model_fallback,
-            "pipeline_version": "perspective_first_v4_1",
+            "pipeline_version": "perspective_first_v4_2",
         },
     }
 
@@ -1394,7 +1450,7 @@ def run_query_pipeline(question: str | None = None,
 # =============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ATIS Query v4.0 — Perspective-First Grounded Pipeline",
+        description="ATIS Query v4.2 — Perspective-First Grounded Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--vault_path", default="./vault", help="Path to Obsidian vault root.")
@@ -1410,7 +1466,7 @@ def main() -> None:
 
     if question:
         logger.info("=" * 70)
-        logger.info("MODE B: QUESTION-DRIVEN QUERY (Perspective-First v4.0)")
+        logger.info("MODE B: QUESTION-DRIVEN QUERY (Perspective-First v4.2)")
         logger.info("Question: %s", question)
         logger.info("=" * 70)
     else:
