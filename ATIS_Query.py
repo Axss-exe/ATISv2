@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v4.2 — Perspective-First Grounded Architecture + Determinism
+ATIS_Query.py v4.3 — Perspective-First Grounded Architecture + Deterministic LLM Output Recovery
 
 4-STAGE PIPELINE:
   0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
@@ -100,124 +100,236 @@ def _sanitize_for_json(data):
 
 
 # =============================================================================
-# Safe JSON Loader — Brace-Balancing Engine (Shared with ATIS_News)
+# Robust JSON Recovery Engine
 # =============================================================================
 def _strip_markdown_fences(text: str) -> str:
-    """Remove markdown code fences and surrounding whitespace."""
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^~~~(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n?```\s*$', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n?~~~\s*$', '', text, flags=re.IGNORECASE)
+    """Remove common markdown wrappers without touching JSON content."""
+    text = (text or "").strip()
+    text = re.sub(r"^\s*```(?:json|javascript|js)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?\s*```\s*$", "", text)
+    text = re.sub(r"^\s*~~~(?:json|javascript|js)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?\s*~~~\s*$", "", text)
     return text.strip()
 
 
+def _json_error_context(text: str, error: json.JSONDecodeError, radius: int = 350) -> str:
+    """Return the exact area around a JSON failure for actionable Render logs."""
+    pos = max(0, min(error.pos, len(text)))
+    start = max(0, pos - radius)
+    end = min(len(text), pos + radius)
+    excerpt = text[start:end].replace("\r", "\\r").replace("\n", "\\n")
+    pointer = " " * (pos - start) + "^"
+    return f"position={error.pos}, line={error.lineno}, column={error.colno}\n{excerpt}\n{pointer}"
+
+
 def _extract_balanced_json(text: str) -> str:
+    """Extract the largest syntactically balanced JSON object/array.
+
+    Braces inside quoted strings are ignored and JSON escapes are respected.
+    An unterminated top-level structure is intentionally not returned: it is
+    treated as a likely truncated model response and handled by retry logic.
     """
-    Extract the largest balanced JSON object or array from raw text.
-    Uses character-level brace/bracket tracking with full string/escape awareness.
-    """
-    in_string = False
-    escape_next = False
-    brace_stack: List[str] = []
-    start_idx = -1
     candidates: List[str] = []
+    stack: List[str] = []
+    start_idx = -1
+    in_string = False
+    escape = False
 
     for i, char in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-
-        if char == '\\' and in_string:
-            escape_next = True
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
             continue
 
         if char == '"':
-            in_string = not in_string
+            in_string = True
             continue
 
-        if in_string:
-            continue
-
-        if char in '{[':
-            if not brace_stack:
+        if char in "{[":
+            if not stack:
                 start_idx = i
-            brace_stack.append(char)
-        elif char in '}]':
-            if not brace_stack:
+            stack.append(char)
+        elif char in "}]":
+            if not stack:
                 continue
-            opener = brace_stack.pop()
-            if (opener == '{' and char != '}') or (opener == '[' and char != ']'):
-                brace_stack = []
+            expected = "}" if stack[-1] == "{" else "]"
+            if char != expected:
+                # Reset at a structurally impossible boundary and keep looking.
+                stack.clear()
                 start_idx = -1
                 continue
-            if not brace_stack and start_idx != -1:
-                candidates.append(text[start_idx : i + 1])
+            stack.pop()
+            if not stack and start_idx >= 0:
+                candidates.append(text[start_idx:i + 1])
+                start_idx = -1
 
-    if not candidates:
-        return ""
-    return max(candidates, key=len)
+    return max(candidates, key=len) if candidates else ""
 
 
 def _fix_common_json_errors(text: str) -> str:
-    """Apply safe heuristics to fix common LLM JSON syntax errors."""
-    text = re.sub(r',(\s*[\}\]])', r'\1', text)
-    text = re.sub(r',+(\s*)', r',', text)
-    return text
+    """Fix conservative, unambiguous LLM JSON mistakes."""
+    # Trailing/double commas are safe to remove outside strings.
+    out: List[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ',':
+            j = i + 1
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j < len(text) and text[j] in '}]':
+                i += 1
+                continue
+            if j < len(text) and text[j] == ',':
+                i = j
+                continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _single_quote_json_repair(text: str) -> str:
+    """Convert Python-style single-quoted strings to JSON strings.
+
+    This is deliberately quote-aware so apostrophes in normal double-quoted
+    JSON strings (for example "Zimbabwe's") are never modified.
+    """
+    out: List[str] = []
+    i = 0
+    in_double = False
+    in_single = False
+    escape = False
+    while i < len(text):
+        ch = text[i]
+        if in_double:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if in_single:
+            if escape:
+                # Python-style escaped single quote becomes JSON escaped quote.
+                if ch == "'":
+                    out.append("\\\"")
+                elif ch == "\\":
+                    out.append("\\\\")
+                else:
+                    out.append(ch)
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "'":
+                out.append('"')
+                in_single = False
+            elif ch == '"':
+                out.append('\\"')
+            elif ch in '\r\n':
+                out.append('\\n')
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+        elif ch == "'":
+            in_single = True
+            out.append('"')
+        else:
+            out.append(ch)
+        i += 1
+    if in_single:
+        # Leave unterminated strings for the truncation/repair path.
+        return ''.join(out)
+    return ''.join(out)
 
 
 def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
-    """
-    Safely parse a JSON string with deterministic, layered fallback strategies.
-    Strips markdown fences, extracts balanced structures, fixes trailing commas,
-    and raises a clear RuntimeError on absolute failure.
-    """
+    """Parse LLM JSON with layered recovery and precise failure diagnostics."""
     if not raw_text or not raw_text.strip():
         raise RuntimeError(f"Empty response received from {stage_name}")
 
     original = raw_text.strip()
-    logger.debug("safe_json_loads called for %s (len=%d)", stage_name, len(original))
-
-    # Strategy 1: Direct parse after stripping fences
     cleaned = _strip_markdown_fences(original)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as direct_err:
-        logger.warning("Direct JSON parse failed in %s: %s", stage_name, direct_err)
+    logger.info("%s raw response: %d chars", stage_name, len(original))
+    errors: List[tuple[str, json.JSONDecodeError]] = []
 
-    # Strategy 2: Extract largest balanced JSON object/array
+    def attempt(label: str, candidate: str):
+        try:
+            value = json.loads(candidate)
+            if not isinstance(value, dict):
+                raise ValueError(f"Expected JSON object, got {type(value).__name__}")
+            logger.info("%s JSON parse succeeded via %s.", stage_name, label)
+            return value
+        except json.JSONDecodeError as exc:
+            errors.append((label, exc))
+            logger.warning("%s JSON parse failed via %s: %s", stage_name, label, exc)
+            return None
+        except ValueError as exc:
+            logger.warning("%s JSON parse rejected via %s: %s", stage_name, label, exc)
+            return None
+
+    result = attempt("direct", cleaned)
+    if result is not None:
+        return result
+
     balanced = _extract_balanced_json(cleaned)
     if balanced:
-        try:
-            return json.loads(balanced)
-        except json.JSONDecodeError as bal_err:
-            logger.warning("Balanced JSON extraction failed in %s: %s", stage_name, bal_err)
-
-        # Strategy 3: Fix common syntax errors on the balanced extract
+        result = attempt("balanced extraction", balanced)
+        if result is not None:
+            return result
         fixed = _fix_common_json_errors(balanced)
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError as fix_err:
-            logger.warning("Fixed balanced JSON failed in %s: %s", stage_name, fix_err)
+        result = attempt("balanced + common-error repair", fixed)
+        if result is not None:
+            return result
+        single = _single_quote_json_repair(fixed)
+        result = attempt("balanced + single-quote repair", single)
+        if result is not None:
+            return result
 
-    # Strategy 4: Non-greedy regex fallback
-    match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError as regex_err:
-            logger.warning("Non-greedy regex JSON recovery failed in %s: %s", stage_name, regex_err)
+    fixed_full = _fix_common_json_errors(cleaned)
+    result = attempt("full-text common-error repair", fixed_full)
+    if result is not None:
+        return result
 
-    # Strategy 5: Trailing-comma fix on full text as last resort
-    heuristic = re.sub(r',(\s*[\}\]])', r'\1', cleaned)
-    try:
-        return json.loads(heuristic)
-    except json.JSONDecodeError as heuristic_err:
-        logger.error("All JSON parsing strategies exhausted for %s.", stage_name)
-        logger.error("Raw response excerpt (first 1000 chars):\n%s", original[:1000])
-        raise RuntimeError(
-            f"Failed to parse JSON response from {stage_name} after all recovery strategies."
-        ) from heuristic_err
+    single_full = _single_quote_json_repair(fixed_full)
+    result = attempt("full-text single-quote repair", single_full)
+    if result is not None:
+        return result
+
+    if errors:
+        label, err = errors[-1]
+        logger.error("%s JSON recovery exhausted. Last strategy=%s", stage_name, label)
+        logger.error("%s failure context:\n%s", stage_name, _json_error_context(cleaned, err))
+    logger.error("%s response start:\n%s", stage_name, original[:1200])
+    logger.error("%s response end:\n%s", stage_name, original[-1200:])
+    raise RuntimeError(f"Failed to parse JSON response from {stage_name} after all recovery strategies.")
 
 
 # =============================================================================
@@ -741,7 +853,51 @@ class LLMQueryEngine:
         self.token_budget = TokenBudget()
         self.cache: AnalysisCache = AnalysisCache()
 
-    def _call_api(self, system_prompt: str, user_prompt: str) -> str:
+    def _model_output_cap(self) -> int:
+        """Return the configured adapter output-token ceiling."""
+        try:
+            return int(self.client.adapter.capabilities.max_output_tokens)
+        except (AttributeError, TypeError, ValueError):
+            return 4096
+
+    @staticmethod
+    def _looks_truncated(raw: str) -> bool:
+        """Detect likely truncation without treating normal prose as complete JSON."""
+        text = (raw or "").strip()
+        if not text:
+            return True
+        if text.endswith("..."):
+            return True
+
+        # Scan structural state accurately rather than using raw brace counts.
+        stack: List[str] = []
+        in_string = False
+        escape = False
+        for ch in text:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                expected = "}" if stack[-1] == "{" else "]"
+                if ch == expected:
+                    stack.pop()
+                else:
+                    return True
+        return in_string or bool(stack)
+
+    def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
+        if max_tokens is None:
+            max_tokens = 4096
+        max_tokens = max(256, min(int(max_tokens), self._model_output_cap()))
         return self.client.chat(
             [
                 {"role": "system", "content": system_prompt},
@@ -749,7 +905,42 @@ class LLMQueryEngine:
             ],
             temperature=0.0,
             seed=42,
+            max_tokens=max_tokens,
         )
+
+    def _call_api_with_retry(self, system_prompt: str, user_prompt: str,
+                             max_tokens: int, stage_name: str) -> str:
+        """Call an LLM stage and retry once when output is structurally truncated."""
+        cap = self._model_output_cap()
+        requested = min(max(256, int(max_tokens)), cap)
+        raw = self._call_api(system_prompt, user_prompt, max_tokens=requested)
+        if self._looks_truncated(raw):
+            retry_tokens = min(max(requested * 2, requested + 1024), cap)
+            if retry_tokens > requested:
+                logger.warning("%s appears truncated (len=%d). Retrying with %d output tokens.",
+                               stage_name, len(raw), retry_tokens)
+                raw = self._call_api(system_prompt, user_prompt, max_tokens=retry_tokens)
+                if self._looks_truncated(raw):
+                    logger.error("%s still appears truncated after retry (len=%d).",
+                                 stage_name, len(raw))
+            else:
+                logger.error("%s appears truncated at model output cap=%d.", stage_name, cap)
+        return raw
+
+    def _repair_json_response(self, raw: str, stage_name: str,
+                              system_prompt: str) -> str:
+        """Use a final constrained LLM pass to repair syntax only, never content."""
+        repair_prompt = (
+            "You are a JSON repair engine. Return ONLY one valid JSON object. "
+            "Preserve every value and key exactly; do not summarize, add facts, or remove data. "
+            "Only repair JSON syntax, quoting, commas, escaping, and structure. "
+            "If the supplied object is truncated, reconstruct only the minimum closing syntax "
+            "needed to produce valid JSON; do not invent missing content.\n\n"
+            "MALFORMED RESPONSE:\n" + raw
+        )
+        repair_tokens = min(max(4096, int(len(raw) / 2.5)), self._model_output_cap())
+        logger.warning("%s invoking constrained JSON repair pass.", stage_name)
+        return self._call_api(system_prompt, repair_prompt, max_tokens=repair_tokens)
 
     # -----------------------------------------------------------------
     # STAGE 0: Intent Extraction
@@ -758,9 +949,11 @@ class LLMQueryEngine:
         logger.info("STAGE 0: INTENT EXTRACTION")
         user_prompt = f'Question: "{question}"\n\nExtract the structured intent as JSON.'
 
-        raw_response = self._call_api(
+        raw_response = self._call_api_with_retry(
             system_prompt=INTENT_EXTRACTION_PROMPT,
             user_prompt=user_prompt,
+            max_tokens=4096,
+            stage_name="Intent Extraction",
         )
 
         try:
@@ -940,9 +1133,11 @@ class LLMQueryEngine:
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
             logger.warning("Ranking prompt truncated.")
 
-        raw_response = self._call_api(
+        raw_response = self._call_api_with_retry(
             system_prompt=SEMANTIC_RANKING_PROMPT,
             user_prompt=user_prompt,
+            max_tokens=4096,
+            stage_name="Semantic Ranking",
         )
 
         try:
@@ -1057,21 +1252,29 @@ class LLMQueryEngine:
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
             logger.warning("Synthesis prompt truncated.")
 
-        raw_response = self._call_api(
+        raw_response = self._call_api_with_retry(
             system_prompt=GROUNDED_SYNTHESIS_PROMPT,
             user_prompt=user_prompt,
+            max_tokens=8192,
+            stage_name="Grounded Synthesis",
         )
 
-        return self._parse_grounded_response(raw_response, ranked_nodes, perspective_nodes, cross_border_bridges, perspective, intent)
+        try:
+            return self._parse_grounded_response(
+                raw_response, ranked_nodes, perspective_nodes, cross_border_bridges, perspective, intent
+            )
+        except RuntimeError:
+            # A complete-but-malformed response gets one syntax-only repair pass.
+            repaired = self._repair_json_response(raw_response, "Grounded Synthesis", GROUNDED_SYNTHESIS_PROMPT)
+            return self._parse_grounded_response(
+                repaired, ranked_nodes, perspective_nodes, cross_border_bridges, perspective, intent
+            )
 
     def _parse_grounded_response(self, raw: str, source_nodes: List[VaultNode],
                                  perspective_nodes: List[VaultNode],
                                  cross_border_bridges: List[Dict[str, Any]],
                                  perspective: PerspectiveContext, intent: ATISIntent) -> Dict[str, Any]:
-        try:
-            data = safe_json_loads(raw, stage_name="Grounded Synthesis")
-        except RuntimeError:
-            return self._generate_empty_response("JSON parse failed", intent)
+        data = safe_json_loads(raw, stage_name="Grounded Synthesis")
 
         # Ensure all sections are lists
         for section in ["structured_intelligence", "findings", "opportunities", "risks", "key_entities"]:
@@ -1113,23 +1316,8 @@ class LLMQueryEngine:
             validated = validate_opportunity(
                 item, perspective, all_node_ids, perspective_node_ids, cross_border_bridges
             )
-            # Assign a deterministic stable opportunity ID using the canonical
-            # identity fields required by atis_context.compute_opportunity_identity.
-            # Do NOT pass the whole dict as a positional argument: the identity
-            # function intentionally requires each component explicitly.
-            stable_id = compute_opportunity_identity(
-                title=validated.get("title", ""),
-                perspective_country=validated.get("perspective_country", perspective.country),
-                source_country=validated.get("source_country", ""),
-                event_country=validated.get("event_country", ""),
-                opportunity_country=validated.get("opportunity_country", ""),
-                perspective_actor=validated.get("perspective_actor", ""),
-                perspective_capability=validated.get("perspective_capability", ""),
-                pathway=validated.get("pathway", ""),
-                source_nodes=validated.get("source_nodes", []),
-            )
-            validated["opportunity_id"] = stable_id
-            validated["stable_opportunity_id"] = stable_id
+            # Assign stable opportunity ID via compute_opportunity_identity
+            validated["opportunity_id"] = compute_opportunity_identity(validated)
             validated_opportunities.append(validated)
         data["opportunities"] = validated_opportunities
 
@@ -1213,7 +1401,7 @@ class LLMQueryEngine:
             max_chars = int(self.token_budget.available_for_input * 3.2) - len(system_prompt)
             user_prompt = user_prompt[:max_chars] + "\n[TRUNCATED]"
 
-        raw = self._call_api(system_prompt=system_prompt, user_prompt=user_prompt)
+        raw = self._call_api_with_retry(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=8192, stage_name="Full Vault Scan")
         result = self._parse_grounded_response(raw, all_nodes, perspective_nodes, cross_border_bridges, perspective, ATISIntent({}))
         result["scan_mode"] = "full_vault_capped"
         return result
@@ -1352,7 +1540,7 @@ def persist_query_payload(payload: Dict[str, Any], entity_graph: Dict[str, Any],
             "vault_files_scanned": aggregate_stats.get("total_entities", 0),
             "model_primary": model_primary,
             "model_fallback": model_fallback,
-            "pipeline_version": "perspective_first_v4_2",
+            "pipeline_version": "perspective_first_v4_3",
         },
     }
 
