@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ATIS_Query.py v4.3 — Perspective-First Grounded Architecture + Deterministic LLM Output Recovery
+ATIS_Query.py v4.3.1 — Explicit Opportunity Identity Fix + Deterministic LLM Output Recovery
 
 4-STAGE PIPELINE:
   0. INTENT EXTRACTION:    LLM understands question → structured intent (1 call)
@@ -1316,8 +1316,24 @@ class LLMQueryEngine:
             validated = validate_opportunity(
                 item, perspective, all_node_ids, perspective_node_ids, cross_border_bridges
             )
-            # Assign stable opportunity ID via compute_opportunity_identity
-            validated["opportunity_id"] = compute_opportunity_identity(validated)
+            # Assign a deterministic stable opportunity ID using the canonical
+            # identity fields required by atis_context.compute_opportunity_identity.
+            # The helper intentionally requires each component explicitly; passing
+            # the whole dict as one positional argument causes the runtime error
+            # seen in production.
+            stable_id = compute_opportunity_identity(
+                title=validated.get("title", ""),
+                perspective_country=validated.get("perspective_country", perspective.country),
+                source_country=validated.get("source_country", ""),
+                event_country=validated.get("event_country", ""),
+                opportunity_country=validated.get("opportunity_country", ""),
+                perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
+            )
+            validated["opportunity_id"] = stable_id
+            validated["stable_opportunity_id"] = stable_id
             validated_opportunities.append(validated)
         data["opportunities"] = validated_opportunities
 
