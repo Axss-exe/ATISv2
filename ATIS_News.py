@@ -1,4 +1,3 @@
-# ATIS_News.py v4.3.1 — Stage 3 retry-argument + robust JSON fixes
 #!/usr/bin/env python3
 """
 ATIS Constraint-Solving and Market Equilibrium Engine
@@ -125,8 +124,12 @@ PROMPT_STAGE_3_FORMATTER: str = (
     '  "market_equilibrium_shift": "String",\n'
     '  "source_country": "String",\n'
     '  "event_country": "String",\n'
-    '  "opportunities": [\n'
-    "    {\n"
+    '  "executive_summary": "String",\n'
+    '  "key_entities": [],\n'
+    '  "structured_intelligence": [],\n'
+    '  "findings": [],\n'
+    '  "risks": [],\n'
+    '  "opportunities": [\n'    "    {\n"
     '      "opportunity_id": "OPP-001",\n'
     '      "title": "String",\n'
     '      "type": "String",\n'
@@ -143,7 +146,10 @@ PROMPT_STAGE_3_FORMATTER: str = (
     '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},\n'
     '      "justification": "One precise sentence explaining the structural gap and the evidenced pathway."\n'
     "    }\n"
-    "  ]\n"
+    "  ],\n"
+    '  "source_nodes": ["Exact vault node IDs"],\n'
+    '  "perspective_nodes": ["Exact vault node IDs"],\n'
+    '  "cross_border_bridges": [],\n'
     "}"
 )
 
@@ -262,97 +268,48 @@ class TokenBudget:
 # Safe JSON Loader
 # --------------------------------------------------------------------------- #
 def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
-    """Parse LLM JSON defensively without relying on greedy regex extraction."""
-    cleaned = (raw_text or "").strip()
+    """
+    Safely parse a JSON string with multiple fallback strategies.
+    Strips markdown fences, attempts regex recovery, and raises a clear
+    RuntimeError on absolute failure.
+    """
+    cleaned = raw_text.strip()
 
-    def _strip_fences(value: str) -> str:
-        value = value.strip()
-        if value.startswith("```"):
-            value = re.sub(r"^```(?:json|JSON)?\s*", "", value)
-            value = re.sub(r"\s*```\s*$", "", value)
-        return value.strip()
+    # Strip markdown code fences if present
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    def _balanced_candidates(value: str):
-        """Yield balanced JSON object/array candidates while respecting strings."""
-        candidates = []
-        stack = []
-        in_string = False
-        escape = False
-        start_idx = None
-        pairs = {"}": "{", "]": "["}
-
-        for i, ch in enumerate(value):
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-                continue
-
-            if ch in "{[":
-                if not stack:
-                    start_idx = i
-                stack.append(ch)
-            elif ch in "}]":
-                if not stack or stack[-1] != pairs[ch]:
-                    if stack:
-                        stack.clear()
-                    start_idx = None
-                    continue
-                stack.pop()
-                if not stack and start_idx is not None:
-                    candidates.append(value[start_idx:i + 1])
-                    start_idx = None
-
-        return candidates
-
-    def _clean_common_syntax(value: str) -> str:
-        # Remove commas immediately before a closing object/array.
-        value = re.sub(r",(\s*[}\]])", r"\1", value)
-        # Remove accidental duplicate commas between values.
-        value = re.sub(r",\s*,", ",", value)
-        return value
-
-    cleaned = _strip_fences(cleaned)
-
+    # Attempt direct parse
     try:
-        data = json.loads(cleaned)
-        logger.info("%s JSON parse succeeded via direct.", stage_name)
-        return data
+        return json.loads(cleaned)
     except json.JSONDecodeError as direct_err:
-        logger.warning("Direct JSON parse failed in %s: %s", stage_name, direct_err)
-        line_start = cleaned.rfind("\n", 0, max(0, direct_err.pos)) + 1
-        line_end = cleaned.find("\n", direct_err.pos)
-        if line_end == -1:
-            line_end = len(cleaned)
-        logger.warning("%s JSON failure context: %s", stage_name, cleaned[line_start:line_end][:500])
+        logger.warning(
+            "Direct JSON parse failed in %s: %s", stage_name, direct_err
+        )
 
-    candidates = _balanced_candidates(cleaned)
-    # Prefer the largest balanced candidate; nested JSON values are normally smaller.
-    for candidate in sorted(candidates, key=len, reverse=True):
-        for attempt in (candidate, _clean_common_syntax(candidate)):
-            try:
-                data = json.loads(attempt)
-                logger.info("%s JSON parse succeeded via balanced extraction.", stage_name)
-                return data
-            except json.JSONDecodeError:
-                pass
+    # Fallback: greedy regex search for the outermost JSON object
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as regex_err:
+            logger.warning(
+                "Regex JSON recovery failed in %s: %s", stage_name, regex_err
+            )
 
-    heuristic = _clean_common_syntax(cleaned)
+    # Final fallback: attempt to fix trailing commas or common syntax issues
+    heuristic = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
     try:
-        data = json.loads(heuristic)
-        logger.info("%s JSON parse succeeded via syntax cleanup.", stage_name)
-        return data
+        return json.loads(heuristic)
     except json.JSONDecodeError as heuristic_err:
-        logger.error("All JSON parsing strategies exhausted for %s: %s", stage_name, heuristic_err)
-        logger.error("Raw response excerpt (first 1000 chars):\n%s", raw_text[:1000])
-        raise RuntimeError(f"Failed to parse JSON response from {stage_name}.") from heuristic_err
+        logger.error(
+            "All JSON parsing strategies exhausted for %s.", stage_name
+        )
+        logger.error("Raw response excerpt (first 800 chars):\n%s", raw_text[:800])
+        raise RuntimeError(
+            f"Failed to parse JSON response from {stage_name}."
+        ) from heuristic_err
 
 # --------------------------------------------------------------------------- #
 # Obsidian Vault Manager (Graph & Inbound Backlink Engine)
@@ -963,8 +920,6 @@ class LLMPipeline:
             "Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
             f"## GRAPH CONTEXT\n{graph_context}\n\n"
             + stage_2_analysis,
-            max_tokens=4096,
-            stage_name="Stage 3",
         )
         dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
         logger.info("Stage 3 complete. Dashboard JSON generated.")
@@ -1136,8 +1091,10 @@ def process_article_pipeline(article_path: str, perspective: PerspectiveContext 
                 source_country=validated.get("source_country", ""),
                 event_country=validated.get("event_country", ""),
                 opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
                 perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
             )
             validated["opportunity_id"] = stable_id
             validated["stable_opportunity_id"] = stable_id
@@ -1302,6 +1259,42 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
         # Store in cache after dashboard build
         pipeline.cache.set(analysis_fingerprint, dashboard_payload)
 
+    # ------------------------------------------------------------------ #
+    # Normalize the News response to the frontend's canonical intelligence
+    # contract. This is applied to both fresh and cached dashboards so an
+    # older News-only cache cannot produce an apparently empty UI.
+    # ------------------------------------------------------------------ #
+    if not isinstance(dashboard_payload, dict):
+        raise ValueError("Stage 3 returned a non-object dashboard payload")
+
+    dashboard_payload.setdefault("intelligence_id", "ATIS-INT-GENERIC")
+    dashboard_payload.setdefault("executive_summary", "")
+    dashboard_payload.setdefault("trigger_event", core_event)
+    dashboard_payload.setdefault("market_equilibrium_shift", "")
+    dashboard_payload.setdefault("key_entities", [])
+    dashboard_payload.setdefault("structured_intelligence", [])
+    dashboard_payload.setdefault("findings", [])
+    dashboard_payload.setdefault("risks", [])
+    dashboard_payload.setdefault("opportunities", [])
+    dashboard_payload.setdefault("source_nodes", evidence_ids)
+    dashboard_payload.setdefault("perspective_nodes", [pn["node_id"] for pn in perspective_nodes])
+    dashboard_payload.setdefault("cross_border_bridges", cross_border_bridges)
+
+    for field in ("key_entities", "structured_intelligence", "findings", "risks", "opportunities", "source_nodes", "perspective_nodes", "cross_border_bridges"):
+        if not isinstance(dashboard_payload.get(field), list):
+            dashboard_payload[field] = []
+
+    if not dashboard_payload["executive_summary"]:
+        dashboard_payload["executive_summary"] = dashboard_payload.get("trigger_event") or core_event
+
+    # Ensure there is at least one grounded, frontend-readable finding when
+    # the formatter returned only the News-native equilibrium statement.
+    if not dashboard_payload["findings"] and dashboard_payload.get("market_equilibrium_shift"):
+        dashboard_payload["findings"] = [{
+            "text": dashboard_payload["market_equilibrium_shift"],
+            "source_nodes": evidence_ids or ["news_event"],
+        }]
+
     # Enrich with deterministic validation
     dashboard_payload["perspective"] = perspective.as_dict()
     dashboard_payload["source_country"] = source_country
@@ -1324,8 +1317,10 @@ def run_news_pipeline(article_text: str, perspective: PerspectiveContext | None 
                 source_country=validated.get("source_country", ""),
                 event_country=validated.get("event_country", ""),
                 opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
                 perspective_actor=validated.get("perspective_actor", ""),
+                perspective_capability=validated.get("perspective_capability", ""),
+                pathway=validated.get("pathway", ""),
+                source_nodes=validated.get("source_nodes", []),
             )
             validated["opportunity_id"] = stable_id
             validated["stable_opportunity_id"] = stable_id
