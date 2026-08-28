@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """
-ATIS Constraint-Solving and Market Equilibrium Engine
-======================================================
+ATIS News Architecture Rebuild — Intelligent Retrieval, Token Budgeting & Multi-Stage Reasoning
+================================================================================================
 
-Africa Trade & Intelligence System (ATIS) — Production Orchestration Script.
+Rebuilt per ATIS NEWS ARCHITECTURE REBUILD specification:
+  1. Backlink tracing with distance-aware scoring
+  2. Intelligent knowledge-node selection with inspectable multi-factor scoring
+  3. Context/token budgeting against actual model capabilities
+  4. LLM call orchestration with automatic workload splitting
+  5. Multi-stage reasoning for large knowledge states
+  6. Progressive evidence compression (never sends raw massive context to final call)
+  7. Evidence provenance preservation through all stages
+  8. Diversity-aware selection
+  9. Opportunity detection with explicit/derived/potential confidence levels
+ 10. Observability logging for every analysis
 
-This module implements a decoupled, state-passing pipeline that:
-    1. Extracts economic entities from a news article via the configured LLM.
-    2. Reconciles extracted entities against a local Obsidian markdown vault,
-       using canonical fuzzy matching and bidirectional backlink crawling.
-    3. Retrieves perspective-side actors, capabilities, and cross-border bridges.
-    4. Performs macroeconomic constraint-solving analysis via the configured LLM.
-    5. Formats the analysis into a structured commercial-intelligence dashboard.
-    6. Deterministically validates every opportunity against vault evidence.
-    7. Persists the final dashboard JSON to a local `./dashboards/` directory.
+Public API (backward compatible):
+  - process_article_pipeline(article_path, perspective=None) -> Dict[str, Any]
+  - run_news_pipeline(article_text, perspective=None) -> Dict[str, Any]
 
-Determinism Features:
+Determinism:
   - temperature=0.0, seed=42 on all LLM calls
-  - sorted vault iterations for stable ordering
+  - sorted iterations for stable ordering
   - AnalysisCache for disk-based result caching
   - KnowledgeState for vault versioning
   - compute_analysis_fingerprint for stable identity
   - compute_opportunity_identity for stable opportunity IDs
-
-Constraints:
-  - Python 3.10+
-  - Strict 60,000-token ceiling per API request (aggressive truncation).
-  - Zero placeholders; fully operational.
-
-Environment:
-    - LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL must be configured.
-  - Article path provided as the first CLI argument.
 """
 
 from __future__ import annotations
@@ -43,12 +38,13 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from llm_client import LLMClient, get_client
+from llm_client import LLMClient, get_client, LLMTokenLimitError, ModelCapabilities
 from atis_context import (
     PerspectiveContext,
     validate_opportunity,
@@ -58,104 +54,8 @@ from atis_context import (
     compute_opportunity_identity,
     ANALYSIS_VERSION,
     SCHEMA_VERSION,
+    COUNTRY_CODES,
 )
-
-
-# --------------------------------------------------------------------------- #
-# System Prompts (Embedded as Constants)
-# --------------------------------------------------------------------------- #
-PROMPT_STAGE_1_EXTRACTOR: str = (
-    "You are the Entity Extraction Module for an economic intelligence pipeline. "
-    "Your sole objective is to extract entities from the provided text and classify them into a strict schema. "
-    "Do not analyze or interpret the text.\n"
-    "CLASSIFICATION SCHEMA:\n"
-    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.\n"
-    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.\n"
-    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.\n"
-    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.\n"
-    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.\n"
-    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.\n"
-    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).\n"
-    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.\n\n"
-    "OUTPUT INSTRUCTIONS:\n"
-    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).\n"
-    "JSON SCHEMA:\n"
-    "{\n"
-    '  "entities": [\n'
-    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}\n'
-    "  ],\n"
-    '  "core_event": "String summarizing the article main event.",\n'
-    '  "source_country": "Country where the event occurred (infer from text)",\n'
-    '  "event_country": "Country where the underlying development occurred (infer from text)"\n'
-    "}"
-)
-
-PROMPT_STAGE_2_SOLVER: str = (
-    "You are the ATIS Equilibrium and Constraint Engine. Your objective is to act as a macroeconomic constraint solver. "
-    "You will be provided with a [NEW EVENT], a [PERSPECTIVE CONTEXT] containing evidenced actors and capabilities from the perspective country, "
-    "and a [CROSS-BORDER BRIDGE CONTEXT] showing actual vault-documented relationships between the perspective country and the source event country. "
-    "You must calculate the systemic shifts and unfulfilled requirements caused by the event, BUT you may only propose opportunities that are grounded in the provided perspective-side evidence.\n\n"
-    "CRITICAL RULES:\n"
-    "1. You MUST select perspective_actor from the [PERSPECTIVE ACTOR REGISTRY] list below. Do not invent actors.\n"
-    "2. You MUST select perspective_capability from the capabilities listed for that actor. Do not invent capabilities.\n"
-    "3. You MUST select pathway from the [CROSS-BORDER BRIDGE CONTEXT] or from the enumerated list: export, procurement, supplier relationship, regional tender, joint venture, partnership, investment, financing, logistics, professional services, technology transfer, regional infrastructure, power trade, regulatory arbitrage, market entry. The pathway must be supported by evidence.\n"
-    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists — this may be the source country, the perspective country, or a third country. Do NOT default it to the perspective country.\n"
-    "5. If no perspective-side actor can respond to the event, state 'NO VALID OPPORTUNITY' and explain the gap.\n"
-    "6. Distinguish local source-country opportunities from perspective-country opportunities. A source-country event does NOT automatically create a perspective-country opportunity.\n\n"
-    "Follow this exact reasoning sequence in your markdown output:\n"
-    "## 1. THE EQUILIBRIUM DELTA: What specific market equilibrium was broken by this event?\n"
-    "## 2. CONSTRAINT MATRIX: What new capabilities are now required? What existing capabilities are now insufficient?\n"
-    "## 3. PERSPECTIVE-SIDE CAPABILITY AUDIT: Which perspective-country actors have evidenced capabilities that could address the constraints?\n"
-    "## 4. CROSS-BORDER BRIDGE AUDIT: Which evidenced pathways connect perspective actors to the source event?\n"
-    "## 5. ECONOMIC FLOW: For validated cross-border opportunities, identify who pays, who benefits, and capital flow.\n"
-    "## 6. OPPORTUNITY CASCADE: Detail ONLY perspective-validated Primary, Secondary, and Tertiary opportunities. If none, say NONE."
-)
-
-PROMPT_STAGE_3_FORMATTER: str = (
-    "You are a strict data serialization module. Your objective is to take the provided macroeconomic constraint analysis "
-    "and format it into a structured JSON payload for a commercial intelligence dashboard.\n"
-    "OUTPUT INSTRUCTIONS:\n"
-    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json). "
-    "Calculate urgency_score and feasibility_score on a scale of 1.0 to 10.0.\n"
-    "JSON SCHEMA:\n"
-    "{\n"
-    '  "intelligence_id": "ATIS-INT-GENERIC",\n'
-    '  "trigger_event": "String",\n'
-    '  "market_equilibrium_shift": "String",\n'
-    '  "source_country": "String",\n'
-    '  "event_country": "String",\n'
-    '  "opportunities": [\n'
-    "    {\n"
-    '      "opportunity_id": "OPP-001",\n'
-    '      "title": "String",\n'
-    '      "type": "String",\n'
-    '      "perspective_country": "String", "perspective_country_code": "ISO-2",\n'
-    '      "source_country": "String", "event_country": "String", "opportunity_country": "String",\n'
-    '      "cross_border": true, "cross_border_countries": ["String"],\n'
-    '      "perspective_actor": "MUST be from the PERSPECTIVE ACTOR REGISTRY",\n'
-    '      "perspective_capability": "MUST be a capability listed for that actor",\n'
-    '      "pathway": "MUST be from the enumerated list and supported by evidence",\n'
-    '      "source_nodes": ["Exact vault node IDs"],\n'
-    '      "urgency_score": Float,\n'
-    '      "feasibility_score": Float,\n'
-    '      "required_missing_nodes": ["String"],\n'
-    '      "capital_flow": {"beneficiary": "String", "likely_funder": "String"},\n'
-    '      "justification": "One precise sentence explaining the structural gap and the evidenced pathway."\n'
-    "    }\n"
-    "  ]\n"
-    "}"
-)
-
-
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-VAULT_DIR: Path = Path(os.getenv("ATIS_VAULT_DIR", "./vault"))
-DASHBOARDS_DIR: Path = Path("./dashboards")
-MAX_TOKENS_PER_REQUEST: int = 60_000
-RESPONSE_RESERVE: int = 8_000
-SAFETY_BUFFER: int = 1_000
-
 
 # --------------------------------------------------------------------------- #
 # Logging Setup
@@ -165,100 +65,254 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger: logging.Logger = logging.getLogger("atis_engine")
-
+logger: logging.Logger = logging.getLogger("atis_news")
 
 # --------------------------------------------------------------------------- #
-# Token Budget Manager
+# Configuration
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class TokenBudget:
-    """Aggressive token budget manager enforcing the 60k ceiling."""
+VAULT_DIR: Path = Path(os.getenv("ATIS_VAULT_DIR", "./vault"))
+DASHBOARDS_DIR: Path = Path("./dashboards")
 
-    max_tokens: int = MAX_TOKENS_PER_REQUEST
-    response_reserve: int = RESPONSE_RESERVE
-    safety_buffer: int = SAFETY_BUFFER
+# Safety margins — never consume 100% of context
+OUTPUT_RESERVE_TOKENS: int = 12_000      # Reserve for model response
+SAFETY_MARGIN_TOKENS: int = 2_000       # Buffer for token estimation error
+SYSTEM_PROMPT_OVERHEAD: int = 500        # Overhead per message block
+
+# Diversity / selection parameters
+MAX_DIRECT_EVIDENCE_NODES: int = 30
+MAX_FIRST_ORDER_NODES: int = 25
+MAX_SECOND_ORDER_NODES: int = 15
+MAX_PERIPHERAL_NODES: int = 5
+MAX_PERSPECTIVE_NODES: int = 20
+MAX_BRIDGE_NODES: int = 15
+MAX_GLOBAL_REGISTRY_NODES: int = 50
+
+# Multi-stage partitioning
+MAX_NODES_PER_PARTITION: int = 25       # Nodes per evidence-analysis call
+MAX_PARTITIONS: int = 10
+
+# Deduplication
+MIN_SIMILARITY_THRESHOLD: float = 0.75   # For near-duplicate detection
+
+# --------------------------------------------------------------------------- #
+# Enums
+# --------------------------------------------------------------------------- #
+class EvidenceCategory(Enum):
+    DIRECT = "direct"               # Information directly describing the event
+    FIRST_ORDER = "first_order"   # Nodes directly connected to event entities
+    SECOND_ORDER = "second_order" # Nodes connected to first-order nodes
+    PERIPHERAL = "peripheral"     # Technically connected but low analytical value
+    PERSPECTIVE = "perspective"   # Perspective-country actors
+    BRIDGE = "bridge"             # Cross-border bridge nodes
+    GLOBAL = "global"             # Background registry nodes
+
+class OpportunityType(Enum):
+    EXPLICIT = "explicit"         # Source directly indicates opportunity
+    DERIVED = "derived"           # Evidence supports reasonable strategic opportunity
+    POTENTIAL = "potential"       # Plausible but insufficient evidence
+
+class ReasoningMode(Enum):
+    SINGLE = "single"
+    MULTI_STAGE = "multi_stage"
+
+# --------------------------------------------------------------------------- #
+# Data Structures
+# --------------------------------------------------------------------------- #
+@dataclass
+class ScoredNode:
+    """
+    Inspectable node selection with multi-factor relevance scoring.
+    Every candidate node receives explicit scores so the reasoning is transparent.
+    """
+    node_id: str
+    canonical_id: str
+    content: str
+    category: EvidenceCategory
+
+    # Core relevance dimensions
+    relevance_score: float = 0.0
+    direct_match_score: float = 0.0
+    relationship_score: float = 0.0
+    temporal_score: float = 0.0
+    geographic_score: float = 0.0
+    sector_score: float = 0.0
+    backlink_distance: int = 0
+    evidence_strength: float = 0.0
+    diversity_score: float = 0.0
+
+    # Metadata
+    country: str = ""
+    node_type: str = ""
+    sector: str = ""
+    summary: str = ""
+    source_entities: List[str] = field(default_factory=list)
+    selection_reason: str = ""
 
     @property
-    def available_for_input(self) -> int:
-        """Tokens available for system + user prompts after reserves."""
-        return self.max_tokens - self.response_reserve - self.safety_buffer
+    def composite_score(self) -> float:
+        """Weighted composite for ranking."""
+        return (
+            self.relevance_score * 0.30 +
+            self.direct_match_score * 0.25 +
+            self.relationship_score * 0.15 +
+            self.geographic_score * 0.10 +
+            self.sector_score * 0.08 +
+            self.temporal_score * 0.05 +
+            self.evidence_strength * 0.05 +
+            self.diversity_score * 0.02
+        )
+
+@dataclass
+class IntermediateFinding:
+    """Preserves evidence provenance through intermediate reasoning stages."""
+    finding: str
+    supporting_nodes: List[str]
+    supporting_entities: List[str]
+    confidence: float
+    reasoning_stage: str
+    category: str = ""
+    contradictions: List[str] = field(default_factory=list)
+
+@dataclass
+class EvidencePartition:
+    """A partition of evidence for parallel/sequential analysis."""
+    partition_id: int
+    nodes: List[ScoredNode]
+    theme: str
+    estimated_tokens: int
+
+@dataclass
+class ReasoningLog:
+    """Observability record for a single News analysis."""
+    entities_extracted: int = 0
+    candidate_nodes: int = 0
+    backlink_candidates: int = 0
+    relevant_nodes: int = 0
+    selected_evidence: int = 0
+    estimated_tokens: int = 0
+    safe_budget: int = 0
+    reasoning_mode: str = ""
+    partitions: int = 0
+    evidence_calls: int = 0
+    synthesis_calls: int = 0
+    final_call: int = 0
+    total_llm_calls: int = 0
+    deduplicated_nodes: int = 0
+    weak_backlinks_filtered: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "entities_extracted": self.entities_extracted,
+            "candidate_nodes": self.candidate_nodes,
+            "backlink_candidates": self.backlink_candidates,
+            "relevant_nodes": self.relevant_nodes,
+            "selected_evidence": self.selected_evidence,
+            "estimated_tokens": self.estimated_tokens,
+            "safe_budget": self.safe_budget,
+            "reasoning_mode": self.reasoning_mode,
+            "partitions": self.partitions,
+            "evidence_calls": self.evidence_calls,
+            "synthesis_calls": self.synthesis_calls,
+            "final_call": self.final_call,
+            "total_llm_calls": self.total_llm_calls,
+            "deduplicated_nodes": self.deduplicated_nodes,
+            "weak_backlinks_filtered": self.weak_backlinks_filtered,
+        }
+
+    def log_tree(self) -> str:
+        return (
+            f"NEWS REASONING\n"
+            f"├── entities extracted: {self.entities_extracted}\n"
+            f"├── candidate nodes: {self.candidate_nodes}\n"
+            f"├── backlink candidates: {self.backlink_candidates}\n"
+            f"├── relevant nodes: {self.relevant_nodes}\n"
+            f"├── selected evidence: {self.selected_evidence}\n"
+            f"├── estimated tokens: {self.estimated_tokens:,}\n"
+            f"├── safe budget: {self.safe_budget:,}\n"
+            f"├── reasoning mode: {self.reasoning_mode}\n"
+            f"├── partitions: {self.partitions}\n"
+            f"├── evidence calls: {self.evidence_calls}\n"
+            f"├── synthesis calls: {self.synthesis_calls}\n"
+            f"├── final call: {self.final_call}\n"
+            f"├── total LLM calls: {self.total_llm_calls}\n"
+            f"├── deduplicated nodes: {self.deduplicated_nodes}\n"
+            f"└── weak backlinks filtered: {self.weak_backlinks_filtered}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Token Budget Manager — Dynamic against actual model capabilities
+# --------------------------------------------------------------------------- #
+@dataclass
+class TokenBudgetManager:
+    """
+    Dedicated token-budgeting layer that queries actual model capabilities.
+    Never assumes the model can consume the provider's maximum context.
+    """
+    capabilities: ModelCapabilities
+    output_reserve: int = OUTPUT_RESERVE_TOKENS
+    safety_margin: int = SAFETY_MARGIN_TOKENS
+    system_prompt_overhead: int = SYSTEM_PROMPT_OVERHEAD
+
+    @property
+    def provider_context_limit(self) -> int:
+        return self.capabilities.max_context_tokens
+
+    @property
+    def max_output_tokens(self) -> int:
+        return self.capabilities.max_output_tokens
+
+    @property
+    def usable_context_budget(self) -> int:
+        """Safe input budget after reserving output + safety margin."""
+        return self.provider_context_limit - self.output_reserve - self.safety_margin
 
     @staticmethod
-    def estimate(text: str) -> int:
-        """
-        Conservative token estimator.
-        Assumes ~3.2 characters per token for mixed English/technical text.
-        """
+    def estimate_tokens(text: str) -> int:
+        """Conservative estimate: ~3.2 chars per token for mixed English/technical text."""
         if not text:
             return 0
         return int(len(text) / 3.2) + 1
 
-    def truncate_payload(
-        self,
-        system_prompt: str,
-        article_text: str,
-        graph_context: str,
-        min_article_ratio: float = 0.25,
-    ) -> Tuple[str, str]:
+    @staticmethod
+    def estimate_messages_tokens(messages: List[Dict[str, str]]) -> int:
+        """Estimate tokens for a list of messages including overhead."""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += TokenBudgetManager.estimate_tokens(content)
+            total += SYSTEM_PROMPT_OVERHEAD  # per-message overhead
+        return total
+
+    def fits_in_budget(self, input_tokens: int, requested_output: int) -> bool:
+        """Check if a call fits within the safe budget."""
+        total = input_tokens + requested_output + self.safety_margin
+        return total <= self.provider_context_limit
+
+    def compute_safe_output_tokens(self, input_tokens: int) -> int:
+        """Given input size, compute safe max output tokens."""
+        available = self.provider_context_limit - input_tokens - self.safety_margin
+        return min(available, self.max_output_tokens)
+
+    def require_budget(self, input_tokens: int, requested_output: int, stage_name: str) -> None:
         """
-        Truncate article and graph context so that the combined input
-        (system + article + graph) fits within the token budget.
-        Truncation is applied to graph context first, then article text.
+        Guarantee: input + output + safety < provider_context_limit.
+        If exceeded, raise LLMTokenLimitError BEFORE sending.
         """
-        total_estimated = self.estimate(system_prompt + article_text + graph_context)
-        if total_estimated <= self.available_for_input:
-            return article_text, graph_context
-
-        # Convert available token budget back to a rough character budget
-        available_chars = int(self.available_for_input * 3.2) - len(system_prompt)
-        if available_chars <= 0:
-            raise RuntimeError("System prompt alone exceeds the token budget.")
-
-        # Reserve minimum space for the article
-        min_article_chars = int(available_chars * min_article_ratio)
-        article_chars = min(len(article_text), min_article_chars)
-        graph_chars = available_chars - article_chars
-
-        truncated_article = article_text
-        truncated_graph = graph_context
-
-        if len(article_text) > article_chars:
-            truncated_article = (
-                article_text[:article_chars]
-                + "\n\n[ARTICLE TRUNCATED TO RESPECT TOKEN BUDGET]"
+        total = input_tokens + requested_output + self.safety_margin
+        if total > self.provider_context_limit:
+            raise LLMTokenLimitError(
+                f"[{stage_name}] Estimated total tokens ({total:,}) exceeds provider "
+                f"context limit ({self.provider_context_limit:,}). "
+                f"Input: ~{input_tokens:,}, Requested output: {requested_output:,}, "
+                f"Safety margin: {self.safety_margin:,}. "
+                f"SPLIT the workload instead of sending."
             )
-            logger.warning(
-                "Article truncated from %d to ~%d chars to fit token budget.",
-                len(article_text),
-                article_chars,
-            )
-
-        if len(graph_context) > graph_chars:
-            truncated_graph = (
-                graph_context[:graph_chars]
-                + "\n\n[GRAPH CONTEXT TRUNCATED TO RESPECT TOKEN BUDGET]"
-            )
-            logger.warning(
-                "Graph context truncated from %d to ~%d chars to fit token budget.",
-                len(graph_context),
-                graph_chars,
-            )
-
-        # Verify
-        revised_estimate = self.estimate(
-            system_prompt + truncated_article + truncated_graph
-        )
-        logger.info(
-            "Revised payload estimate after truncation: %d tokens (budget: %d)",
-            revised_estimate,
-            self.available_for_input,
-        )
-        return truncated_article, truncated_graph
 
 
 # --------------------------------------------------------------------------- #
-# Safe JSON Loader — Brace-Balancing Engine
+# Safe JSON Loader — Brace-Balancing Engine (preserved from original)
 # --------------------------------------------------------------------------- #
 def _strip_markdown_fences(text: str) -> str:
     """Remove markdown code fences and surrounding whitespace."""
@@ -271,11 +325,7 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 def _extract_balanced_json(text: str) -> str:
-    """
-    Extract the largest balanced JSON object or array from raw text.
-    Uses character-level brace/bracket tracking with full string/escape awareness.
-    This avoids the greedy-regex bug that grabs from first '{' to last '}'.
-    """
+    """Extract the largest balanced JSON object or array from raw text."""
     in_string = False
     escape_next = False
     brace_stack: List[str] = []
@@ -286,18 +336,14 @@ def _extract_balanced_json(text: str) -> str:
         if escape_next:
             escape_next = False
             continue
-
         if char == '\\' and in_string:
             escape_next = True
             continue
-
         if char == '"':
             in_string = not in_string
             continue
-
         if in_string:
             continue
-
         if char in '{[':
             if not brace_stack:
                 start_idx = i
@@ -326,11 +372,7 @@ def _fix_common_json_errors(text: str) -> str:
 
 
 def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
-    """
-    Safely parse a JSON string with deterministic, layered fallback strategies.
-    Strips markdown fences, extracts balanced structures, fixes trailing commas,
-    and raises a clear RuntimeError on absolute failure.
-    """
+    """Safely parse JSON with deterministic, layered fallback strategies."""
     if not raw_text or not raw_text.strip():
         raise RuntimeError(f"Empty response received from {stage_name}")
 
@@ -349,7 +391,6 @@ def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
             return json.loads(balanced)
         except json.JSONDecodeError as bal_err:
             logger.warning("Balanced JSON extraction failed in %s: %s", stage_name, bal_err)
-
         fixed = _fix_common_json_errors(balanced)
         try:
             return json.loads(fixed)
@@ -375,13 +416,12 @@ def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Obsidian Vault Manager (Graph & Inbound Backlink Engine)
+# Obsidian Vault Manager — Enhanced with Intelligent Scoring
 # --------------------------------------------------------------------------- #
 class ObsidianVaultManager:
     """
-    Handles vault indexing, fuzzy filename matching, bidirectional link crawling
-    (outbound + inbound backlinks), and perspective-side retrieval for the ATIS
-    graph layer.
+    Handles vault indexing, fuzzy filename matching, bidirectional link crawling,
+    and intelligent node selection with multi-factor relevance scoring.
     """
 
     def __init__(self, vault_dir: Path = VAULT_DIR) -> None:
@@ -389,448 +429,943 @@ class ObsidianVaultManager:
         self._ensure_directories()
 
         # Core Graph Indexing Maps
-        self.file_map: Dict[str, str] = {}  # canonical_name -> actual_file_stem
-        self.backlink_map: Dict[str, Set[str]] = {}  # canonical_name -> set of actual_file_stems linking to it
-        self.node_metadata: Dict[str, Dict[str, Any]] = {}  # canonical_name -> {country, type, summary}
+        self.file_map: Dict[str, str] = {}          # canonical_name -> actual_file_stem
+        self.backlink_map: Dict[str, Set[str]] = {}   # canonical_name -> set of stems linking TO it
+        self.node_metadata: Dict[str, Dict[str, Any]] = {}  # canonical_name -> metadata
+        self.node_content: Dict[str, str] = {}      # canonical_name -> full content (lazy)
+        self.outbound_links: Dict[str, List[str]] = {}  # canonical_name -> outbound link targets
 
         # Build index immediately on startup
         self._index_vault()
 
-    # -- Directory hygiene --------------------------------------------------- #
     def _ensure_directories(self) -> None:
-        """Ensure vault and dashboard directories exist cleanly."""
         self.vault_dir.mkdir(parents=True, exist_ok=True)
         DASHBOARDS_DIR.mkdir(parents=True, exist_ok=True)
         logger.info("Vault directory verified: %s", self.vault_dir.resolve())
 
-    # -- Canonicalization Engine (Fuzzy Matching) ---------------------------- #
     @staticmethod
     def _canonicalize(name: str) -> str:
-        """
-        Convert any string/filename to a strict alphanumeric lowercase token.
-        Removes spaces, underscores, hyphens, and casing variations to eliminate matching bugs.
-        e.g., "Lithium carbonate", "lithium_carbonate", and "LITHIUM-CARBONATE" all become "lithiumcarbonate"
-        """
+        """Strict alphanumeric lowercase token for deterministic matching."""
         return re.sub(r"[^a-zA-Z0-9]", "", str(name or "")).lower()
 
-    # -- Institutional Memory Vault Indexer ---------------------------------- #
     def _index_vault(self) -> None:
-        """
-        Performs a full pass over the vault to catalog existing nodes and map
-        bidirectional graph relationships (backlinks) before execution.
-        Also extracts country metadata from frontmatter and file paths.
-        """
+        """Full pass: catalog nodes, map bidirectional relationships, extract metadata."""
         self.file_map.clear()
         self.backlink_map.clear()
         self.node_metadata.clear()
+        self.node_content.clear()
+        self.outbound_links.clear()
 
-        # DETERMINISTIC: sort md files by path string
         md_files = sorted(self.vault_dir.rglob("*.md"), key=lambda p: str(p))
-        logger.info("Indexing %d existing vault files for graph matching...", len(md_files))
+        logger.info("Indexing %d vault files...", len(md_files))
 
         for file_path in md_files:
             actual_stem = file_path.stem
             canonical_stem = self._canonicalize(actual_stem)
-
-            # Map canonical name to actual file name on disk
             self.file_map[canonical_stem] = actual_stem
 
             try:
                 content = file_path.read_text(encoding="utf-8")
-                # Extract frontmatter for country metadata
-                country = ""
-                node_type = ""
-                fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-                if fm_match:
-                    try:
-                        import yaml
-                        front = yaml.safe_load(fm_match.group(1)) or {}
-                        country = front.get("country", "") or front.get("location", "")
-                        node_type = front.get("node_type", "") or front.get("type", "") or front.get("entity_type", "")
-                    except Exception:
-                        pass
+            except Exception as exc:
+                logger.error("Failed to read %s: %s", actual_stem, exc)
+                continue
 
-                # Infer country from path if not in frontmatter
-                if not country:
-                    path_parts = [p.lower() for p in file_path.relative_to(self.vault_dir).parts]
-                    for part in path_parts:
-                        if part in ("zimbabwe", "zambia", "south africa", "botswana", "kenya", "china", "germany", "switzerland", "united kingdom", "united states of america"):
-                            country = part.title()
-                            break
+            # Extract frontmatter
+            country = ""
+            node_type = ""
+            sector = ""
+            fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+            if fm_match:
+                try:
+                    import yaml
+                    front = yaml.safe_load(fm_match.group(1)) or {}
+                    country = front.get("country", "") or front.get("location", "")
+                    node_type = front.get("node_type", "") or front.get("type", "") or front.get("entity_type", "")
+                    sector = front.get("sector", "") or front.get("industry", "")
+                except Exception:
+                    pass
 
-                # Extract summary
-                summary = ""
-                lines = [l.strip() for l in content.split("\n") if l.strip()]
-                for line in lines:
-                    if not line.startswith("---") and not line.startswith("#"):
-                        summary = line[:200]
+            # Infer country from path if not in frontmatter
+            if not country:
+                path_parts = [p.lower() for p in file_path.relative_to(self.vault_dir).parts]
+                for part in path_parts:
+                    if part in COUNTRY_CODES:
+                        country = part.title()
                         break
 
-                self.node_metadata[canonical_stem] = {
-                    "country": country,
-                    "type": node_type,
-                    "summary": summary,
-                    "path": str(file_path.relative_to(self.vault_dir)),
-                }
+            # Extract summary (first non-empty, non-frontmatter, non-header line)
+            summary = ""
+            lines = [l.strip() for l in content.split("\n") if l.strip()]
+            for line in lines:
+                if not line.startswith("---") and not line.startswith("#"):
+                    summary = line[:300]
+                    break
 
-                # Parse Obsidian style [[WikiLinks]] or [[WikiLinks|Display Name]]
-                links = re.findall(r"\[\[(.*?)\]\]", content)
-                for link in links:
-                    link_target = link.split("|")[0].strip()
-                    if not link_target:
-                        continue
+            rel_path = str(file_path.relative_to(self.vault_dir))
+            self.node_metadata[canonical_stem] = {
+                "country": country,
+                "type": node_type,
+                "sector": sector,
+                "summary": summary,
+                "path": rel_path,
+            }
+            self.node_content[canonical_stem] = content
 
-                    canonical_target = self._canonicalize(link_target)
-                    if canonical_target not in self.backlink_map:
-                        self.backlink_map[canonical_target] = set()
+            # Parse outbound wiki-links
+            links = re.findall(r"\[\[(.*?)\]\]", content)
+            cleaned_links: List[str] = []
+            seen_links: Set[str] = set()
+            for link in links:
+                link_target = link.split("|")[0].strip()
+                if not link_target:
+                    continue
+                canon_target = self._canonicalize(link_target)
+                if canon_target not in seen_links:
+                    seen_links.add(canon_target)
+                    cleaned_links.append(link_target)
+            self.outbound_links[canonical_stem] = cleaned_links
 
-                    # Register that this file links TO the target
-                    self.backlink_map[canonical_target].add(actual_stem)
-            except Exception as exc:
-                logger.error("Failed to parse backlinks for %s: %s", actual_stem, exc)
+            # Register backlinks
+            for link in cleaned_links:
+                canon_target = self._canonicalize(link)
+                if canon_target not in self.backlink_map:
+                    self.backlink_map[canon_target] = set()
+                self.backlink_map[canon_target].add(actual_stem)
+
+        logger.info("Vault index complete: %d nodes, %d backlink targets",
+                    len(self.file_map), len(self.backlink_map))
 
     def entity_exists(self, entity_name: str) -> bool:
         return self._canonicalize(entity_name) in self.file_map
 
     def read_entity(self, entity_name: str) -> str:
         canonical = self._canonicalize(entity_name)
+        if canonical in self.node_content:
+            return self.node_content[canonical]
         actual_name = self.file_map.get(canonical)
         if actual_name:
-            # Use stored relative path to handle nested subdirectories
             meta = self.node_metadata.get(canonical, {})
             rel_path = meta.get("path", f"{actual_name}.md")
             path = self.vault_dir / rel_path
             if path.exists():
                 return path.read_text(encoding="utf-8")
-            # Fallback: search by rglob if stored path is stale
             for found in self.vault_dir.rglob(f"{actual_name}.md"):
                 if found.exists():
                     return found.read_text(encoding="utf-8")
-            logger.warning("Entity file not found: %s (looked at %s and via rglob)", actual_name, path)
         return ""
 
-    def write_entity(self, entity_name: str, content: str) -> None:
+    def get_node_meta(self, entity_name: str) -> Dict[str, Any]:
         canonical = self._canonicalize(entity_name)
-        # Re-use existing name structure if it exists; otherwise use the raw name passed
-        actual_name = self.file_map.get(canonical, entity_name.strip())
-        path = self.vault_dir / f"{actual_name}.md"
-        path.write_text(content, encoding="utf-8")
+        return self.node_metadata.get(canonical, {})
 
-        # Keep internal indexes hot
-        self.file_map[canonical] = actual_name
-
-    # -- Bidirectional Link Crawler ----------------------------------------- #
-    def crawl_node_network(self, entity_name: str, visited: Optional[set] = None) -> str:
+    # ------------------------------------------------------------------ #
+    # Intelligent Node Selection with Multi-Factor Scoring
+    # ------------------------------------------------------------------ #
+    def select_evidence_nodes(
+        self,
+        entities: List[Dict[str, str]],
+        perspective: PerspectiveContext,
+        reasoning_log: ReasoningLog,
+    ) -> List[ScoredNode]:
         """
-        Traverses both forward wiki-links and inbound backlinks for an entity,
-        bundling structural context so the LLM spots network vulnerabilities.
+        Main entry: starting from extracted entities, perform intelligent
+        backlink tracing, relevance scoring, diversity selection, and deduplication.
+        Returns a ranked, deduplicated list of ScoredNodes.
         """
-        if visited is None:
-            visited = set()
+        entity_names = [e.get("name", "").strip() for e in entities if e.get("name", "").strip()]
+        entity_classes = {self._canonicalize(e.get("name", "")): e.get("class", "") for e in entities}
 
-        canonical = self._canonicalize(entity_name)
-        actual_name = self.file_map.get(canonical, entity_name)
+        # Extract countries, sectors, actors from entities
+        source_countries: Set[str] = set()
+        source_sectors: Set[str] = set()
+        for e in entities:
+            ctx = e.get("context", "").lower()
+            for country in COUNTRY_CODES:
+                if country in ctx:
+                    source_countries.add(country.title())
 
-        if actual_name in visited:
-            return ""
-        visited.add(actual_name)
+        perspective_norm = perspective.country.lower()
 
-        content = self.read_entity(actual_name)
-        if not content:
-            return ""
+        # --- PHASE 1: Direct Evidence ---
+        direct_nodes: List[ScoredNode] = []
+        for name in entity_names:
+            canonical = self._canonicalize(name)
+            if canonical not in self.file_map:
+                continue
+            actual = self.file_map[canonical]
+            meta = self.node_metadata.get(canonical, {})
+            content = self.read_entity(actual)
 
-        bundle_parts: List[str] = [
-            f"--- CORE NODE: {actual_name} ---\n{content}"
-        ]
+            score = ScoredNode(
+                node_id=actual,
+                canonical_id=canonical,
+                content=content,
+                category=EvidenceCategory.DIRECT,
+                direct_match_score=1.0,
+                relationship_score=1.0,
+                evidence_strength=1.0,
+                backlink_distance=0,
+                country=meta.get("country", ""),
+                node_type=meta.get("type", ""),
+                sector=meta.get("sector", ""),
+                summary=meta.get("summary", ""),
+                source_entities=[name],
+                selection_reason=f"Direct entity match: '{name}'",
+            )
+            # Geographic score
+            if meta.get("country", "").lower() in {c.lower() for c in source_countries}:
+                score.geographic_score = 1.0
+            direct_nodes.append(score)
 
-        # 1. OUTBOUND CONTEXT (What does this note point to?)
-        links = re.findall(r"\[\[(.*?)\]\]", content)
-        # DETERMINISTIC: sort links before processing
-        for link in sorted(links):
-            link_clean = link.split("|")[0].strip()
-            link_canonical = self._canonicalize(link_clean)
-            if link_canonical in self.file_map and link_clean not in visited:
-                target_actual = self.file_map[link_canonical]
-                # Inline bundle linked file data if it hasn't been crawled yet
-                linked_content = self.read_entity(target_actual)
-                bundle_parts.append(
-                    f"\n--- OUTBOUND LINKED CONTEXT: {target_actual} ---\n{linked_content}"
+        # --- PHASE 2: Backlink Tracing (First & Second Order) ---
+        first_order_nodes: Dict[str, ScoredNode] = {}
+        second_order_nodes: Dict[str, ScoredNode] = {}
+        peripheral_nodes: Dict[str, ScoredNode] = {}
+
+        visited: Set[str] = set(self._canonicalize(n) for n in entity_names)
+
+        # First-order: outbound links from direct nodes + inbound backlinks to direct nodes
+        for name in entity_names:
+            canonical = self._canonicalize(name)
+            if canonical not in self.file_map:
+                continue
+            actual = self.file_map[canonical]
+
+            # Outbound links
+            for link_target in self.outbound_links.get(canonical, []):
+                link_canon = self._canonicalize(link_target)
+                if link_canon in visited:
+                    continue
+                visited.add(link_canon)
+                if link_canon not in self.file_map:
+                    continue
+                actual_target = self.file_map[link_canon]
+                meta = self.node_metadata.get(link_canon, {})
+                content = self.read_entity(actual_target)
+
+                rel_score = self._compute_relationship_score(
+                    link_canon, entity_names, perspective_norm, source_countries
                 )
-                visited.add(target_actual)
 
-        # 2. INBOUND CONTEXT / BACKLINKS (What existing assets point to this node?)
-        inbound_stems = self.backlink_map.get(canonical, set())
-        if inbound_stems:
-            bundle_parts.append(
-                f"\n--- INBOUND BACKLINKS (EXISTING VAULT RELATIONSHIPS) ---"
+                node = ScoredNode(
+                    node_id=actual_target,
+                    canonical_id=link_canon,
+                    content=content,
+                    category=EvidenceCategory.FIRST_ORDER,
+                    direct_match_score=0.3,
+                    relationship_score=rel_score,
+                    evidence_strength=0.7,
+                    backlink_distance=1,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=[name],
+                    selection_reason=f"First-order link from '{name}'",
+                )
+                first_order_nodes[link_canon] = node
+
+            # Inbound backlinks
+            for inbound_stem in self.backlink_map.get(canonical, set()):
+                inbound_canon = self._canonicalize(inbound_stem)
+                if inbound_canon in visited:
+                    continue
+                visited.add(inbound_canon)
+                if inbound_canon not in self.file_map:
+                    continue
+                meta = self.node_metadata.get(inbound_canon, {})
+                content = self.read_entity(inbound_stem)
+
+                rel_score = self._compute_relationship_score(
+                    inbound_canon, entity_names, perspective_norm, source_countries
+                )
+
+                node = ScoredNode(
+                    node_id=inbound_stem,
+                    canonical_id=inbound_canon,
+                    content=content,
+                    category=EvidenceCategory.FIRST_ORDER,
+                    direct_match_score=0.2,
+                    relationship_score=rel_score,
+                    evidence_strength=0.6,
+                    backlink_distance=1,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=[name],
+                    selection_reason=f"Inbound backlink to '{name}'",
+                )
+                first_order_nodes[inbound_canon] = node
+
+        # Second-order: links from first-order nodes
+        for canon, first_node in list(first_order_nodes.items()):
+            for link_target in self.outbound_links.get(canon, []):
+                link_canon = self._canonicalize(link_target)
+                if link_canon in visited:
+                    continue
+                visited.add(link_canon)
+                if link_canon not in self.file_map:
+                    continue
+                actual_target = self.file_map[link_canon]
+                meta = self.node_metadata.get(link_canon, {})
+                content = self.read_entity(actual_target)
+
+                rel_score = self._compute_relationship_score(
+                    link_canon, entity_names, perspective_norm, source_countries
+                ) * 0.5  #衰减 for second order
+
+                node = ScoredNode(
+                    node_id=actual_target,
+                    canonical_id=link_canon,
+                    content=content,
+                    category=EvidenceCategory.SECOND_ORDER,
+                    direct_match_score=0.1,
+                    relationship_score=rel_score,
+                    evidence_strength=0.4,
+                    backlink_distance=2,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=first_node.source_entities,
+                    selection_reason=f"Second-order link from '{first_node.node_id}'",
+                )
+                second_order_nodes[link_canon] = node
+
+            # Second-order via backlinks to first-order nodes
+            for inbound_stem in self.backlink_map.get(canon, set()):
+                inbound_canon = self._canonicalize(inbound_stem)
+                if inbound_canon in visited:
+                    continue
+                visited.add(inbound_canon)
+                if inbound_canon not in self.file_map:
+                    continue
+                meta = self.node_metadata.get(inbound_canon, {})
+                content = self.read_entity(inbound_stem)
+
+                rel_score = self._compute_relationship_score(
+                    inbound_canon, entity_names, perspective_norm, source_countries
+                ) * 0.4
+
+                node = ScoredNode(
+                    node_id=inbound_stem,
+                    canonical_id=inbound_canon,
+                    content=content,
+                    category=EvidenceCategory.SECOND_ORDER,
+                    direct_match_score=0.05,
+                    relationship_score=rel_score,
+                    evidence_strength=0.3,
+                    backlink_distance=2,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=first_node.source_entities,
+                    selection_reason=f"Second-order backlink to '{first_node.node_id}'",
+                )
+                second_order_nodes[inbound_canon] = node
+
+        # --- PHASE 3: Perspective-Side Nodes ---
+        perspective_nodes: Dict[str, ScoredNode] = {}
+        for canon, meta in sorted(self.node_metadata.items()):
+            if meta.get("country", "").lower() != perspective_norm:
+                continue
+            if canon in visited:
+                # Already captured — upgrade its perspective relevance
+                continue
+            actual = self.file_map.get(canon, canon)
+            content = self.read_entity(actual)
+
+            rel_score = self._compute_relationship_score(
+                canon, entity_names, perspective_norm, source_countries
             )
-            bundle_parts.append(
-                f"The following existing nodes in your database are explicitly dependent on or linked to [[{actual_name}]]:"
+
+            node = ScoredNode(
+                node_id=actual,
+                canonical_id=canon,
+                content=content,
+                category=EvidenceCategory.PERSPECTIVE,
+                direct_match_score=0.0,
+                relationship_score=rel_score,
+                evidence_strength=0.5,
+                backlink_distance=1,
+                country=meta.get("country", ""),
+                node_type=meta.get("type", ""),
+                sector=meta.get("sector", ""),
+                summary=meta.get("summary", ""),
+                source_entities=[],
+                selection_reason=f"Perspective-country actor: {perspective.country}",
             )
-            # DETERMINISTIC: sort inbound stems
-            for inbound in sorted(inbound_stems):
-                # Grab a snippet or properties from the backlinked node to maximize context density
-                inbound_content = self.read_entity(inbound)
-                fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", inbound_content, re.DOTALL)
-                meta = f" [{fm_match.group(1).strip().replace(chr(10), ' | ')}]" if fm_match else ""
-                bundle_parts.append(f"- [[{inbound}]]{meta}")
+            perspective_nodes[canon] = node
 
-        return "\n".join(bundle_parts)
+        # --- PHASE 4: Cross-Border Bridges ---
+        bridge_nodes: Dict[str, ScoredNode] = {}
+        source_country = ""
+        if source_countries:
+            source_country = list(source_countries)[0]
+        else:
+            # Infer from entity context
+            for e in entities:
+                ctx = e.get("context", "").lower()
+                for country in COUNTRY_CODES:
+                    if country in ctx:
+                        source_country = country.title()
+                        break
+                if source_country:
+                    break
 
-    # -- Perspective-Side Retrieval (NEW) ----------------------------------- #
-    def get_perspective_nodes(self, perspective: PerspectiveContext) -> List[Dict[str, Any]]:
-        """
-        Retrieve all vault nodes that belong to the perspective country.
-        Returns a list of dicts with node_id, country, type, summary, content.
-        """
-        perspective_country_norm = perspective.country.lower()
-        results: List[Dict[str, Any]] = []
+        if source_country and source_country.lower() != perspective_norm:
+            source_norm = source_country.lower()
+            for canon, meta in sorted(self.node_metadata.items()):
+                node_country = meta.get("country", "").lower()
+                if node_country not in (perspective_norm, source_norm):
+                    continue
 
-        # DETERMINISTIC: iterate sorted by canonical stem
-        for canonical_stem in sorted(self.file_map.keys()):
-            actual_stem = self.file_map[canonical_stem]
-            meta = self.node_metadata.get(canonical_stem, {})
-            node_country = (meta.get("country") or "").lower()
-            if node_country == perspective_country_norm:
-                content = self.read_entity(actual_stem)
-                results.append({
-                    "node_id": actual_stem,
-                    "country": meta.get("country", ""),
-                    "type": meta.get("type", ""),
-                    "summary": meta.get("summary", ""),
-                    "content": content[:1500],  # Truncated for token efficiency
-                })
+                # Check if this node has cross-border links
+                has_bridge = False
+                for link_target in self.outbound_links.get(canon, []):
+                    link_canon = self._canonicalize(link_target)
+                    link_meta = self.node_metadata.get(link_canon, {})
+                    link_country = link_meta.get("country", "").lower()
+                    if node_country == perspective_norm and link_country == source_norm:
+                        has_bridge = True
+                        break
+                    if node_country == source_norm and link_country == perspective_norm:
+                        has_bridge = True
+                        break
 
-        logger.info("Retrieved %d perspective-side nodes for %s", len(results), perspective.country)
-        return results
+                if not has_bridge:
+                    # Check backlinks
+                    for inbound in self.backlink_map.get(canon, set()):
+                        inbound_canon = self._canonicalize(inbound)
+                        inbound_meta = self.node_metadata.get(inbound_canon, {})
+                        inbound_country = inbound_meta.get("country", "").lower()
+                        if node_country == perspective_norm and inbound_country == source_norm:
+                            has_bridge = True
+                            break
+                        if node_country == source_norm and inbound_country == perspective_norm:
+                            has_bridge = True
+                            break
 
-    def get_cross_border_bridges(self, perspective: PerspectiveContext, source_country: str) -> List[Dict[str, Any]]:
-        """
-        Find nodes in the perspective country that have links to nodes in the source country,
-        or nodes in the source country that have links to perspective-country nodes.
-        Returns bridge dicts with from_node, to_node, relationship_type.
-        """
+                if has_bridge and canon not in visited:
+                    actual = self.file_map.get(canon, canon)
+                    content = self.read_entity(actual)
+                    node = ScoredNode(
+                        node_id=actual,
+                        canonical_id=canon,
+                        content=content,
+                        category=EvidenceCategory.BRIDGE,
+                        direct_match_score=0.2,
+                        relationship_score=0.8,
+                        evidence_strength=0.7,
+                        backlink_distance=1,
+                        country=meta.get("country", ""),
+                        node_type=meta.get("type", ""),
+                        sector=meta.get("sector", ""),
+                        summary=meta.get("summary", ""),
+                        source_entities=[],
+                        selection_reason=f"Cross-border bridge: {node_country} ↔ {source_country}",
+                    )
+                    bridge_nodes[canon] = node
+
+        # --- PHASE 5: Global Registry (diversity fill) ---
+        global_nodes: Dict[str, ScoredNode] = {}
+        # Only if we need more diversity
+        all_selected = set()
+        for d in [direct_nodes, list(first_order_nodes.values()), list(second_order_nodes.values()),
+                   list(perspective_nodes.values()), list(bridge_nodes.values())]:
+            for n in (d if isinstance(d, list) else d):
+                all_selected.add(n.canonical_id)
+
+        # Collect sectors and countries already covered
+        covered_sectors: Set[str] = set()
+        covered_countries: Set[str] = set()
+        for n in all_selected:
+            meta = self.node_metadata.get(n, {})
+            if meta.get("sector"):
+                covered_sectors.add(meta["sector"].lower())
+            if meta.get("country"):
+                covered_countries.add(meta["country"].lower())
+
+        # Fill gaps with diverse global nodes
+        for canon, meta in sorted(self.node_metadata.items()):
+            if canon in all_selected:
+                continue
+            sector = meta.get("sector", "").lower()
+            country = meta.get("country", "").lower()
+            if sector and sector not in covered_sectors:
+                actual = self.file_map.get(canon, canon)
+                content = self.read_entity(actual)
+                node = ScoredNode(
+                    node_id=actual,
+                    canonical_id=canon,
+                    content=content,
+                    category=EvidenceCategory.GLOBAL,
+                    direct_match_score=0.0,
+                    relationship_score=0.2,
+                    evidence_strength=0.2,
+                    backlink_distance=3,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=[],
+                    selection_reason=f"Diversity fill: sector '{meta.get('sector', '')}'",
+                )
+                global_nodes[canon] = node
+                covered_sectors.add(sector)
+            elif country and country not in covered_countries and len(global_nodes) < MAX_GLOBAL_REGISTRY_NODES // 2:
+                actual = self.file_map.get(canon, canon)
+                content = self.read_entity(actual)
+                node = ScoredNode(
+                    node_id=actual,
+                    canonical_id=canon,
+                    content=content,
+                    category=EvidenceCategory.GLOBAL,
+                    direct_match_score=0.0,
+                    relationship_score=0.15,
+                    evidence_strength=0.15,
+                    backlink_distance=3,
+                    country=meta.get("country", ""),
+                    node_type=meta.get("type", ""),
+                    sector=meta.get("sector", ""),
+                    summary=meta.get("summary", ""),
+                    source_entities=[],
+                    selection_reason=f"Diversity fill: country '{meta.get('country', '')}'",
+                )
+                global_nodes[canon] = node
+                covered_countries.add(country)
+
+        # --- PHASE 6: Deduplication ---
+        all_nodes: Dict[str, ScoredNode] = {}
+        for node in direct_nodes:
+            all_nodes[node.canonical_id] = node
+        for d in [first_order_nodes, second_order_nodes, perspective_nodes, bridge_nodes, global_nodes]:
+            for canon, node in d.items():
+                if canon in all_nodes:
+                    # Merge: keep higher scores
+                    existing = all_nodes[canon]
+                    existing.direct_match_score = max(existing.direct_match_score, node.direct_match_score)
+                    existing.relationship_score = max(existing.relationship_score, node.relationship_score)
+                    existing.evidence_strength = max(existing.evidence_strength, node.evidence_strength)
+                    existing.source_entities = list(set(existing.source_entities + node.source_entities))
+                    # Upgrade category if better
+                    if node.category.value < existing.category.value:
+                        existing.category = node.category
+                else:
+                    all_nodes[canon] = node
+
+        # Near-duplicate detection (by content similarity on summaries)
+        deduped: Dict[str, ScoredNode] = {}
+        duplicates_removed = 0
+        for canon in sorted(all_nodes.keys()):
+            node = all_nodes[canon]
+            is_duplicate = False
+            for existing_canon, existing in deduped.items():
+                sim = self._summary_similarity(node.summary, existing.summary)
+                if sim > MIN_SIMILARITY_THRESHOLD and node.node_type == existing.node_type:
+                    # Merge into existing
+                    existing.direct_match_score = max(existing.direct_match_score, node.direct_match_score)
+                    existing.relationship_score = max(existing.relationship_score, node.relationship_score)
+                    existing.source_entities = list(set(existing.source_entities + node.source_entities))
+                    is_duplicate = True
+                    duplicates_removed += 1
+                    break
+            if not is_duplicate:
+                deduped[canon] = node
+
+        # --- PHASE 7: Category caps with diversity enforcement ---
+        final_selection: List[ScoredNode] = []
+
+        # Direct: take all (they're the most relevant)
+        direct = [n for n in deduped.values() if n.category == EvidenceCategory.DIRECT]
+        direct.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(direct[:MAX_DIRECT_EVIDENCE_NODES])
+
+        # First-order
+        first = [n for n in deduped.values() if n.category == EvidenceCategory.FIRST_ORDER]
+        first.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(first[:MAX_FIRST_ORDER_NODES])
+
+        # Second-order
+        second = [n for n in deduped.values() if n.category == EvidenceCategory.SECOND_ORDER]
+        second.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(second[:MAX_SECOND_ORDER_NODES])
+
+        # Peripheral (low-value second-order)
+        peripheral = [n for n in deduped.values() if n.category == EvidenceCategory.PERIPHERAL]
+        peripheral.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(peripheral[:MAX_PERIPHERAL_NODES])
+
+        # Perspective
+        persp = [n for n in deduped.values() if n.category == EvidenceCategory.PERSPECTIVE]
+        persp.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(persp[:MAX_PERSPECTIVE_NODES])
+
+        # Bridge
+        bridge = [n for n in deduped.values() if n.category == EvidenceCategory.BRIDGE]
+        bridge.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(bridge[:MAX_BRIDGE_NODES])
+
+        # Global (diversity)
+        glob = [n for n in deduped.values() if n.category == EvidenceCategory.GLOBAL]
+        glob.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.extend(glob[:MAX_GLOBAL_REGISTRY_NODES])
+
+        # Compute diversity scores
+        sector_counts: Dict[str, int] = {}
+        country_counts: Dict[str, int] = {}
+        type_counts: Dict[str, int] = {}
+        for n in final_selection:
+            sector_counts[n.sector.lower()] = sector_counts.get(n.sector.lower(), 0) + 1
+            country_counts[n.country.lower()] = country_counts.get(n.country.lower(), 0) + 1
+            type_counts[n.node_type.lower()] = type_counts.get(n.node_type.lower(), 0) + 1
+
+        for n in final_selection:
+            # Higher diversity score if in underrepresented categories
+            sector_rarity = 1.0 / max(sector_counts.get(n.sector.lower(), 1), 1)
+            country_rarity = 1.0 / max(country_counts.get(n.country.lower(), 1), 1)
+            type_rarity = 1.0 / max(type_counts.get(n.node_type.lower(), 1), 1)
+            n.diversity_score = (sector_rarity + country_rarity + type_rarity) / 3.0
+
+        # Re-sort by composite score (which now includes diversity)
+        final_selection.sort(key=lambda n: n.composite_score, reverse=True)
+
+        # Update reasoning log
+        reasoning_log.candidate_nodes = len(self.file_map)
+        reasoning_log.backlink_candidates = len(first_order_nodes) + len(second_order_nodes)
+        reasoning_log.relevant_nodes = len(deduped)
+        reasoning_log.selected_evidence = len(final_selection)
+        reasoning_log.deduplicated_nodes = duplicates_removed
+        reasoning_log.weak_backlinks_filtered = len(second_order_nodes) - len([n for n in final_selection if n.category == EvidenceCategory.SECOND_ORDER])
+
+        logger.info("Evidence selection: %d direct, %d first-order, %d second-order, "
+                    "%d perspective, %d bridge, %d global | %d deduplicated | %d final",
+                    len(direct), len(first), len(second), len(persp), len(bridge), len(glob),
+                    duplicates_removed, len(final_selection))
+
+        return final_selection
+
+    def _compute_relationship_score(
+        self,
+        node_canon: str,
+        entity_names: List[str],
+        perspective_norm: str,
+        source_countries: Set[str],
+    ) -> float:
+        """Score a node's relationship relevance to the event."""
+        meta = self.node_metadata.get(node_canon, {})
+        content = self.node_content.get(node_canon, "").lower()
+        score = 0.0
+
+        # Entity name matches in content
+        for name in entity_names:
+            name_lower = name.lower()
+            if name_lower in content:
+                score += 0.3
+            canon_name = self._canonicalize(name)
+            if canon_name in self._canonicalize(meta.get("summary", "")):
+                score += 0.2
+
+        # Country match
+        node_country = meta.get("country", "").lower()
+        if node_country in source_countries:
+            score += 0.25
+        if node_country == perspective_norm:
+            score += 0.15
+
+        # Type relevance (actors, infrastructure, policy are more relevant)
+        node_type = meta.get("type", "").lower()
+        if node_type in ("government_agency", "government_ministry", "private_conglomerate"):
+            score += 0.1
+
+        # Content richness (more content = more evidence)
+        if len(content) > 1000:
+            score += 0.05
+
+        return min(score, 1.0)
+
+    @staticmethod
+    def _summary_similarity(a: str, b: str) -> float:
+        """Simple Jaccard similarity on word sets for near-duplicate detection."""
+        if not a or not b:
+            return 0.0
+        words_a = set(re.findall(r'\b\w+\b', a.lower()))
+        words_b = set(re.findall(r'\b\w+\b', b.lower()))
+        if not words_a or not words_b:
+            return 0.0
+        intersection = words_a & words_b
+        union = words_a | words_b
+        return len(intersection) / len(union)
+
+    def build_node_context_block(self, node: ScoredNode, max_chars: int = 2000) -> str:
+        """Build a structured context block for a single node."""
+        content = node.content[:max_chars]
+        if len(node.content) > max_chars:
+            content += "\n[CONTENT TRUNCATED FOR TOKEN BUDGET]"
+
+        lines = [
+            f"=== NODE: {node.node_id} ===",
+            f"Type: {node.node_type or 'unknown'} | Country: {node.country or 'N/A'} | Sector: {node.sector or 'N/A'}",
+            f"Relevance: {node.composite_score:.2f} | Category: {node.category.value} | Distance: {node.backlink_distance}",
+            f"Selection reason: {node.selection_reason}",
+            f"Source entities: {', '.join(node.source_entities) or 'N/A'}",
+            "---",
+            content,
+            "=== END NODE ===",
+        ]
+        return "\n".join(lines)
+
+    def build_cross_border_bridge_context(
+        self,
+        perspective: PerspectiveContext,
+        source_country: str,
+    ) -> List[Dict[str, Any]]:
+        """Find cross-border bridges between perspective and source country."""
         perspective_norm = perspective.country.lower()
         source_norm = source_country.lower()
         bridges: List[Dict[str, Any]] = []
 
-        # DETERMINISTIC: iterate sorted by canonical stem
-        for canonical_stem in sorted(self.file_map.keys()):
-            actual_stem = self.file_map[canonical_stem]
-            meta = self.node_metadata.get(canonical_stem, {})
-            node_country = (meta.get("country") or "").lower()
-
-            # Only process nodes from either perspective or source country
+        for canon, meta in sorted(self.node_metadata.items()):
+            node_country = meta.get("country", "").lower()
             if node_country not in (perspective_norm, source_norm):
                 continue
 
-            content = self.read_entity(actual_stem)
-            links = re.findall(r"\[\[(.*?)\]\]", content)
+            actual = self.file_map.get(canon, canon)
+            for link_target in self.outbound_links.get(canon, []):
+                link_canon = self._canonicalize(link_target)
+                link_meta = self.node_metadata.get(link_canon, {})
+                link_country = link_meta.get("country", "").lower()
 
-            for link in links:
-                link_clean = link.split("|")[0].strip()
-                link_canonical = self._canonicalize(link_clean)
-                if link_canonical not in self.file_map:
-                    continue
-
-                link_meta = self.node_metadata.get(link_canonical, {})
-                link_country = (link_meta.get("country") or "").lower()
-
-                # Check if this link crosses between perspective and source countries
                 if node_country == perspective_norm and link_country == source_norm:
                     bridges.append({
-                        "from_node": actual_stem,
+                        "from_node": actual,
                         "from_country": perspective.country,
-                        "to_node": self.file_map[link_canonical],
+                        "to_node": self.file_map.get(link_canon, link_target),
                         "to_country": source_country,
                         "relationship_type": "outbound_link",
                     })
                 elif node_country == source_norm and link_country == perspective_norm:
                     bridges.append({
-                        "from_node": actual_stem,
+                        "from_node": actual,
                         "from_country": source_country,
-                        "to_node": self.file_map[link_canonical],
+                        "to_node": self.file_map.get(link_canon, link_target),
                         "to_country": perspective.country,
                         "relationship_type": "outbound_link",
                     })
 
-        # Also check backlinks — DETERMINISTIC: sort keys
-        for canonical_stem in sorted(self.file_map.keys()):
-            actual_stem = self.file_map[canonical_stem]
-            meta = self.node_metadata.get(canonical_stem, {})
-            node_country = (meta.get("country") or "").lower()
-            if node_country != perspective_norm:
-                continue
+            # Backlinks
+            for inbound in self.backlink_map.get(canon, set()):
+                inbound_canon = self._canonicalize(inbound)
+                inbound_meta = self.node_metadata.get(inbound_canon, {})
+                inbound_country = inbound_meta.get("country", "").lower()
 
-            inbound_stems = self.backlink_map.get(canonical_stem, set())
-            for inbound in sorted(inbound_stems):
-                inbound_canonical = self._canonicalize(inbound)
-                inbound_meta = self.node_metadata.get(inbound_canonical, {})
-                inbound_country = (inbound_meta.get("country") or "").lower()
-                if inbound_country == source_norm:
+                if node_country == perspective_norm and inbound_country == source_norm:
                     bridges.append({
                         "from_node": inbound,
                         "from_country": source_country,
-                        "to_node": actual_stem,
+                        "to_node": actual,
                         "to_country": perspective.country,
                         "relationship_type": "backlink",
                     })
+                elif node_country == source_norm and inbound_country == perspective_norm:
+                    bridges.append({
+                        "from_node": inbound,
+                        "from_country": perspective.country,
+                        "to_node": actual,
+                        "to_country": source_country,
+                        "relationship_type": "backlink",
+                    })
 
-        logger.info("Found %d cross-border bridges between %s and %s", len(bridges), perspective.country, source_country)
-        return bridges
+        return sorted(bridges, key=lambda b: (b.get("from_node", ""), b.get("to_node", "")))
 
-    # -- Global Database Indexer -------------------------------------------- #
-    def build_global_database_context(self, explicit_names: set[str]) -> str:
-        """
-        Builds a lightweight structural registry of all remaining nodes in the database
-        to ensure background assets are available for pattern matching.
-        """
-        global_parts: List[str] = []
-        canonical_explicits = {self._canonicalize(name) for name in explicit_names}
-
-        # DETERMINISTIC: iterate sorted by canonical stem
-        for canonical_stem in sorted(self.file_map.keys()):
-            if canonical_stem in canonical_explicits:
-                continue
-
-            actual_stem = self.file_map[canonical_stem]
-            meta = self.node_metadata.get(canonical_stem, {})
-            summary = meta.get("summary", "")
-
-            # Verify file exists before including (handles stale index entries)
-            rel_path = meta.get("path", f"{actual_stem}.md")
-            full_path = self.vault_dir / rel_path
-            if not full_path.exists():
-                # Try rglob fallback
-                found = list(self.vault_dir.rglob(f"{actual_stem}.md"))
-                if not found:
-                    logger.debug("Skipping stale index entry: %s", actual_stem)
-                    continue
-                # Update stored path
-                meta["path"] = str(found[0].relative_to(self.vault_dir))
-
-            metadata_str = f"- **{actual_stem}**"
-            if meta.get("country"):
-                metadata_str += f" [country: {meta['country']}]"
-            if meta.get("type"):
-                metadata_str += f" [type: {meta['type']}]"
-            if summary:
-                metadata_str += f" -> Context: {summary}"
-
-            global_parts.append(metadata_str)
-
-        if not global_parts:
-            return "No additional background nodes detected."
-        return "\n".join(global_parts)
-
-    # -- Graph Context Builder ---------------------------------------------- #
-    def build_graph_context(self, entities: List[Dict[str, str]], perspective: PerspectiveContext) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """
-        Process explicit entities using the new fuzzy-matching and backlink injection engine.
-        Also retrieves perspective-side nodes and cross-border bridges.
-        Returns: (combined_context, perspective_nodes, cross_border_bridges)
-        """
-        context_parts: List[str] = []
-        handled_canonical_names: set[str] = set()
-
-        for entity in entities:
-            name = entity.get("name", "").strip()
-            classification = entity.get("class", "").strip()
-            if not name:
-                continue
-
-            canonical = self._canonicalize(name)
-            handled_canonical_names.add(canonical)
-
-            if self.entity_exists(name):
-                # Pull forward links AND inbound backlinks
-                node_context = self.crawl_node_network(name)
-                context_parts.append(
-                    f"\n=== MATCHED EXISTING NODE: {self.file_map[canonical]} ===\n{node_context}"
-                )
-            else:
-                # Shadow node provisioning REMOVED per requirements
-                context_parts.append(
-                    f"\n=== UNMATCHED ENTITY: {name} ===\n"
-                    f"Entity not found in vault. No shadow node created."
-                )
-
-        # Compile the remaining vault assets into the tracking registry
-        logger.info("Compiling global landscape index...")
-        global_landscape = self.build_global_database_context(handled_canonical_names)
-
-        context_parts.append(
-            f"\n=== GLOBAL SYSTEM GRAPH DATABASE MATRIX ===\n"
-            f"Use the following existing database structure to cross-reference constraints. "
-            f"Pay special attention to unmentioned downstream assets that are bound by backlinks to the primary constraints:\n"
-            f"{global_landscape}"
-        )
-
-        source_context = "\n".join(context_parts)
-
-        # Retrieve perspective-side nodes
-        perspective_nodes = self.get_perspective_nodes(perspective)
-
-        # Determine source country from entities (best effort)
-        source_country = ""
-        for entity in entities:
-            ctx = entity.get("context", "").lower()
-            if "zambia" in ctx:
-                source_country = "Zambia"
-                break
-            elif "zimbabwe" in ctx:
-                source_country = "Zimbabwe"
-                break
-
-        # If we couldn't infer from entities, try to find any non-perspective country in the source context
-        if not source_country:
-            source_country = perspective.country  # fallback for domestic analysis
-
-        # Retrieve cross-border bridges
-        cross_border_bridges = []
-        if source_country.lower() != perspective.country.lower():
-            cross_border_bridges = self.get_cross_border_bridges(perspective, source_country)
-
-        # Build perspective context block
-        perspective_blocks: List[str] = []
-        perspective_blocks.append(f"\n=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ===")
-        # DETERMINISTIC: sort perspective nodes by node_id before capping
-        for pn in sorted(perspective_nodes, key=lambda x: x["node_id"])[:30]:  # Cap for token budget
-            perspective_blocks.append(
-                f"- {pn['node_id']} | type: {pn['type']} | summary: {pn['summary'][:100]}"
-            )
-
-        if cross_border_bridges:
-            perspective_blocks.append(f"\n=== CROSS-BORDER BRIDGE CONTEXT ({perspective.country} ↔ {source_country}) ===")
-            # DETERMINISTIC: sort bridges before capping
-            for bridge in sorted(cross_border_bridges, key=lambda b: (b["from_node"], b["to_node"]))[:20]:  # Cap for token budget
-                perspective_blocks.append(
-                    f"- {bridge['from_node']} ({bridge['from_country']}) → {bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
-                )
-        else:
-            perspective_blocks.append(f"\n=== CROSS-BORDER BRIDGE CONTEXT ===\nNo evidenced cross-border relationships found between {perspective.country} and {source_country}.")
-
-        combined_context = source_context + "\n" + "\n".join(perspective_blocks)
-
-        return combined_context, perspective_nodes, cross_border_bridges
 
 # --------------------------------------------------------------------------- #
-# LLM Pipeline Wrapper
+# System Prompts
 # --------------------------------------------------------------------------- #
-class LLMPipeline:
+PROMPT_STAGE_1_EXTRACTOR: str = (
+    "You are the Entity Extraction Module for an economic intelligence pipeline. "
+    "Your sole objective is to extract entities from the provided text and classify them into a strict schema. "
+    "Do not analyze or interpret the text.\n"
+    "CLASSIFICATION SCHEMA:\n"
+    "- [MINING_REFINERY]: Processing plants, smelters, concentrators.\n"
+    "- [PRIVATE_CONGLOMERATE]: Mining companies, logistics firms, tech providers.\n"
+    "- [GOVERNMENT_AGENCY]: Regulatory bodies, state-owned enterprises, councils.\n"
+    "- [GOVERNMENT_MINISTRY]: Sovereign ministries.\n"
+    "- [ACADEMIC_INSTITUTION]: Universities, polytechnics, research labs.\n"
+    "- [INFRASTRUCTURE_NODE]: Power plants, dams, railways, ports, specific laboratories.\n"
+    "- [COMMODITY]: Specific raw or processed materials (e.g., Lithium Ore, Sulfuric Acid).\n"
+    "- [POLICY_FRAMEWORK]: Laws, bans, official state initiatives.\n\n"
+    "OUTPUT INSTRUCTIONS:\n"
+    "Output ONLY valid raw JSON. Do not wrap the response in markdown blocks (```json).\n"
+    "JSON SCHEMA:\n"
+    "{\n"
+    '  "entities": [\n'
+    '    {"name": "Exact Name", "class": "[SCHEMA_CLASS]", "context": "Sentence explaining action."}\n'
+    "  ],\n"
+    '  "core_event": "String summarizing the article main event.",\n'
+    '  "source_country": "Country where the event occurred (infer from text)",\n'
+    '  "event_country": "Country where the underlying development occurred (infer from text)"\n'
+    "}"
+)
+
+PROMPT_EVIDENCE_ANALYSIS: str = (
+    "You are the ATIS Evidence Analysis Module. You will analyze a subset of evidence nodes "
+    "related to a news event. Your task is to extract structured findings, identify relationships, "
+    "and flag potential opportunities and risks.\n\n"
+    "OUTPUT SCHEMA (raw JSON only):\n"
+    "{\n"
+    '  "findings": [\n'
+    '    {"finding": "Precise statement", "confidence": 0.85, "supporting_nodes": ["NodeID"], "category": "economic|political|infrastructure|regulatory"}\n'
+    "  ],\n"
+    '  "relationships": [\n'
+    '    {"from": "NodeA", "to": "NodeB", "relationship": "regulates|funds|operates|supplies", "evidence": "quote or reasoning"}\n'
+    "  ],\n"
+    '  "opportunity_signals": [\n'
+    '    {"signal": "Description", "confidence": 0.72, "type": "explicit|derived|potential", "supporting_nodes": ["NodeID"], "rationale": "Why this is an opportunity"}\n'
+    "  ],\n"
+    '  "risk_signals": [\n'
+    '    {"signal": "Description", "confidence": 0.65, "severity": "high|medium|low", "supporting_nodes": ["NodeID"]}\n'
+    "  ],\n"
+    '  "key_entities": ["NodeID1", "NodeID2"],\n'
+    '  "gaps": ["What information is missing"]\n'
+    "}\n\n"
+    "RULES:\n"
+    "1. Every finding MUST cite supporting_nodes from the provided evidence.\n"
+    "2. Do NOT invent facts not present in the evidence.\n"
+    "3. Confidence scores must be justified by evidence quality.\n"
+    "4. Distinguish: EXPLICIT (source states it), DERIVED (reasonable inference), POTENTIAL (plausible but weak).\n"
+    "5. Output ONLY raw JSON."
+)
+
+PROMPT_RELATIONSHIP_SYNTHESIS: str = (
+    "You are the ATIS Relationship Synthesis Module. You will receive intermediate findings "
+    "from multiple evidence partitions. Your task is to synthesize cross-partition relationships, "
+    "resolve contradictions, and identify the most important patterns.\n\n"
+    "OUTPUT SCHEMA (raw JSON only):\n"
+    "{\n"
+    '  "synthesized_findings": [\n'
+    '    {"finding": "...", "confidence": 0.88, "supporting_partitions": [1, 3], "supporting_nodes": ["NodeID"]}\n'
+    "  ],\n"
+    '  "cross_relationships": [\n'
+    '    {"from_partition": 1, "to_partition": 2, "relationship": "...", "nodes": ["NodeA", "NodeB"]}\n'
+    "  ],\n"
+    '  "contradictions": [\n'
+    '    {"partitions": [1, 2], "description": "...", "resolution": "..."}\n'
+    "  ],\n"
+    '  "consolidated_opportunities": [\n'
+    '    {"title": "...", "type": "explicit|derived|potential", "confidence": 0.75, "supporting_nodes": ["NodeID"], "rationale": "..."}\n'
+    "  ],\n"
+    '  "consolidated_risks": [\n'
+    '    {"description": "...", "severity": "high|medium|low", "supporting_nodes": ["NodeID"]}\n'
+    "  ],\n"
+    '  "key_themes": ["theme1", "theme2"]\n'
+    "}\n\n"
+    "RULES:\n"
+    "1. Preserve all source node references.\n"
+    "2. Resolve contradictions explicitly — do not ignore them.\n"
+    "3. Consolidate duplicate opportunity signals into the strongest single entry.\n"
+    "4. Output ONLY raw JSON."
+)
+
+PROMPT_FINAL_SYNTHESIS: str = (
+    "You are the ATIS Final Synthesis Engine. You will receive distilled findings, "
+    "relationship discoveries, and opportunity/risk signals from prior reasoning stages. "
+    "Your task is to produce the final ATIS News analytical dashboard.\n\n"
+    "CRITICAL RULES:\n"
+    "1. You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. Do not invent actors.\n"
+    "2. You MUST select perspective_capability from the capabilities listed for that actor.\n"
+    "3. You MUST select pathway from the CROSS-BORDER BRIDGE CONTEXT or from: "
+    "export, procurement, supplier relationship, regional tender, joint venture, partnership, "
+    "investment, financing, logistics, professional services, technology transfer, "
+    "regional infrastructure, power trade, regulatory arbitrage, market entry.\n"
+    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists.\n"
+    "5. Distinguish local source-country opportunities from perspective-country opportunities.\n"
+    "6. Opportunity detection: EXPLICIT (source states it), DERIVED (evidence supports it), POTENTIAL (plausible but weak).\n"
+    "7. Do NOT force opportunities. If no defensible opportunity exists, return an empty opportunities array.\n"
+    "8. Every opportunity MUST have supporting_nodes from the provided evidence.\n"
+    "9. Output ONLY valid raw JSON.\n\n"
+    "JSON SCHEMA:\n"
+    "{\n"
+    '  "intelligence_id": "ATIS-INT-GENERIC",\n'
+    '  "trigger_event": "String",\n'
+    '  "market_equilibrium_shift": "String",\n'
+    '  "source_country": "String",\n'
+    '  "event_country": "String",\n'
+    '  "executive_summary": "6-10 sentence comprehensive narrative...",\n'
+    '  "structured_intelligence": [\n'
+    "    {\n"
+    '      "entity": "Entity Name", "type": "entity_type", "country": "...", "relationship": "...",\n'
+    '      "status": "...", "priority": "Critical|High|Medium|Low", "insight": "...", "source_node": "NodeID"\n'
+    "    }\n"
+    "  ],\n"
+    '  "findings": [\n'
+    '    {"text": "Finding.", "source_nodes": ["NodeID"]}\n'
+    "  ],\n"
+    '  "opportunities": [\n'
+    "    {\n"
+    '      "opportunity_id": "OPP-...", "title": "...", "type": "String",\n'
+    '      "perspective_country": "...", "perspective_country_code": "...",\n'
+    '      "source_country": "...", "event_country": "...", "opportunity_country": "...",\n'
+    '      "cross_border": true, "cross_border_countries": ["..."],\n'
+    '      "perspective_actor": "MUST be from registry", "perspective_capability": "MUST be evidenced",\n'
+    '      "pathway": "MUST be evidenced", "urgency_score": 0.0, "feasibility_score": 0.0,\n'
+    '      "required_missing_nodes": [], "capital_flow": {"beneficiary": "...", "likely_funder": "..."},\n'
+    '      "justification": "...", "source_nodes": ["NodeID"],\n'
+    '      "opportunity_type": "explicit|derived|potential", "opportunity_confidence": 0.0\n'
+    "    }\n"
+    "  ],\n"
+    '  "risks": [\n'
+    '    {"text": "Risk.", "source_nodes": ["NodeID"], "severity": "high|medium|low"}\n'
+    "  ],\n"
+    '  "key_entities": [\n'
+    "    {\n"
+    '      "entity_name": "...", "entity_type": "...", "country": "...", "sector": "...",\n'
+    '      "significance_score": 9, "summary": "...", "source_node": "NodeID"\n'
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+
+PROMPT_SINGLE_STAGE_ANALYSIS: str = (
+    "You are the ATIS Equilibrium and Constraint Engine. Analyze the provided news event "
+    "and evidence to produce a complete intelligence dashboard.\n\n"
+    "CRITICAL RULES:\n"
+    "1. You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY.\n"
+    "2. You MUST select perspective_capability from the capabilities listed for that actor.\n"
+    "3. You MUST select pathway from the CROSS-BORDER BRIDGE CONTEXT or enumerated list.\n"
+    "4. You MUST set opportunity_country to the actual country where the commercial opportunity exists.\n"
+    "5. Distinguish: EXPLICIT, DERIVED, and POTENTIAL opportunities with different confidence levels.\n"
+    "6. Do NOT force opportunities — return empty array if none are defensible.\n"
+    "7. Every claim MUST cite source_node IDs from the provided evidence.\n"
+    "8. Output ONLY valid raw JSON.\n\n"
+    "Use the same JSON schema as the Final Synthesis prompt above."
+)
+
+
+# --------------------------------------------------------------------------- #
+# News LLM Orchestrator
+# --------------------------------------------------------------------------- #
+class NewsLLMOrchestrator:
     """
-    Encapsulates ATIS stage orchestration around the central LLM client.
+    Orchestrates LLM calls for the News pipeline with:
+      - Automatic token budget calculation against actual model capabilities
+      - Dynamic workload splitting (single-call vs multi-stage)
+      - Progressive evidence compression
+      - Evidence provenance preservation
+      - Failure safety (never exceeds provider context limit)
     """
 
     def __init__(self) -> None:
         self.client: LLMClient = get_client()
         self.config = self.client.config
-        self.token_budget: TokenBudget = TokenBudget()
+        self.budget = TokenBudgetManager(self.client.adapter.capabilities)
         self.cache = AnalysisCache()
+        self._call_count = 0
 
-    # -- Low-level API call with retries ------------------------------------ #
     def _model_output_cap(self) -> int:
-        return self.client.adapter.capabilities.max_output_tokens
+        return self.budget.max_output_tokens
 
     def _is_truncated(self, raw: str) -> bool:
         text = raw.strip()
@@ -841,21 +1376,51 @@ class LLMPipeline:
         if text[-1] not in {"}", "]", "\"", ">", "'"}:
             if not (text[-1].isdigit() or text[-1].lower() in {"e", "l"}):
                 return True
-        open_braces = text.count("{") - text.count("}")
-        open_brackets = text.count("[") - text.count("]")
-        if open_braces > 0 or open_brackets > 0:
-            return True
-        return False
+        # Structural check
+        stack: List[str] = []
+        in_string = False
+        escape = False
+        for ch in text:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                expected = "}" if stack[-1] == "{" else "]"
+                if ch == expected:
+                    stack.pop()
+        return in_string or bool(stack)
 
-    def _call_api(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
+    def _call_api(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int | None = None,
+        stage_name: str = "LLM call",
+    ) -> str:
         if max_tokens is None:
             max_tokens = 4096
         cap = self._model_output_cap()
         max_tokens = min(max_tokens, cap)
-        return self.client.chat([
+
+        # Pre-flight token safety check
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ], temperature=0.0, seed=42, max_tokens=max_tokens)
+        ]
+        input_tokens = self.budget.estimate_messages_tokens(messages)
+        self.budget.require_budget(input_tokens, max_tokens, stage_name)
+
+        self._call_count += 1
+        return self.client.chat(messages, temperature=0.0, seed=42, max_tokens=max_tokens)
 
     def _call_api_with_retry(
         self,
@@ -866,49 +1431,41 @@ class LLMPipeline:
     ) -> str:
         cap = self._model_output_cap()
         max_tokens = min(max_tokens, cap)
-        raw = self._call_api(system_prompt, user_prompt, max_tokens=max_tokens)
+        raw = self._call_api(system_prompt, user_prompt, max_tokens=max_tokens, stage_name=stage_name)
         if self._is_truncated(raw):
             retry_tokens = min(max_tokens * 2, cap)
             if retry_tokens > max_tokens:
                 logger.warning("%s truncated (len=%d). Retrying with %d tokens.", stage_name, len(raw), retry_tokens)
-                raw = self._call_api(system_prompt, user_prompt, max_tokens=retry_tokens)
+                raw = self._call_api(system_prompt, user_prompt, max_tokens=retry_tokens, stage_name=stage_name)
                 if self._is_truncated(raw):
                     logger.error("%s still truncated after retry.", stage_name)
             else:
                 logger.error("%s truncated at model cap (%d).", stage_name, cap)
         return raw
 
-    # -- Stage 1: Entity Extraction ----------------------------------------- #
-    def stage_1_extract(self, article_text: str) -> Dict[str, Any]:
-        """
-        Stage 1 — Send the article text to the Entity Extraction Module.
-        Returns a Python dict with 'entities', 'core_event', 'source_country', 'event_country'.
-        """
+    # ------------------------------------------------------------------ #
+    # Stage 1: Entity Extraction (always single call — article is input)
+    # ------------------------------------------------------------------ #
+    def stage_1_extract(self, article_text: str, reasoning_log: ReasoningLog) -> Dict[str, Any]:
         logger.info("=" * 60)
         logger.info("STAGE 1: ENTITY EXTRACTION")
         logger.info("=" * 60)
 
-        # Token guard
-        estimated = self.token_budget.estimate(
-            PROMPT_STAGE_1_EXTRACTOR + article_text
-        )
-        logger.info("Estimated Stage-1 input tokens: %d", estimated)
+        estimated = self.budget.estimate_tokens(PROMPT_STAGE_1_EXTRACTOR + article_text)
+        logger.info("Estimated Stage-1 input tokens: %d (budget: %d)", estimated, self.budget.usable_context_budget)
 
-        if estimated > self.token_budget.available_for_input:
-            max_chars = int(
-                self.token_budget.available_for_input * 3.2
-            ) - len(PROMPT_STAGE_1_EXTRACTOR)
-            article_text = article_text[:max_chars] + "\n[TRUNCATED]"
-            logger.warning(
-                "Article aggressively truncated to fit Stage-1 token budget."
-            )
+        if not self.budget.fits_in_budget(estimated, 2048):
+            max_chars = int((self.budget.usable_context_budget - 2048) * 3.2) - len(PROMPT_STAGE_1_EXTRACTOR)
+            article_text = article_text[:max(max_chars, 500)] + "\n[ARTICLE TRUNCATED TO RESPECT TOKEN BUDGET]"
+            logger.warning("Article truncated to fit Stage-1 token budget.")
 
-        raw_response = self._call_api(PROMPT_STAGE_1_EXTRACTOR, article_text)
+        raw_response = self._call_api(PROMPT_STAGE_1_EXTRACTOR, article_text, max_tokens=2048, stage_name="Stage 1")
         data = safe_json_loads(raw_response, stage_name="Stage 1")
 
         entity_count = len(data.get("entities", []))
+        reasoning_log.entities_extracted = entity_count
         logger.info(
-            "Stage 1 complete. Extracted %d entities. Core event: %s | Source: %s | Event: %s",
+            "Stage 1 complete. Extracted %d entities. Core: %s | Source: %s | Event: %s",
             entity_count,
             data.get("core_event", "N/A"),
             data.get("source_country", "N/A"),
@@ -916,99 +1473,524 @@ class LLMPipeline:
         )
         return data
 
-    # -- Stage 2: Constraint Solving ---------------------------------------- #
-    def stage_2_solve(
+    # ------------------------------------------------------------------ #
+    # Stage 2: Evidence Analysis (partitioned if needed)
+    # ------------------------------------------------------------------ #
+    def stage_2_analyze_evidence(
         self,
         article_text: str,
-        graph_context: str,
-        perspective: Any,
-    ) -> str:
+        evidence_partitions: List[EvidencePartition],
+        perspective: PerspectiveContext,
+        bridge_context: str,
+        perspective_registry: str,
+        reasoning_log: ReasoningLog,
+    ) -> List[Dict[str, Any]]:
         """
-        Stage 2 — Send the [NEW EVENT] + [GRAPH CONTEXT] to the
-        Equilibrium and Constraint Engine. Returns raw markdown analysis.
+        Analyze evidence partitions. Each partition gets its own LLM call.
+        Returns list of intermediate findings (one per partition).
         """
         logger.info("=" * 60)
-        logger.info("STAGE 2: CONSTRAINT SOLVING")
+        logger.info("STAGE 2: EVIDENCE ANALYSIS (%d partitions)", len(evidence_partitions))
         logger.info("=" * 60)
 
-        # Aggressive token management
-        article_text, graph_context = self.token_budget.truncate_payload(
-            PROMPT_STAGE_2_SOLVER, article_text, graph_context
+        partition_results: List[Dict[str, Any]] = []
+
+        for partition in evidence_partitions:
+            logger.info("Analyzing partition %d: %d nodes, ~%d tokens | theme: %s",
+                        partition.partition_id, len(partition.nodes), partition.estimated_tokens, partition.theme)
+
+            # Build evidence block
+            evidence_blocks = []
+            for node in partition.nodes:
+                block = self._build_evidence_block(node)
+                evidence_blocks.append(block)
+
+            evidence_text = "\n\n".join(evidence_blocks)
+
+            user_prompt = (
+                f"## NEWS EVENT\n{article_text[:2000]}\n\n"
+                f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
+                f"## PERSPECTIVE ACTOR REGISTRY\n{perspective_registry}\n\n"
+                f"## CROSS-BORDER BRIDGE CONTEXT\n{bridge_context}\n\n"
+                f"## EVIDENCE PARTITION {partition.partition_id}: {partition.theme}\n"
+                f"{evidence_text}\n\n"
+                f"Analyze this evidence partition and return structured findings."
+            )
+
+            estimated_input = self.budget.estimate_tokens(PROMPT_EVIDENCE_ANALYSIS + user_prompt)
+            logger.info("Partition %d estimated input: %d tokens", partition.partition_id, estimated_input)
+
+            raw = self._call_api_with_retry(
+                PROMPT_EVIDENCE_ANALYSIS,
+                user_prompt,
+                max_tokens=4096,
+                stage_name=f"Evidence Analysis P{partition.partition_id}",
+            )
+
+            try:
+                result = safe_json_loads(raw, stage_name=f"Evidence Analysis P{partition.partition_id}")
+            except RuntimeError as exc:
+                logger.error("Partition %d analysis failed: %s", partition.partition_id, exc)
+                result = {"findings": [], "relationships": [], "opportunity_signals": [],
+                          "risk_signals": [], "key_entities": [], "gaps": [str(exc)]}
+
+            result["_partition_id"] = partition.partition_id
+            result["_theme"] = partition.theme
+            partition_results.append(result)
+            reasoning_log.evidence_calls += 1
+
+        return partition_results
+
+    def _build_evidence_block(self, node: ScoredNode, max_chars: int = 1500) -> str:
+        content = node.content[:max_chars]
+        if len(node.content) > max_chars:
+            content += "\n[TRUNCATED]"
+        return (
+            f"--- NODE: {node.node_id} ---\n"
+            f"Type: {node.node_type or 'unknown'} | Country: {node.country or 'N/A'} | Sector: {node.sector or 'N/A'}\n"
+            f"Relevance: {node.composite_score:.2f} | Category: {node.category.value}\n"
+            f"Reason: {node.selection_reason}\n"
+            f"{content}\n"
+            f"--- END ---"
         )
 
-        user_payload = (
-            f"[ANALYTICAL PERSPECTIVE]: {perspective.country} ({perspective.country_code})\n"
-            "You MUST use only the actors and capabilities listed in the PERSPECTIVE ACTOR REGISTRY. "
-            "You MUST use only the pathways evidenced in the CROSS-BORDER BRIDGE CONTEXT. "
-            "Do not invent perspective-side actors, capabilities, or pathways.\n\n"
-            f"[NEW EVENT]:\n{article_text}\n\n"
-            f"[GRAPH CONTEXT]:\n{graph_context}"
-        )
-
-        estimated = self.token_budget.estimate(
-            PROMPT_STAGE_2_SOLVER + user_payload
-        )
-        logger.info("Final Stage-2 input token estimate: %d", estimated)
-
-        raw_analysis = self._call_api(PROMPT_STAGE_2_SOLVER, user_payload)
-        logger.info("Stage 2 complete. Analysis length: %d chars", len(raw_analysis))
-        return raw_analysis
-
-    # -- Stage 3: Dashboard Formatting -------------------------------------- #
-    def stage_3_format(
+    # ------------------------------------------------------------------ #
+    # Stage 3: Relationship Synthesis (if multi-partition)
+    # ------------------------------------------------------------------ #
+    def stage_3_synthesize_relationships(
         self,
-        stage_2_analysis: str,
-        graph_context: str,
-        perspective: Any,
+        partition_results: List[Dict[str, Any]],
+        perspective: PerspectiveContext,
+        reasoning_log: ReasoningLog,
     ) -> Dict[str, Any]:
-        """
-        Stage 3 — Send the Stage-2 markdown analysis + graph_context to the strict
-        data-serialisation module. Returns a structured dashboard JSON dict.
-        """
+        """Synthesize findings across partitions."""
         logger.info("=" * 60)
-        logger.info("STAGE 3: DASHBOARD FORMATTING")
+        logger.info("STAGE 3: RELATIONSHIP SYNTHESIS (%d partitions)", len(partition_results))
         logger.info("=" * 60)
 
-        combined_input = stage_2_analysis + "\n\n" + graph_context
-        estimated = self.token_budget.estimate(
-            PROMPT_STAGE_3_FORMATTER + combined_input
-        )
-        logger.info("Estimated Stage-3 input tokens: %d", estimated)
+        # Compress partition results into a synthesis prompt
+        compressed_partitions = []
+        for pr in partition_results:
+            pid = pr.get("_partition_id", 0)
+            findings = pr.get("findings", [])
+            relationships = pr.get("relationships", [])
+            opp_signals = pr.get("opportunity_signals", [])
+            risk_signals = pr.get("risk_signals", [])
 
-        if estimated > self.token_budget.available_for_input:
-            max_chars = int(
-                self.token_budget.available_for_input * 3.2
-            ) - len(PROMPT_STAGE_3_FORMATTER)
-            stage_2_analysis = (
-                stage_2_analysis[:max_chars] + "\n[ANALYSIS TRUNCATED]"
-            )
-            logger.warning(
-                "Stage-2 analysis truncated to fit Stage-3 token budget."
-            )
+            compressed = {
+                "partition_id": pid,
+                "theme": pr.get("_theme", ""),
+                "finding_count": len(findings),
+                "top_findings": [f["finding"] for f in findings[:5]],
+                "relationship_count": len(relationships),
+                "top_relationships": relationships[:5],
+                "opportunity_signals": [o["signal"] for o in opp_signals[:5]],
+                "risk_signals": [r["signal"] for r in risk_signals[:5]],
+                "key_entities": pr.get("key_entities", []),
+                "gaps": pr.get("gaps", []),
+            }
+            compressed_partitions.append(compressed)
+
+        partitions_json = json.dumps(compressed_partitions, indent=2, ensure_ascii=False)
 
         user_prompt = (
-            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n"
-            "You MUST select perspective_actor from the PERSPECTIVE ACTOR REGISTRY. "
-            "You MUST select perspective_capability from the capabilities listed for that actor. "
-            "You MUST select pathway from the enumerated list and ensure it is supported by the CROSS-BORDER BRIDGE CONTEXT. "
-            "You MUST set opportunity_country to the actual country where the commercial value exists. "
-            "Do NOT default opportunity_country to the perspective country. "
-            "Mark unsupported opportunities RESEARCH_REQUIRED.\n\n"
-            f"## GRAPH CONTEXT\n{graph_context}\n\n"
-            + stage_2_analysis
+            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
+            f"## INTERMEDIATE FINDINGS FROM {len(partition_results)} PARTITIONS\n"
+            f"{partitions_json}\n\n"
+            f"Synthesize cross-partition relationships, resolve contradictions, and consolidate opportunities."
         )
 
-        # IMPORTANT: _call_api_with_retry requires all four arguments.
-        # Keep this call explicit so Stage 3 cannot regress to the old 2-argument form.
-        raw_response = self._call_api_with_retry(
-            system_prompt=PROMPT_STAGE_3_FORMATTER,
-            user_prompt=user_prompt,
+        estimated = self.budget.estimate_tokens(PROMPT_RELATIONSHIP_SYNTHESIS + user_prompt)
+
+        # If still too large, compress further
+        if not self.budget.fits_in_budget(estimated, 4096):
+            logger.warning("Synthesis prompt too large (%d tokens). Compressing further.", estimated)
+            # Ultra-compressed: just counts and top items
+            ultra = []
+            for pr in partition_results:
+                ultra.append({
+                    "partition_id": pr.get("_partition_id", 0),
+                    "theme": pr.get("_theme", ""),
+                    "findings": [f["finding"] for f in pr.get("findings", [])[:3]],
+                    "opportunities": [o["signal"] for o in pr.get("opportunity_signals", [])[:3]],
+                    "risks": [r["signal"] for r in pr.get("risk_signals", [])[:3]],
+                })
+            user_prompt = (
+                f"## PERSPECTIVE: {perspective.country}\n"
+                f"## PARTITIONS: {json.dumps(ultra, ensure_ascii=False)}\n"
+                f"Synthesize and return JSON."
+            )
+            estimated = self.budget.estimate_tokens(PROMPT_RELATIONSHIP_SYNTHESIS + user_prompt)
+
+        raw = self._call_api_with_retry(
+            PROMPT_RELATIONSHIP_SYNTHESIS,
+            user_prompt,
             max_tokens=4096,
-            stage_name="Stage 3",
+            stage_name="Relationship Synthesis",
         )
-        dashboard = safe_json_loads(raw_response, stage_name="Stage 3")
-        logger.info("Stage 3 complete. Dashboard JSON generated.")
+
+        try:
+            result = safe_json_loads(raw, stage_name="Relationship Synthesis")
+        except RuntimeError as exc:
+            logger.error("Relationship synthesis failed: %s", exc)
+            result = {
+                "synthesized_findings": [],
+                "cross_relationships": [],
+                "contradictions": [],
+                "consolidated_opportunities": [],
+                "consolidated_risks": [],
+                "key_themes": [],
+            }
+
+        reasoning_log.synthesis_calls += 1
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Stage 4: Final Synthesis (always receives distilled intelligence)
+    # ------------------------------------------------------------------ #
+    def stage_4_final_synthesis(
+        self,
+        article_text: str,
+        distilled_findings: Dict[str, Any],
+        perspective: PerspectiveContext,
+        perspective_registry: str,
+        bridge_context: str,
+        reasoning_log: ReasoningLog,
+    ) -> Dict[str, Any]:
+        """Produce final dashboard from distilled findings."""
+        logger.info("=" * 60)
+        logger.info("STAGE 4: FINAL SYNTHESIS")
+        logger.info("=" * 60)
+
+        # Build distilled context (never the raw massive knowledge base)
+        distilled_text = json.dumps(distilled_findings, indent=2, ensure_ascii=False)
+
+        user_prompt = (
+            f"## NEWS EVENT\n{article_text[:1500]}\n\n"
+            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
+            f"## PERSPECTIVE ACTOR REGISTRY\n{perspective_registry}\n\n"
+            f"## CROSS-BORDER BRIDGE CONTEXT\n{bridge_context}\n\n"
+            f"## DISTILLED INTELLIGENCE\n"
+            f"{distilled_text}\n\n"
+            f"Produce the final ATIS News analytical dashboard."
+        )
+
+        estimated = self.budget.estimate_tokens(PROMPT_FINAL_SYNTHESIS + user_prompt)
+        logger.info("Final synthesis estimated input: %d tokens", estimated)
+
+        if not self.budget.fits_in_budget(estimated, 8192):
+            # Compress distilled findings further
+            logger.warning("Final synthesis too large. Compressing distilled findings.")
+            compressed = {
+                "synthesized_findings": distilled_findings.get("synthesized_findings", [])[:10],
+                "consolidated_opportunities": distilled_findings.get("consolidated_opportunities", [])[:10],
+                "consolidated_risks": distilled_findings.get("consolidated_risks", [])[:10],
+                "key_themes": distilled_findings.get("key_themes", []),
+                "contradictions": distilled_findings.get("contradictions", [])[:5],
+            }
+            user_prompt = (
+                f"## NEWS EVENT\n{article_text[:1000]}\n"
+                f"## PERSPECTIVE: {perspective.country}\n"
+                f"## BRIDGES: {bridge_context[:500]}\n"
+                f"## DISTILLED: {json.dumps(compressed, ensure_ascii=False)}\n"
+                f"Produce final dashboard JSON."
+            )
+            estimated = self.budget.estimate_tokens(PROMPT_FINAL_SYNTHESIS + user_prompt)
+
+        raw = self._call_api_with_retry(
+            PROMPT_FINAL_SYNTHESIS,
+            user_prompt,
+            max_tokens=8192,
+            stage_name="Final Synthesis",
+        )
+
+        dashboard = safe_json_loads(raw, stage_name="Final Synthesis")
+        reasoning_log.final_call = 1
+        logger.info("Final synthesis complete.")
         return dashboard
+
+    # ------------------------------------------------------------------ #
+    # Single-Stage Analysis (for small workloads)
+    # ------------------------------------------------------------------ #
+    def single_stage_analysis(
+        self,
+        article_text: str,
+        selected_nodes: List[ScoredNode],
+        perspective: PerspectiveContext,
+        perspective_registry: str,
+        bridge_context: str,
+        reasoning_log: ReasoningLog,
+    ) -> Dict[str, Any]:
+        """Single LLM call for small evidence sets."""
+        logger.info("=" * 60)
+        logger.info("SINGLE-STAGE ANALYSIS (%d nodes)", len(selected_nodes))
+        logger.info("=" * 60)
+
+        evidence_blocks = []
+        for node in selected_nodes:
+            evidence_blocks.append(self._build_evidence_block(node))
+
+        evidence_text = "\n\n".join(evidence_blocks)
+
+        user_prompt = (
+            f"## NEWS EVENT\n{article_text}\n\n"
+            f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
+            f"## PERSPECTIVE ACTOR REGISTRY\n{perspective_registry}\n\n"
+            f"## CROSS-BORDER BRIDGE CONTEXT\n{bridge_context}\n\n"
+            f"## EVIDENCE\n"
+            f"{evidence_text}\n\n"
+            f"Analyze the event and evidence. Produce the final ATIS News dashboard."
+        )
+
+        estimated = self.budget.estimate_tokens(PROMPT_SINGLE_STAGE_ANALYSIS + user_prompt)
+        logger.info("Single-stage estimated input: %d tokens (budget: %d)",
+                    estimated, self.budget.usable_context_budget)
+
+        if not self.budget.fits_in_budget(estimated, 8192):
+            raise LLMTokenLimitError(
+                f"Single-stage analysis exceeds budget ({estimated} > {self.budget.usable_context_budget}). "
+                f"This should have been caught earlier and switched to multi-stage."
+            )
+
+        raw = self._call_api_with_retry(
+            PROMPT_SINGLE_STAGE_ANALYSIS,
+            user_prompt,
+            max_tokens=8192,
+            stage_name="Single-Stage Analysis",
+        )
+
+        dashboard = safe_json_loads(raw, stage_name="Single-Stage Analysis")
+        reasoning_log.reasoning_mode = ReasoningMode.SINGLE.value
+        reasoning_log.final_call = 1
+        reasoning_log.total_llm_calls = reasoning_log.evidence_calls + reasoning_log.synthesis_calls + reasoning_log.final_call + 1  # +1 for stage 1
+        logger.info("Single-stage analysis complete.")
+        return dashboard
+
+
+# --------------------------------------------------------------------------- #
+# Evidence Partitioning
+# --------------------------------------------------------------------------- #
+def partition_evidence(
+    nodes: List[ScoredNode],
+    budget: TokenBudgetManager,
+    system_prompt: str,
+    article_text: str,
+    perspective_registry: str,
+    bridge_context: str,
+    max_nodes_per_partition: int = MAX_NODES_PER_PARTITION,
+) -> List[EvidencePartition]:
+    """
+    Partition selected evidence into thematically coherent groups that each
+    fit within the token budget. Returns partitions sorted by importance.
+    """
+    if not nodes:
+        return []
+
+    # Group nodes by sector for thematic coherence
+    sector_groups: Dict[str, List[ScoredNode]] = {}
+    for node in nodes:
+        sector = node.sector or "general"
+        if sector not in sector_groups:
+            sector_groups[sector] = []
+        sector_groups[sector].append(node)
+
+    # Sort groups by total composite score
+    sorted_sectors = sorted(
+        sector_groups.items(),
+        key=lambda item: sum(n.composite_score for n in item[1]),
+        reverse=True,
+    )
+
+    partitions: List[EvidencePartition] = []
+    current_partition_nodes: List[ScoredNode] = []
+    current_theme = ""
+    current_tokens = 0
+    partition_id = 0
+
+    # Base overhead: system prompt + article snippet + perspective + bridges
+    base_text = system_prompt + article_text[:1000] + perspective_registry + bridge_context
+    base_tokens = budget.estimate_tokens(base_text)
+    available_per_partition = budget.usable_context_budget - base_tokens - 4096  # reserve output
+
+    for sector, sector_nodes in sorted_sectors:
+        for node in sorted(sector_nodes, key=lambda n: n.composite_score, reverse=True):
+            node_block = _estimate_node_block_tokens(node)
+
+            if not current_partition_nodes:
+                current_theme = sector
+                current_partition_nodes.append(node)
+                current_tokens = node_block
+            elif (len(current_partition_nodes) < max_nodes_per_partition and
+                  current_tokens + node_block < available_per_partition):
+                current_partition_nodes.append(node)
+                current_tokens += node_block
+            else:
+                # Finalize current partition
+                partitions.append(EvidencePartition(
+                    partition_id=partition_id,
+                    nodes=list(current_partition_nodes),
+                    theme=current_theme,
+                    estimated_tokens=base_tokens + current_tokens,
+                ))
+                partition_id += 1
+
+                # Start new partition
+                current_partition_nodes = [node]
+                current_theme = sector
+                current_tokens = node_block
+
+    # Don't forget the last partition
+    if current_partition_nodes:
+        partitions.append(EvidencePartition(
+            partition_id=partition_id,
+            nodes=list(current_partition_nodes),
+            theme=current_theme,
+            estimated_tokens=base_tokens + current_tokens,
+        ))
+
+    # Cap partitions
+    if len(partitions) > MAX_PARTITIONS:
+        logger.warning("Too many partitions (%d). Merging smallest into largest.", len(partitions))
+        # Sort by importance (total score)
+        partitions.sort(key=lambda p: sum(n.composite_score for n in p.nodes), reverse=True)
+        merged = partitions[:MAX_PARTITIONS - 1]
+        remainder = []
+        for p in partitions[MAX_PARTITIONS - 1:]:
+            remainder.extend(p.nodes)
+        merged.append(EvidencePartition(
+            partition_id=MAX_PARTITIONS - 1,
+            nodes=remainder,
+            theme="mixed",
+            estimated_tokens=budget.estimate_tokens(system_prompt + "\n".join(n.summary for n in remainder)),
+        ))
+        partitions = merged
+
+    logger.info("Evidence partitioned into %d groups", len(partitions))
+    for p in partitions:
+        logger.info("  Partition %d: %d nodes, theme='%s', ~%d tokens",
+                    p.partition_id, len(p.nodes), p.theme, p.estimated_tokens)
+
+    return partitions
+
+
+def _estimate_node_block_tokens(node: ScoredNode) -> int:
+    """Estimate tokens for a single node's evidence block."""
+    content_len = min(len(node.content), 1500)
+    overhead = len(node.node_id) + len(node.node_type) + len(node.country) + len(node.sector) + 100
+    return TokenBudgetManager.estimate_tokens(node.content[:content_len]) + TokenBudgetManager.estimate_tokens(" " * overhead)
+
+
+# --------------------------------------------------------------------------- #
+# Context Builders
+# --------------------------------------------------------------------------- #
+def build_perspective_registry(
+    vault_manager: ObsidianVaultManager,
+    perspective: PerspectiveContext,
+    selected_nodes: List[ScoredNode],
+    max_nodes: int = MAX_PERSPECTIVE_NODES,
+) -> str:
+    """Build perspective actor registry from selected perspective nodes."""
+    perspective_nodes = [n for n in selected_nodes if n.category == EvidenceCategory.PERSPECTIVE]
+    perspective_nodes.sort(key=lambda n: n.composite_score, reverse=True)
+
+    lines = [f"=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ==="]
+    for node in perspective_nodes[:max_nodes]:
+        lines.append(
+            f"- {node.node_id} | type: {node.node_type or 'unknown'} | "
+            f"sector: {node.sector or 'N/A'} | summary: {node.summary[:120]}"
+        )
+
+    if not perspective_nodes:
+        lines.append(f"No perspective-country actors found in vault.")
+
+    return "\n".join(lines)
+
+
+def build_bridge_context(bridges: List[Dict[str, Any]], max_bridges: int = MAX_BRIDGE_NODES) -> str:
+    """Build cross-border bridge context string."""
+    if not bridges:
+        return "=== CROSS-BORDER BRIDGE CONTEXT ===\nNo evidenced cross-border relationships found."
+
+    lines = ["=== CROSS-BORDER BRIDGE CONTEXT ==="]
+    for bridge in bridges[:max_bridges]:
+        lines.append(
+            f"- {bridge['from_node']} ({bridge['from_country']}) → "
+            f"{bridge['to_node']} ({bridge['to_country']}) via {bridge['relationship_type']}"
+        )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Opportunity Post-Processing
+# --------------------------------------------------------------------------- #
+def post_process_opportunities(
+    dashboard: Dict[str, Any],
+    perspective: PerspectiveContext,
+    perspective_node_ids: Set[str],
+    cross_border_bridges: List[Dict[str, Any]],
+    source_country: str,
+    event_country: str,
+) -> List[Dict[str, Any]]:
+    """
+    Validate opportunities and assign explicit/derived/potential types with confidence.
+    """
+    raw_opportunities = dashboard.get("opportunities", [])
+    if not raw_opportunities:
+        return []
+
+    validated = []
+    for item in raw_opportunities:
+        if not isinstance(item, dict):
+            continue
+
+        # Run through atis_context validation
+        validated_item = validate_opportunity(
+            item,
+            perspective,
+            source_node_ids=None,
+            perspective_node_ids=perspective_node_ids,
+            cross_border_bridges=cross_border_bridges,
+        )
+
+        # Determine opportunity type and confidence
+        opp_type = item.get("opportunity_type", "")
+        opp_confidence = item.get("opportunity_confidence", 0.0)
+
+        if not opp_type:
+            # Infer from evidence
+            justification = item.get("justification", "").lower()
+            if any(w in justification for w in ["directly", "announced", "signed", "agreed", "awarded"]):
+                opp_type = OpportunityType.EXPLICIT.value
+                opp_confidence = max(opp_confidence, 0.85)
+            elif any(w in justification for w in ["could", "potential", "might", "may", "possible"]):
+                opp_type = OpportunityType.POTENTIAL.value
+                opp_confidence = min(opp_confidence, 0.55) if opp_confidence else 0.45
+            else:
+                opp_type = OpportunityType.DERIVED.value
+                opp_confidence = max(opp_confidence, 0.60) if opp_confidence else 0.65
+
+        validated_item["opportunity_type"] = opp_type
+        validated_item["opportunity_confidence"] = opp_confidence
+
+        # Stable ID
+        stable_id = compute_opportunity_identity(
+            title=validated_item.get("title", ""),
+            perspective_country=perspective.country,
+            source_country=validated_item.get("source_country", source_country),
+            event_country=validated_item.get("event_country", event_country),
+            opportunity_country=validated_item.get("opportunity_country", ""),
+            perspective_actor=validated_item.get("perspective_actor", ""),
+            perspective_capability=validated_item.get("perspective_capability", ""),
+            pathway=validated_item.get("pathway", ""),
+            source_nodes=validated_item.get("source_nodes", []),
+        )
+        validated_item["opportunity_id"] = stable_id
+        validated_item["stable_opportunity_id"] = stable_id
+
+        validated.append(validated_item)
+
+    return validated
+
 
 # --------------------------------------------------------------------------- #
 # Main Orchestration Entry Point
@@ -1018,28 +2000,32 @@ def process_article_pipeline(
     perspective: Any | None = None,
 ) -> Dict[str, Any]:
     """
-    Primary orchestration function for the ATIS pipeline.
+    Primary orchestration function for the ATIS News pipeline.
 
-    Parameters
-    ----------
-    article_path : str
-        Filesystem path to the plain-text news article.
+    Architecture:
+      1. Entity Extraction (single LLM call)
+      2. Intelligent Evidence Selection (backlink tracing + scoring + diversity)
+      3. Token Budget Calculation
+      4. Decision: Single-Call or Multi-Stage
+      5. [Single] Direct analysis → Final dashboard
+      6. [Multi] Evidence Partitioning → Parallel Analysis → 
+                Relationship Synthesis → Final Synthesis
+      7. Opportunity Validation + Output
 
-    Returns
-    -------
-    Dict[str, Any]
-        The final dashboard JSON payload, enriched with pipeline metadata.
+    The caller does NOT need to know how large the knowledge base is.
     """
     logger.info("=" * 70)
-    logger.info("ATIS PIPELINE INITIALISATION")
+    logger.info("ATIS NEWS PIPELINE INITIALISATION")
     logger.info("=" * 70)
+
     perspective = perspective or PerspectiveContext()
+    reasoning_log = ReasoningLog()
+
     logger.info("Article path      : %s", article_path)
     logger.info("Perspective       : %s (%s)", perspective.country, perspective.country_code)
     logger.info("Vault directory   : %s", VAULT_DIR.resolve())
-    logger.info("Dashboard directory: %s", DASHBOARDS_DIR.resolve())
-    logger.info("Model (primary)   : configured")
-    logger.info("Model (fallback)  : configured")
+    logger.info("Model context     : %d tokens", 
+                get_client().adapter.capabilities.max_context_tokens)
 
     # ------------------------------------------------------------------ #
     # 0. Load article
@@ -1062,12 +2048,12 @@ def process_article_pipeline(
     # ------------------------------------------------------------------ #
     vault_manager = ObsidianVaultManager()
     try:
-        pipeline = LLMPipeline()
+        orchestrator = NewsLLMOrchestrator()
     except ValueError as exc:
         logger.critical("%s", exc)
         raise
 
-    # Compute knowledge state for determinism
+    # Knowledge state for determinism
     knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
     knowledge_state.compute()
     knowledge_state_hash = knowledge_state.knowledge_state_hash
@@ -1076,7 +2062,7 @@ def process_article_pipeline(
     # 2. Stage 1 — Entity Extraction
     # ------------------------------------------------------------------ #
     try:
-        stage_1_result = pipeline.stage_1_extract(article_text)
+        stage_1_result = orchestrator.stage_1_extract(article_text, reasoning_log)
     except Exception as exc:
         logger.critical("STAGE 1 FAILED: %s", exc)
         raise
@@ -1087,36 +2073,132 @@ def process_article_pipeline(
     event_country: str = stage_1_result.get("event_country", source_country)
 
     if not entities:
-        logger.warning("No entities extracted; graph context will be empty.")
+        logger.warning("No entities extracted; analysis will rely on article text only.")
 
     # ------------------------------------------------------------------ #
-    # 3. Graph Processing Layer — WITH PERSPECTIVE RECONCILIATION
+    # 3. Intelligent Evidence Selection
     # ------------------------------------------------------------------ #
     logger.info("=" * 60)
-    logger.info("GRAPH PROCESSING LAYER — PERSPECTIVE RECONCILIATION")
+    logger.info("INTELLIGENT EVIDENCE SELECTION")
     logger.info("=" * 60)
 
-    graph_context, perspective_nodes, cross_border_bridges = vault_manager.build_graph_context(entities, perspective)
-    logger.info(
-        "Consolidated graph context built: %d characters | %d perspective nodes | %d cross-border bridges",
-        len(graph_context), len(perspective_nodes), len(cross_border_bridges),
+    selected_nodes = vault_manager.select_evidence_nodes(entities, perspective, reasoning_log)
+
+    # Build perspective registry and bridge context
+    perspective_registry = build_perspective_registry(vault_manager, perspective, selected_nodes)
+
+    # Determine source country for bridges
+    inferred_source = source_country or event_country or perspective.country
+    if not inferred_source:
+        for e in entities:
+            ctx = e.get("context", "").lower()
+            for country in COUNTRY_CODES:
+                if country in ctx:
+                    inferred_source = country.title()
+                    break
+            if inferred_source:
+                break
+
+    bridges = vault_manager.build_cross_border_bridge_context(perspective, inferred_source)
+    bridge_context = build_bridge_context(bridges)
+
+    perspective_node_ids = {n.node_id for n in selected_nodes if n.category == EvidenceCategory.PERSPECTIVE}
+
+    # ------------------------------------------------------------------ #
+    # 4. Token Budget Calculation & Mode Decision
+    # ------------------------------------------------------------------ #
+    logger.info("=" * 60)
+    logger.info("TOKEN BUDGET CALCULATION")
+    logger.info("=" * 60)
+
+    # Estimate single-stage input
+    single_stage_estimate = _estimate_single_stage_input(
+        article_text, selected_nodes, perspective_registry, bridge_context, orchestrator.budget
     )
+    reasoning_log.estimated_tokens = single_stage_estimate
+    reasoning_log.safe_budget = orchestrator.budget.usable_context_budget
 
-    # Build sets for deterministic validation
-    perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
+    logger.info("Single-stage estimate: %d tokens", single_stage_estimate)
+    logger.info("Safe budget: %d tokens", orchestrator.budget.usable_context_budget)
 
-    # Build evidence IDs for fingerprint
+    # Decision: single or multi-stage?
+    use_multi_stage = single_stage_estimate > orchestrator.budget.usable_context_budget
+
+    # ------------------------------------------------------------------ #
+    # 5. Execute Analysis
+    # ------------------------------------------------------------------ #
+    try:
+        if not use_multi_stage:
+            # Single-stage path
+            logger.info("MODE: SINGLE-STAGE REASONING")
+            reasoning_log.reasoning_mode = ReasoningMode.SINGLE.value
+            dashboard = orchestrator.single_stage_analysis(
+                article_text, selected_nodes, perspective, perspective_registry, bridge_context, reasoning_log
+            )
+        else:
+            # Multi-stage path
+            logger.info("MODE: MULTI-STAGE REASONING")
+            reasoning_log.reasoning_mode = ReasoningMode.MULTI_STAGE.value
+
+            # Partition evidence
+            partitions = partition_evidence(
+                selected_nodes,
+                orchestrator.budget,
+                PROMPT_EVIDENCE_ANALYSIS,
+                article_text,
+                perspective_registry,
+                bridge_context,
+            )
+            reasoning_log.partitions = len(partitions)
+
+            # Stage 2: Analyze each partition
+            partition_results = orchestrator.stage_2_analyze_evidence(
+                article_text, partitions, perspective, bridge_context, perspective_registry, reasoning_log
+            )
+
+            # Stage 3: Synthesize relationships
+            if len(partition_results) > 1:
+                synthesis = orchestrator.stage_3_synthesize_relationships(
+                    partition_results, perspective, reasoning_log
+                )
+            else:
+                # Only one partition — pass through
+                synthesis = {
+                    "synthesized_findings": partition_results[0].get("findings", []) if partition_results else [],
+                    "consolidated_opportunities": partition_results[0].get("opportunity_signals", []) if partition_results else [],
+                    "consolidated_risks": partition_results[0].get("risk_signals", []) if partition_results else [],
+                    "key_themes": [],
+                    "contradictions": [],
+                    "cross_relationships": [],
+                }
+
+            # Stage 4: Final synthesis
+            dashboard = orchestrator.stage_4_final_synthesis(
+                article_text, synthesis, perspective, perspective_registry, bridge_context, reasoning_log
+            )
+    except Exception as exc:
+        logger.critical("ANALYSIS FAILED: %s", exc)
+        raise
+
+    # ------------------------------------------------------------------ #
+    # 6. Enrich & Persist
+    # ------------------------------------------------------------------ #
+    # Post-process opportunities
+    validated_opportunities = post_process_opportunities(
+        dashboard, perspective, perspective_node_ids, bridges, source_country, event_country
+    )
+    dashboard["opportunities"] = validated_opportunities
+
+    # Compute fingerprint
     evidence_ids = sorted([e.get("name", "") for e in entities])
     entity_ids = sorted(list(set(
         [perspective.country, source_country, event_country] +
-        [pn["node_id"] for pn in perspective_nodes]
+        [n.node_id for n in selected_nodes]
     )))
     relationship_ids = sorted(list(set(
-        [b["from_node"] for b in cross_border_bridges] +
-        [b["to_node"] for b in cross_border_bridges]
+        [b["from_node"] for b in bridges] + [b["to_node"] for b in bridges]
     )))
 
-    # Compute analysis fingerprint after stage 1
     analysis_fingerprint = compute_analysis_fingerprint(
         story_id=core_event,
         perspective=perspective,
@@ -1125,69 +2207,12 @@ def process_article_pipeline(
         relationship_ids=[r for r in relationship_ids if r],
         knowledge_state_hash=knowledge_state_hash,
     )
-    logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
 
-    # ------------------------------------------------------------------ #
-    # 4. Stage 2 — Constraint Solving (with cache check)
-    # ------------------------------------------------------------------ #
-    # Check cache before stage 2
-    cached_dashboard = pipeline.cache.get(analysis_fingerprint)
-    if cached_dashboard is not None:
-        logger.info("Cache HIT for fingerprint %s. Returning cached dashboard.", analysis_fingerprint)
-        dashboard_payload = cached_dashboard
-    else:
-        logger.info("Cache MISS for fingerprint %s. Running stages 2 and 3.", analysis_fingerprint)
-        try:
-            stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
-        except Exception as exc:
-            logger.critical("STAGE 2 FAILED: %s", exc)
-            raise
-
-        # ------------------------------------------------------------------ #
-        # 5. Stage 3 — Dashboard Formatting (receives stage 2 output + graph_context)
-        # ------------------------------------------------------------------ #
-        try:
-            dashboard_payload = pipeline.stage_3_format(stage_2_analysis, graph_context, perspective)
-        except Exception as exc:
-            logger.critical("STAGE 3 FAILED: %s", exc)
-            raise
-
-        # Store in cache after dashboard build
-        pipeline.cache.set(analysis_fingerprint, dashboard_payload)
-
-    # ------------------------------------------------------------------ #
-    # 6. Enrich & Persist — WITH DETERMINISTIC VALIDATION
-    # ------------------------------------------------------------------ #
-    dashboard_payload["perspective"] = perspective.as_dict()
-    dashboard_payload["source_country"] = source_country
-    dashboard_payload["event_country"] = event_country
-
-    validated_opportunities = []
-    for item in dashboard_payload.get("opportunities", []):
-        if isinstance(item, dict):
-            validated = validate_opportunity(
-                item,
-                perspective,
-                source_node_ids=None,  # In news pipeline, source nodes are the extracted entities
-                perspective_node_ids=perspective_node_ids,
-                cross_border_bridges=cross_border_bridges,
-            )
-            # Replace sequential ID with stable ID
-            stable_id = compute_opportunity_identity(
-                title=validated.get("title", ""),
-                perspective_country=perspective.country,
-                source_country=validated.get("source_country", ""),
-                event_country=validated.get("event_country", ""),
-                opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
-                perspective_actor=validated.get("perspective_actor", ""),
-            )
-            validated["opportunity_id"] = stable_id
-            validated["stable_opportunity_id"] = stable_id
-            validated_opportunities.append(validated)
-    dashboard_payload["opportunities"] = validated_opportunities
-
-    dashboard_payload["pipeline_metadata"] = {
+    # Build metadata
+    dashboard["perspective"] = perspective.as_dict()
+    dashboard["source_country"] = source_country
+    dashboard["event_country"] = event_country
+    dashboard["pipeline_metadata"] = {
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "source_article": str(article_file.resolve()),
         "extracted_entities_count": len(entities),
@@ -1196,23 +2221,25 @@ def process_article_pipeline(
         "event_country": event_country,
         "perspective_country": perspective.country,
         "perspective_country_code": perspective.country_code,
-        "perspective_nodes_found": len(perspective_nodes),
-        "cross_border_bridges_found": len(cross_border_bridges),
-        "model_primary": pipeline.config.model,
-        "model_fallback": pipeline.config.fallback_model,
+        "selected_evidence_nodes": len(selected_nodes),
+        "cross_border_bridges_found": len(bridges),
+        "model_primary": orchestrator.config.model,
+        "model_fallback": orchestrator.config.fallback_model,
         "analysis_version": ANALYSIS_VERSION,
         "schema_version": SCHEMA_VERSION,
         "analysis_fingerprint": analysis_fingerprint,
         "knowledge_state": knowledge_state.as_dict(),
+        "reasoning_log": reasoning_log.to_dict(),
     }
 
+    # Persist
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_filename = f"atis_dashboard_{timestamp}.json"
     output_path_file = DASHBOARDS_DIR / output_filename
 
     try:
         output_path_file.write_text(
-            json.dumps(dashboard_payload, indent=2, ensure_ascii=False),
+            json.dumps(dashboard, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
         logger.info("Dashboard persisted: %s", output_path_file.resolve())
@@ -1220,19 +2247,214 @@ def process_article_pipeline(
         logger.error("Failed to write dashboard JSON: %s", exc)
         raise
 
+    # Log reasoning tree
+    logger.info("\n%s", reasoning_log.log_tree())
+
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETE")
     logger.info("=" * 70)
 
-    return dashboard_payload
+    return dashboard
+
+
+def _estimate_single_stage_input(
+    article_text: str,
+    selected_nodes: List[ScoredNode],
+    perspective_registry: str,
+    bridge_context: str,
+    budget: TokenBudgetManager,
+) -> int:
+    """Estimate tokens for a single-stage analysis call."""
+    article_tokens = budget.estimate_tokens(article_text)
+    evidence_tokens = sum(budget.estimate_tokens(n.content[:1500]) for n in selected_nodes)
+    registry_tokens = budget.estimate_tokens(perspective_registry)
+    bridge_tokens = budget.estimate_tokens(bridge_context)
+    overhead = budget.estimate_tokens(PROMPT_SINGLE_STAGE_ANALYSIS) + SYSTEM_PROMPT_OVERHEAD * 4
+    return article_tokens + evidence_tokens + registry_tokens + bridge_tokens + overhead
+
+
+# --------------------------------------------------------------------------- #
+# Web Entry Point
+# --------------------------------------------------------------------------- #
+def run_news_pipeline(
+    article_text: str,
+    perspective: Any | None = None,
+) -> Dict[str, Any]:
+    """
+    Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
+
+    This is the same pipeline as process_article_pipeline but accepts text directly.
+    """
+    logger.info("=" * 70)
+    perspective = perspective or PerspectiveContext()
+    reasoning_log = ReasoningLog()
+
+    logger.info("ATIS NEWS PIPELINE (WEB) | Perspective: %s (%s)", perspective.country, perspective.country_code)
+    logger.info("=" * 70)
+
+    # Initialise
+    vault_manager = ObsidianVaultManager()
+    try:
+        orchestrator = NewsLLMOrchestrator()
+    except ValueError as exc:
+        logger.critical("%s", exc)
+        raise
+
+    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
+    knowledge_state.compute()
+    knowledge_state_hash = knowledge_state.knowledge_state_hash
+
+    # Stage 1
+    try:
+        stage_1_result = orchestrator.stage_1_extract(article_text, reasoning_log)
+    except Exception as exc:
+        logger.critical("STAGE 1 FAILED: %s", exc)
+        raise
+
+    entities = stage_1_result.get("entities", [])
+    core_event = stage_1_result.get("core_event", "Unknown event")
+    source_country = stage_1_result.get("source_country", "")
+    event_country = stage_1_result.get("event_country", source_country)
+
+    # Evidence selection
+    selected_nodes = vault_manager.select_evidence_nodes(entities, perspective, reasoning_log)
+    perspective_registry = build_perspective_registry(vault_manager, perspective, selected_nodes)
+
+    inferred_source = source_country or event_country or perspective.country
+    if not inferred_source:
+        for e in entities:
+            ctx = e.get("context", "").lower()
+            for country in COUNTRY_CODES:
+                if country in ctx:
+                    inferred_source = country.title()
+                    break
+            if inferred_source:
+                break
+
+    bridges = vault_manager.build_cross_border_bridge_context(perspective, inferred_source)
+    bridge_context = build_bridge_context(bridges)
+    perspective_node_ids = {n.node_id for n in selected_nodes if n.category == EvidenceCategory.PERSPECTIVE}
+
+    # Budget & decision
+    single_stage_estimate = _estimate_single_stage_input(
+        article_text, selected_nodes, perspective_registry, bridge_context, orchestrator.budget
+    )
+    reasoning_log.estimated_tokens = single_stage_estimate
+    reasoning_log.safe_budget = orchestrator.budget.usable_context_budget
+    use_multi_stage = single_stage_estimate > orchestrator.budget.usable_context_budget
+
+    # Execute
+    try:
+        if not use_multi_stage:
+            reasoning_log.reasoning_mode = ReasoningMode.SINGLE.value
+            dashboard = orchestrator.single_stage_analysis(
+                article_text, selected_nodes, perspective, perspective_registry, bridge_context, reasoning_log
+            )
+        else:
+            reasoning_log.reasoning_mode = ReasoningMode.MULTI_STAGE.value
+            partitions = partition_evidence(
+                selected_nodes, orchestrator.budget, PROMPT_EVIDENCE_ANALYSIS,
+                article_text, perspective_registry, bridge_context,
+            )
+            reasoning_log.partitions = len(partitions)
+
+            partition_results = orchestrator.stage_2_analyze_evidence(
+                article_text, partitions, perspective, bridge_context, perspective_registry, reasoning_log
+            )
+
+            if len(partition_results) > 1:
+                synthesis = orchestrator.stage_3_synthesize_relationships(
+                    partition_results, perspective, reasoning_log
+                )
+            else:
+                synthesis = {
+                    "synthesized_findings": partition_results[0].get("findings", []) if partition_results else [],
+                    "consolidated_opportunities": partition_results[0].get("opportunity_signals", []) if partition_results else [],
+                    "consolidated_risks": partition_results[0].get("risk_signals", []) if partition_results else [],
+                    "key_themes": [],
+                    "contradictions": [],
+                    "cross_relationships": [],
+                }
+
+            dashboard = orchestrator.stage_4_final_synthesis(
+                article_text, synthesis, perspective, perspective_registry, bridge_context, reasoning_log
+            )
+    except Exception as exc:
+        logger.critical("ANALYSIS FAILED: %s", exc)
+        raise
+
+    # Post-process
+    validated_opportunities = post_process_opportunities(
+        dashboard, perspective, perspective_node_ids, bridges, source_country, event_country
+    )
+    dashboard["opportunities"] = validated_opportunities
+
+    # Fingerprint
+    evidence_ids = sorted([e.get("name", "") for e in entities])
+    entity_ids = sorted(list(set(
+        [perspective.country, source_country, event_country] +
+        [n.node_id for n in selected_nodes]
+    )))
+    relationship_ids = sorted(list(set(
+        [b["from_node"] for b in bridges] + [b["to_node"] for b in bridges]
+    )))
+
+    analysis_fingerprint = compute_analysis_fingerprint(
+        story_id=core_event,
+        perspective=perspective,
+        evidence_ids=[e for e in evidence_ids if e],
+        entity_ids=[e for e in entity_ids if e],
+        relationship_ids=[r for r in relationship_ids if r],
+        knowledge_state_hash=knowledge_state_hash,
+    )
+
+    dashboard["perspective"] = perspective.as_dict()
+    dashboard["source_country"] = source_country
+    dashboard["event_country"] = event_country
+    dashboard["pipeline_metadata"] = {
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "source_article": "web_upload",
+        "extracted_entities_count": len(entities),
+        "core_event": core_event,
+        "source_country": source_country,
+        "event_country": event_country,
+        "perspective_country": perspective.country,
+        "perspective_country_code": perspective.country_code,
+        "selected_evidence_nodes": len(selected_nodes),
+        "cross_border_bridges_found": len(bridges),
+        "model_primary": orchestrator.config.model,
+        "model_fallback": orchestrator.config.fallback_model,
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "analysis_fingerprint": analysis_fingerprint,
+        "knowledge_state": knowledge_state.as_dict(),
+        "reasoning_log": reasoning_log.to_dict(),
+    }
+
+    # Persist
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_filename = f"atis_dashboard_{timestamp}.json"
+    output_path_file = DASHBOARDS_DIR / output_filename
+    try:
+        output_path_file.write_text(
+            json.dumps(dashboard, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Dashboard persisted: %s", output_path_file)
+    except Exception as exc:
+        logger.error("Failed to write dashboard: %s", exc)
+
+    logger.info("\n%s", reasoning_log.log_tree())
+    return dashboard
+
 
 # --------------------------------------------------------------------------- #
 # CLI Entry Point
 # --------------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ATIS Constraint-Solving and Market Equilibrium Engine",
-        epilog="Example: python atis_engine.py ./articles/cobalt_news.txt",
+        description="ATIS News — Intelligent Retrieval & Multi-Stage Reasoning Engine",
+        epilog="Example: python ATIS_News.py ./articles/cobalt_news.txt",
     )
     parser.add_argument(
         "article_path",
@@ -1243,174 +2465,10 @@ def main() -> None:
 
     try:
         result = process_article_pipeline(args.article_path)
-        # Echo the final JSON to stdout for piping / inspection
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception as exc:
         logger.critical("Pipeline terminated with fatal error: %s", exc)
         sys.exit(1)
-
-
-# =============================================================================
-# Web entry point
-# =============================================================================
-def run_news_pipeline(
-    article_text: str,
-    perspective: Any | None = None,
-) -> Dict[str, Any]:
-    """
-    Web-compatible entry point. Accepts raw article text, returns dashboard JSON.
-
-    DETERMINISM FEATURES:
-      - Computes KnowledgeState at pipeline start
-      - Computes analysis_fingerprint after stage 1
-      - Checks AnalysisCache before stage 2
-      - Sets AnalysisCache after stage 3
-      - Uses compute_opportunity_identity for stable IDs
-      - Includes analysis_version, schema_version, analysis_fingerprint, knowledge_state in output
-    """
-    logger.info("=" * 70)
-    perspective = perspective or PerspectiveContext()
-    logger.info("ATIS NEWS PIPELINE (WEB) | Perspective: %s (%s)", perspective.country, perspective.country_code)
-    logger.info("=" * 70)
-
-    vault_manager = ObsidianVaultManager()
-    try:
-        pipeline = LLMPipeline()
-    except ValueError as exc:
-        logger.critical("%s", exc)
-        raise
-
-    # Compute knowledge state for determinism
-    knowledge_state = KnowledgeState(vault_path=vault_manager.vault_dir)
-    knowledge_state.compute()
-    knowledge_state_hash = knowledge_state.knowledge_state_hash
-
-    # Stage 1
-    try:
-        stage_1_result = pipeline.stage_1_extract(article_text)
-    except Exception as exc:
-        logger.critical("STAGE 1 FAILED: %s", exc)
-        raise
-
-    entities = stage_1_result.get("entities", [])
-    core_event = stage_1_result.get("core_event", "Unknown event")
-    source_country = stage_1_result.get("source_country", "")
-    event_country = stage_1_result.get("event_country", source_country)
-
-    # Graph layer — WITH PERSPECTIVE RECONCILIATION
-    graph_context, perspective_nodes, cross_border_bridges = vault_manager.build_graph_context(entities, perspective)
-    perspective_node_ids = {pn["node_id"] for pn in perspective_nodes}
-
-    # Build evidence IDs for fingerprint
-    evidence_ids = sorted([e.get("name", "") for e in entities])
-    entity_ids = sorted(list(set(
-        [perspective.country, source_country, event_country] +
-        [pn["node_id"] for pn in perspective_nodes]
-    )))
-    relationship_ids = sorted(list(set(
-        [b["from_node"] for b in cross_border_bridges] +
-        [b["to_node"] for b in cross_border_bridges]
-    )))
-
-    # Compute analysis fingerprint after stage 1
-    analysis_fingerprint = compute_analysis_fingerprint(
-        story_id=core_event,
-        perspective=perspective,
-        evidence_ids=[e for e in evidence_ids if e],
-        entity_ids=[e for e in entity_ids if e],
-        relationship_ids=[r for r in relationship_ids if r],
-        knowledge_state_hash=knowledge_state_hash,
-    )
-    logger.info("Analysis fingerprint computed: %s", analysis_fingerprint)
-
-    # Check cache before stage 2
-    cached_dashboard = pipeline.cache.get(analysis_fingerprint)
-    if cached_dashboard is not None:
-        logger.info("Cache HIT for fingerprint %s. Returning cached dashboard.", analysis_fingerprint)
-        dashboard_payload = cached_dashboard
-    else:
-        logger.info("Cache MISS for fingerprint %s. Running stages 2 and 3.", analysis_fingerprint)
-
-        # Stage 2
-        try:
-            stage_2_analysis = pipeline.stage_2_solve(article_text, graph_context, perspective)
-        except Exception as exc:
-            logger.critical("STAGE 2 FAILED: %s", exc)
-            raise
-
-        # Stage 3 — receives stage 2 output + graph_context
-        try:
-            dashboard_payload = pipeline.stage_3_format(stage_2_analysis, graph_context, perspective)
-        except Exception as exc:
-            logger.critical("STAGE 3 FAILED: %s", exc)
-            raise
-
-        # Store in cache after dashboard build
-        pipeline.cache.set(analysis_fingerprint, dashboard_payload)
-
-    # Enrich with deterministic validation
-    dashboard_payload["perspective"] = perspective.as_dict()
-    dashboard_payload["source_country"] = source_country
-    dashboard_payload["event_country"] = event_country
-
-    validated_opportunities = []
-    for item in dashboard_payload.get("opportunities", []):
-        if isinstance(item, dict):
-            validated = validate_opportunity(
-                item,
-                perspective,
-                source_node_ids=None,
-                perspective_node_ids=perspective_node_ids,
-                cross_border_bridges=cross_border_bridges,
-            )
-            # Replace sequential ID with stable ID
-            stable_id = compute_opportunity_identity(
-                title=validated.get("title", ""),
-                perspective_country=perspective.country,
-                source_country=validated.get("source_country", ""),
-                event_country=validated.get("event_country", ""),
-                opportunity_country=validated.get("opportunity_country", ""),
-                pathway=validated.get("pathway", ""),
-                perspective_actor=validated.get("perspective_actor", ""),
-            )
-            validated["opportunity_id"] = stable_id
-            validated["stable_opportunity_id"] = stable_id
-            validated_opportunities.append(validated)
-    dashboard_payload["opportunities"] = validated_opportunities
-
-    dashboard_payload["pipeline_metadata"] = {
-        "processed_at": datetime.now(timezone.utc).isoformat(),
-        "source_article": "web_upload",
-        "extracted_entities_count": len(entities),
-        "core_event": core_event,
-        "source_country": source_country,
-        "event_country": event_country,
-        "perspective_country": perspective.country,
-        "perspective_country_code": perspective.country_code,
-        "perspective_nodes_found": len(perspective_nodes),
-        "cross_border_bridges_found": len(cross_border_bridges),
-        "model_primary": pipeline.config.model,
-        "model_fallback": pipeline.config.fallback_model,
-        "analysis_version": ANALYSIS_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        "analysis_fingerprint": analysis_fingerprint,
-        "knowledge_state": knowledge_state.as_dict(),
-    }
-
-    # Persist to disk (optional, ephemeral on Render)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_filename = f"atis_dashboard_{timestamp}.json"
-    output_path_file = DASHBOARDS_DIR / output_filename
-    try:
-        output_path_file.write_text(
-            json.dumps(dashboard_payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.info("Dashboard persisted: %s", output_path_file)
-    except Exception as exc:
-        logger.error("Failed to write dashboard: %s", exc)
-
-    return dashboard_payload
 
 
 if __name__ == "__main__":
