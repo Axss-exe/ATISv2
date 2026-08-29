@@ -2478,17 +2478,19 @@ def _legacy_run_news_pipeline(
 # the only authority for what entities and relationships exist in ATIS.
 # =============================================================================
 
-PERSPECTIVE_FIRST_VERSION = "3.0.0"
+PERSPECTIVE_FIRST_VERSION = "3.0.1"
 MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "30000"))
-MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "500"))
+MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "700"))
 MAX_IMPACT_DOMAINS = int(os.getenv("ATIS_NEWS_MAX_IMPACT_DOMAINS", "8"))
 MAX_RETRIEVAL_TARGETS = int(os.getenv("ATIS_NEWS_MAX_RETRIEVAL_TARGETS", "30"))
 MAX_GRAPH_NODES = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES", "80"))
 MAX_GRAPH_PATHS = int(os.getenv("ATIS_NEWS_MAX_GRAPH_PATHS", "60"))
 MAX_GRAPH_DEPTH = int(os.getenv("ATIS_NEWS_MAX_GRAPH_DEPTH", "2"))
-MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "12"))
+MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "80"))
 MAX_FINAL_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_FINAL_OUTPUT_TOKENS", "4096"))
 MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "3072"))
+MAX_NEWS_LLM_CALLS = int(os.getenv("ATIS_NEWS_MAX_LLM_CALLS", "8"))
+NEWS_PIPELINE_DEADLINE_SECONDS = float(os.getenv("ATIS_NEWS_PIPELINE_DEADLINE_SECONDS", "50"))
 MIN_NODE_RESOLUTION_SCORE = float(os.getenv("ATIS_NEWS_MIN_NODE_RESOLUTION_SCORE", "0.72"))
 MIN_OPPORTUNITY_GRAPH_SCORE = float(os.getenv("ATIS_NEWS_MIN_OPPORTUNITY_GRAPH_SCORE", "0.55"))
 
@@ -2563,6 +2565,16 @@ class PerspectiveFirstNewsEngine:
         self.cache = AnalysisCache()
         self.calls = 0
         self.truncated_retries = 0
+        self.started_at = time.monotonic()
+
+    def _deadline_exceeded(self) -> bool:
+        return (time.monotonic() - self.started_at) >= NEWS_PIPELINE_DEADLINE_SECONDS
+
+    def _ensure_call_budget(self, stage: str) -> None:
+        if self.calls >= MAX_NEWS_LLM_CALLS:
+            raise RuntimeError(f"News LLM call budget exhausted before {stage}: {self.calls} calls")
+        if self._deadline_exceeded():
+            raise TimeoutError(f"News pipeline deadline reached before {stage}")
 
     # ------------------------------------------------------------------ #
     # LLM boundary / token safety
@@ -2617,6 +2629,7 @@ class PerspectiveFirstNewsEngine:
                     f"[{stage}] call rejected before transmission: input~{input_tokens:,}, "
                     f"output={requested:,}, context={self.budget.provider_context_limit:,}"
                 )
+        self._ensure_call_budget(stage)
         self.calls += 1
         logger.info("[LLM] %s | input~%d | output<=%d | context=%d", stage, input_tokens, requested, self.budget.provider_context_limit)
         # IMPORTANT: no seed/random_seed. Leanstral-compatible provider boundary.
@@ -2634,6 +2647,7 @@ class PerspectiveFirstNewsEngine:
             retry_output = min(max(512, retry_output), cap)
             if not self.budget.fits_in_budget(compact_input, retry_output):
                 raise LLMTokenLimitError(f"[{stage}] compact retry cannot fit provider context")
+            self._ensure_call_budget(f"{stage} compact retry")
             self.calls += 1
             raw = self.client.chat(compact_messages, temperature=0.0, max_tokens=retry_output)
         return safe_json_loads(raw, stage_name=stage)
@@ -2736,7 +2750,8 @@ Required shape:
         article_json = json.dumps(article, ensure_ascii=False)
         safe_input_budget = max(1500, self.budget.usable_context_budget - self.budget.estimate_tokens(system) - 3072)
         per_node_estimate = max(20, self.budget.estimate_tokens("NODE=xxxxxxxx | type= | sector= | summary=" + "x" * 180))
-        batch_size = max(8, min(80, safe_input_budget // per_node_estimate))
+        configured_batch = int(os.getenv("ATIS_NEWS_PERSPECTIVE_BATCH_SIZE", "350"))
+        batch_size = max(8, min(configured_batch, safe_input_budget // per_node_estimate))
         batches = [ecosystem[i:i + batch_size] for i in range(0, len(ecosystem), batch_size)] or [[]]
         batches = batches[:MAX_PARTITIONS]
         aggregate_domains: Dict[str, Dict[str, Any]] = {}
@@ -2762,7 +2777,13 @@ Required shape:
                 if existing is None:
                     aggregate_domains[key] = dict(domain)
                 else:
-                    existing["ecosystem_node_hints"] = sorted(set(_pf_safe_list(existing.get("ecosystem_node_hints")) + _pf_safe_list(domain.get("ecosystem_node_hints"))))[:12]
+                    merged_hints = []
+                    for hint in (_pf_safe_list(existing.get("ecosystem_node_hints")) + _pf_safe_list(domain.get("ecosystem_node_hints"))):
+                        if isinstance(hint, dict):
+                            hint = hint.get("node_id") or hint.get("canonical_id") or hint.get("name")
+                        if hint is not None and str(hint).strip():
+                            merged_hints.append(str(hint).strip())
+                    existing["ecosystem_node_hints"] = sorted(set(merged_hints))[:12]
                     if str(domain.get("priority", "medium")) == "high":
                         existing["priority"] = "high"
                     if not existing.get("why_relevant") and domain.get("why_relevant"):
@@ -2819,7 +2840,12 @@ Required shape:
         for domain in _pf_safe_list(impact.get("impact_domains")):
             if not isinstance(domain, dict):
                 continue
-            hints = domain.get("ecosystem_node_hints", [])
+            hints = []
+            for hint in _pf_safe_list(domain.get("ecosystem_node_hints")):
+                if isinstance(hint, dict):
+                    hint = hint.get("node_id") or hint.get("canonical_id") or hint.get("name")
+                if hint is not None and str(hint).strip():
+                    hints.append(str(hint).strip())
             if not hints:
                 # Domain-level targeting: sector/type matching is retrieval, not graph evidence.
                 sector = _pf_norm(domain.get("domain", ""))
@@ -2995,7 +3021,7 @@ Shape:
             f"VERIFIED NODES={json.dumps(compact_nodes, ensure_ascii=False)}\n"
             f"VERIFIED EDGES={json.dumps(compact_edges, ensure_ascii=False)}"
         )
-        return self._call_json(system, user, MAX_STAGE_OUTPUT_TOKENS, f"Graph Consequence Partition {partition_no}")
+        return self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 2048), f"Graph Consequence Partition {partition_no}")
 
     def analyze_graph(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], reasoning_log: ReasoningLog) -> Dict[str, Any]:
         nodes = [n for n in graph.get("nodes", []) if isinstance(n, dict)]
@@ -3133,7 +3159,7 @@ Return:
             f"CONSEQUENCES={json.dumps(consequences, ensure_ascii=False)[:10000]}\n"
             f"IMPACT_CHAIN={json.dumps(impact_chain, ensure_ascii=False)[:10000]}"
         )
-        result = self._call_json(system, user, MAX_FINAL_OUTPUT_TOKENS, "Final News Synthesis")
+        result = self._call_json(system, user, min(MAX_FINAL_OUTPUT_TOKENS, 3072), "Final News Synthesis")
         result["impact_chain"] = impact_chain
         return result
 
@@ -3390,8 +3416,8 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}.json"
     try:
-        output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
         dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
+        output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("[FINAL] Dashboard persisted: %s", output_path.resolve())
     except Exception as exc:
         logger.error("[FINAL] Failed to persist dashboard: %s", exc)
