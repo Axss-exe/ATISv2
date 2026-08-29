@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -421,7 +422,7 @@ def safe_json_loads(raw_text: str, stage_name: str) -> Dict[str, Any]:
         return json.loads(heuristic)
     except json.JSONDecodeError as heuristic_err:
         logger.error("All JSON parsing strategies exhausted for %s.", stage_name)
-        logger.error("Raw response excerpt (first 1000 chars):\n%s", original[:1000])
+        logger.error("Raw response excerpt (first 1000 chars):\n%s", original)
         raise RuntimeError(
             f"Failed to parse JSON response from {stage_name} after all recovery strategies."
         ) from heuristic_err
@@ -510,7 +511,7 @@ class ObsidianVaultManager:
             lines = [l.strip() for l in content.split("\n") if l.strip()]
             for line in lines:
                 if not line.startswith("---") and not line.startswith("#"):
-                    summary = line[:300]
+                    summary = line
                     break
 
             rel_path = str(file_path.relative_to(self.vault_dir))
@@ -1520,7 +1521,7 @@ class NewsLLMOrchestrator:
             evidence_text = "\n\n".join(evidence_blocks)
 
             user_prompt = (
-                f"## NEWS EVENT\n{article_text[:2000]}\n\n"
+                f"## NEWS EVENT\n{article_text}\n\n"
                 f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
                 f"## PERSPECTIVE ACTOR REGISTRY\n{perspective_registry}\n\n"
                 f"## CROSS-BORDER BRIDGE CONTEXT\n{bridge_context}\n\n"
@@ -1678,7 +1679,7 @@ class NewsLLMOrchestrator:
         distilled_text = json.dumps(distilled_findings, indent=2, ensure_ascii=False)
 
         user_prompt = (
-            f"## NEWS EVENT\n{article_text[:1500]}\n\n"
+            f"## NEWS EVENT\n{article_text}\n\n"
             f"## ANALYTICAL PERSPECTIVE\n{perspective.country} ({perspective.country_code})\n\n"
             f"## PERSPECTIVE ACTOR REGISTRY\n{perspective_registry}\n\n"
             f"## CROSS-BORDER BRIDGE CONTEXT\n{bridge_context}\n\n"
@@ -1701,9 +1702,9 @@ class NewsLLMOrchestrator:
                 "contradictions": distilled_findings.get("contradictions", [])[:5],
             }
             user_prompt = (
-                f"## NEWS EVENT\n{article_text[:1000]}\n"
+                f"## NEWS EVENT\n{article_text}\n"
                 f"## PERSPECTIVE: {perspective.country}\n"
-                f"## BRIDGES: {bridge_context[:500]}\n"
+                f"## BRIDGES: {bridge_context}\n"
                 f"## DISTILLED: {json.dumps(compressed, ensure_ascii=False)}\n"
                 f"Produce final dashboard JSON."
             )
@@ -1820,7 +1821,7 @@ def partition_evidence(
     partition_id = 0
 
     # Base overhead: system prompt + article snippet + perspective + bridges
-    base_text = system_prompt + article_text[:1000] + perspective_registry + bridge_context
+    base_text = system_prompt + article_text + perspective_registry + bridge_context
     base_tokens = budget.estimate_tokens(base_text)
     available_per_partition = budget.usable_context_budget - base_tokens - 4096  # reserve output
 
@@ -1909,7 +1910,7 @@ def build_perspective_registry(
     for node in perspective_nodes[:max_nodes]:
         lines.append(
             f"- {node.node_id} | type: {node.node_type or 'unknown'} | "
-            f"sector: {node.sector or 'N/A'} | summary: {node.summary[:120]}"
+            f"sector: {node.sector or 'N/A'} | summary: {node.summary}"
         )
 
     if not perspective_nodes:
@@ -2278,7 +2279,7 @@ def _estimate_single_stage_input(
 ) -> int:
     """Estimate tokens for a single-stage analysis call."""
     article_tokens = budget.estimate_tokens(article_text)
-    evidence_tokens = sum(budget.estimate_tokens(n.content[:1500]) for n in selected_nodes)
+    evidence_tokens = sum(budget.estimate_tokens(n.content) for n in selected_nodes)
     registry_tokens = budget.estimate_tokens(perspective_registry)
     bridge_tokens = budget.estimate_tokens(bridge_context)
     overhead = budget.estimate_tokens(PROMPT_SINGLE_STAGE_ANALYSIS) + SYSTEM_PROMPT_OVERHEAD * 4
@@ -2478,21 +2479,32 @@ def _legacy_run_news_pipeline(
 # the only authority for what entities and relationships exist in ATIS.
 # =============================================================================
 
-PERSPECTIVE_FIRST_VERSION = "3.0.1"
-MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "30000"))
-MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "700"))
+PERSPECTIVE_FIRST_VERSION = "3.3.0-production"
+MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "120000"))
+MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "500"))
 MAX_IMPACT_DOMAINS = int(os.getenv("ATIS_NEWS_MAX_IMPACT_DOMAINS", "8"))
 MAX_RETRIEVAL_TARGETS = int(os.getenv("ATIS_NEWS_MAX_RETRIEVAL_TARGETS", "30"))
 MAX_GRAPH_NODES = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES", "80"))
 MAX_GRAPH_PATHS = int(os.getenv("ATIS_NEWS_MAX_GRAPH_PATHS", "60"))
 MAX_GRAPH_DEPTH = int(os.getenv("ATIS_NEWS_MAX_GRAPH_DEPTH", "2"))
-MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "80"))
+MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "40"))
 MAX_FINAL_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_FINAL_OUTPUT_TOKENS", "4096"))
-MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "3072"))
-MAX_NEWS_LLM_CALLS = int(os.getenv("ATIS_NEWS_MAX_LLM_CALLS", "8"))
-NEWS_PIPELINE_DEADLINE_SECONDS = float(os.getenv("ATIS_NEWS_PIPELINE_DEADLINE_SECONDS", "50"))
+MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "4096"))
 MIN_NODE_RESOLUTION_SCORE = float(os.getenv("ATIS_NEWS_MIN_NODE_RESOLUTION_SCORE", "0.72"))
 MIN_OPPORTUNITY_GRAPH_SCORE = float(os.getenv("ATIS_NEWS_MIN_OPPORTUNITY_GRAPH_SCORE", "0.55"))
+# Render's news request has historically been killed at ~60s. Keep a hard internal
+# safety deadline so the pipeline can return a truthful partial result instead of
+# continuing past the HTTP request lifetime.
+PIPELINE_DEADLINE_SECONDS = float(os.getenv("ATIS_NEWS_PIPELINE_DEADLINE_SECONDS", "52"))
+# Stage-level ceilings ensure one provider call cannot consume the entire HTTP lifetime.
+ARTICLE_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_ARTICLE_TIMEOUT_SECONDS", "12"))
+IMPACT_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_IMPACT_TIMEOUT_SECONDS", "12"))
+GRAPH_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_GRAPH_TIMEOUT_SECONDS", "12"))
+FINAL_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_FINAL_TIMEOUT_SECONDS", "10"))
+MIN_LLM_CALL_SECONDS = float(os.getenv("ATIS_NEWS_MIN_LLM_CALL_SECONDS", "2.5"))
+MAX_IMPACT_LLM_CALLS = max(1, int(os.getenv("ATIS_NEWS_MAX_IMPACT_LLM_CALLS", "2")))
+MAX_GRAPH_LLM_CALLS = max(1, int(os.getenv("ATIS_NEWS_MAX_GRAPH_LLM_CALLS", "2")))
+LLM_CONCURRENCY = max(1, int(os.getenv("ATIS_NEWS_LLM_CONCURRENCY", "2")))
 
 
 def _pf_norm(value: Any) -> str:
@@ -2526,8 +2538,13 @@ def _pf_safe_list(value: Any) -> List[Any]:
 
 
 def _pf_text(value: Any, limit: int = 1200) -> str:
-    text = str(value or "").strip()
-    return text if len(text) <= limit else text[:limit] + " [TRUNCATED]"
+    """Return complete text; structured LLM inputs are reduced by whole records, never characters.
+
+    ``limit`` is retained for backward compatibility with callers, but is intentionally
+    not applied. This prevents silent evidence truncation. Context pressure is handled
+    by selecting fewer complete records before serialization.
+    """
+    return str(value or "").strip()
 
 
 def _pf_safe_float(value: Any, default: float = 0.0) -> float:
@@ -2541,6 +2558,10 @@ def _pf_safe_float(value: Any, default: float = 0.0) -> float:
     if not (-1e9 < number < 1e9):
         return default
     return number
+
+
+class NewsPipelineDeadline(RuntimeError):
+    """Raised when ATIS must stop before the upstream HTTP request deadline."""
 
 
 class PerspectiveFirstNewsEngine:
@@ -2565,16 +2586,10 @@ class PerspectiveFirstNewsEngine:
         self.cache = AnalysisCache()
         self.calls = 0
         self.truncated_retries = 0
-        self.started_at = time.monotonic()
-
-    def _deadline_exceeded(self) -> bool:
-        return (time.monotonic() - self.started_at) >= NEWS_PIPELINE_DEADLINE_SECONDS
-
-    def _ensure_call_budget(self, stage: str) -> None:
-        if self.calls >= MAX_NEWS_LLM_CALLS:
-            raise RuntimeError(f"News LLM call budget exhausted before {stage}: {self.calls} calls")
-        if self._deadline_exceeded():
-            raise TimeoutError(f"News pipeline deadline reached before {stage}")
+        self.timeouts = 0
+        self.deadline_exhausted = False
+        self._pipeline_started = time.monotonic()
+        self._deadline = self._pipeline_started + PIPELINE_DEADLINE_SECONDS
 
     # ------------------------------------------------------------------ #
     # LLM boundary / token safety
@@ -2613,8 +2628,57 @@ class PerspectiveFirstNewsEngine:
                     return True
         return in_string or bool(stack)
 
+    def _stage_timeout(self, stage: str) -> float:
+        name = stage.lower()
+        if "article understanding" in name:
+            return ARTICLE_LLM_TIMEOUT_SECONDS
+        if "perspective impact" in name:
+            return IMPACT_LLM_TIMEOUT_SECONDS
+        if "graph consequence" in name:
+            return GRAPH_LLM_TIMEOUT_SECONDS
+        if "final news synthesis" in name:
+            return FINAL_LLM_TIMEOUT_SECONDS
+        return min(10.0, PIPELINE_DEADLINE_SECONDS)
+
+    def _remaining_seconds(self) -> float:
+        return max(0.0, self._deadline - time.monotonic())
+
+    def _chat_with_deadline(self, messages: List[Dict[str, str]], max_tokens: int, stage: str) -> str:
+        """Run a synchronous provider client behind a hard local wait deadline.
+
+        LLMClient.chat is synchronous and does not expose a per-call timeout. A worker
+        thread prevents a slow provider call from holding the HTTP handler past the
+        ATIS deadline. The worker is cancelled when possible; if the underlying HTTP
+        library cannot be interrupted, the request handler still returns safely.
+        """
+        remaining = self._remaining_seconds()
+        if remaining < MIN_LLM_CALL_SECONDS:
+            self.deadline_exhausted = True
+            raise NewsPipelineDeadline(f"[{stage}] insufficient pipeline time remaining ({remaining:.2f}s)")
+        timeout = min(self._stage_timeout(stage), remaining - 0.75)
+        if timeout < MIN_LLM_CALL_SECONDS:
+            self.deadline_exhausted = True
+            raise NewsPipelineDeadline(f"[{stage}] insufficient safe call window ({remaining:.2f}s remaining)")
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="atis-news-llm")
+        future = executor.submit(self.client.chat, messages, temperature=0.0, max_tokens=max_tokens)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError as exc:
+            self.timeouts += 1
+            self.deadline_exhausted = True
+            future.cancel()
+            raise NewsPipelineDeadline(f"[{stage}] provider call exceeded {timeout:.1f}s") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def _call_json(self, system_prompt: str, user_prompt: str, requested_output: int, stage: str) -> Dict[str, Any]:
-        """Bound every call before transmission; retry once in a more compact form."""
+        """Bounded, lossless structured-output call.
+
+        No character slicing is performed on article/evidence input or retry input.
+        If output is incomplete, ATIS retries the exact same evidence once with a
+        larger output allowance, subject to the remaining pipeline deadline.
+        """
         cap = self._model_output_cap()
         requested = min(max(512, int(requested_output)), cap)
         messages = [
@@ -2624,33 +2688,33 @@ class PerspectiveFirstNewsEngine:
         input_tokens = self.budget.estimate_messages_tokens(messages)
         if not self.budget.fits_in_budget(input_tokens, requested):
             requested = self.budget.compute_safe_output_tokens(input_tokens)
-            if not self.budget.fits_in_budget(input_tokens, requested):
+            if requested < 512 or not self.budget.fits_in_budget(input_tokens, requested):
                 raise LLMTokenLimitError(
-                    f"[{stage}] call rejected before transmission: input~{input_tokens:,}, "
-                    f"output={requested:,}, context={self.budget.provider_context_limit:,}"
+                    f"[{stage}] rejected before transmission: input~{input_tokens:,}, output={requested:,}, "
+                    f"context={self.budget.provider_context_limit:,}"
                 )
-        self._ensure_call_budget(stage)
+
+        logger.info("[LLM] %s | input~%d | output<=%d | remaining=%.1fs", stage, input_tokens, requested, self._remaining_seconds())
         self.calls += 1
-        logger.info("[LLM] %s | input~%d | output<=%d | context=%d", stage, input_tokens, requested, self.budget.provider_context_limit)
-        # IMPORTANT: no seed/random_seed. Leanstral-compatible provider boundary.
-        raw = self.client.chat(messages, temperature=0.0, max_tokens=requested)
-        if self._is_truncated(raw):
+        raw = self._chat_with_deadline(messages, requested, stage)
+        try:
+            return safe_json_loads(raw, stage_name=stage)
+        except RuntimeError as first_error:
+            retry_output = min(cap, max(requested + 2048, requested * 2))
+            if retry_output <= requested or self._remaining_seconds() < MIN_LLM_CALL_SECONDS + 1.0:
+                raise first_error
+            if not self.budget.fits_in_budget(input_tokens, retry_output):
+                retry_output = self.budget.compute_safe_output_tokens(input_tokens)
+            if retry_output < 512 or not self.budget.fits_in_budget(input_tokens, retry_output):
+                raise first_error
             self.truncated_retries += 1
-            logger.warning("[LLM] %s returned truncated output; retrying compactly", stage)
-            compact_user = user_prompt[: max(2000, int(len(user_prompt) * 0.70))]
-            compact_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": compact_user},
-            ]
-            compact_input = self.budget.estimate_messages_tokens(compact_messages)
-            retry_output = self.budget.compute_safe_output_tokens(compact_input)
-            retry_output = min(max(512, retry_output), cap)
-            if not self.budget.fits_in_budget(compact_input, retry_output):
-                raise LLMTokenLimitError(f"[{stage}] compact retry cannot fit provider context")
-            self._ensure_call_budget(f"{stage} compact retry")
+            logger.warning("[LLM] %s returned incomplete/non-JSON output; retrying SAME input with output<=%d", stage, retry_output)
             self.calls += 1
-            raw = self.client.chat(compact_messages, temperature=0.0, max_tokens=retry_output)
-        return safe_json_loads(raw, stage_name=stage)
+            raw_retry = self._chat_with_deadline(messages, retry_output, f"{stage} retry")
+            try:
+                return safe_json_loads(raw_retry, stage_name=f"{stage} retry")
+            except RuntimeError as second_error:
+                raise RuntimeError(f"[{stage}] provider returned unusable structured output after lossless retry") from second_error
 
     # ------------------------------------------------------------------ #
     # Perspective ecosystem — database first, never a generic dump
@@ -2709,7 +2773,7 @@ Required shape:
   "uncertainties": ["..."]
 }
 """
-        user = f"ARTICLE:\n{article_text[:MAX_ARTICLE_CHARS]}"
+        user = f"ARTICLE:\n{article_text}"
         result = self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 3072), "Article Understanding")
         result.setdefault("event", {})
         result.setdefault("facts", [])
@@ -2724,7 +2788,12 @@ Required shape:
     # Stage 2 — map meaning against the perspective ecosystem
     # ------------------------------------------------------------------ #
     def map_impact_domains(self, article: Dict[str, Any], ecosystem: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Map the event to the perspective ecosystem without sending the whole registry in one call."""
+        """Map article meaning to the selected country's ecosystem.
+
+        Prefer ONE call when the complete ecosystem fits the real model context.
+        Only partition when required by the provider's actual context limit.
+        Independent partitions are executed concurrently and merged deterministically.
+        """
         system = """You are ATIS News Stage 2: Perspective Impact Mapper.
 The analytical perspective is the selected country. Determine which areas of THAT
 country's supplied ecosystem should be investigated because of the event.
@@ -2746,52 +2815,79 @@ Required shape:
   "excluded_domains":[{"domain":"","reason":""}]
 }
 """
-        # Use the model's actual context capacity to batch the perspective registry.
         article_json = json.dumps(article, ensure_ascii=False)
-        safe_input_budget = max(1500, self.budget.usable_context_budget - self.budget.estimate_tokens(system) - 3072)
-        per_node_estimate = max(20, self.budget.estimate_tokens("NODE=xxxxxxxx | type= | sector= | summary=" + "x" * 180))
-        configured_batch = int(os.getenv("ATIS_NEWS_PERSPECTIVE_BATCH_SIZE", "350"))
-        batch_size = max(8, min(configured_batch, safe_input_budget // per_node_estimate))
-        batches = [ecosystem[i:i + batch_size] for i in range(0, len(ecosystem), batch_size)] or [[]]
-        batches = batches[:MAX_PARTITIONS]
+        full_registry = self._ecosystem_context(ecosystem)
+        full_user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM:\n{full_registry}"
+        requested = MAX_STAGE_OUTPUT_TOKENS
+
+        def fits(user: str) -> bool:
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            return self.budget.fits_in_budget(self.budget.estimate_messages_tokens(messages), requested)
+
+        if fits(full_user):
+            result = self._call_json(system, full_user, requested, "Perspective Impact Mapping")
+            results = [result]
+        else:
+            safe_input_budget = max(2000, self.budget.usable_context_budget - self.budget.estimate_tokens(system) - requested)
+            per_node_estimate = max(40, self.budget.estimate_tokens("NODE=xxxxxxxx | type= | sector= | summary=" + "x" * 240))
+            batch_size = max(8, min(100, safe_input_budget // per_node_estimate))
+            batches = [ecosystem[i:i + batch_size] for i in range(0, len(ecosystem), batch_size)] or [[]]
+            # Never fan out into an unbounded set of LLM calls. If the full ecosystem
+            # cannot fit in two calls, retain the highest-priority deterministic slice
+            # rather than turning one news request into a call explosion.
+            if len(batches) > MAX_IMPACT_LLM_CALLS:
+                ranked = sorted(
+                    ecosystem,
+                    key=lambda n: (
+                        -_pf_similarity(article_json, f"{n.get('node_id','')} {n.get('sector','')} {n.get('summary','')}"),
+                        str(n.get('node_id','')),
+                    ),
+                )
+                keep = batch_size * MAX_IMPACT_LLM_CALLS
+                batches = [ranked[i:i + batch_size] for i in range(0, min(len(ranked), keep), batch_size)]
+                logger.warning("[PERSPECTIVE] ecosystem requires %d batches; capped to %d evidence-complete batches", len(ranked) // max(1, batch_size) + 1, len(batches))
+
+            def run_batch(item: Tuple[int, List[Dict[str, Any]]]) -> Tuple[int, Dict[str, Any]]:
+                idx, batch = item
+                registry = self._ecosystem_context(batch)
+                user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM BATCH {idx}/{len(batches)}:\n{registry}"
+                return idx, self._call_json(system, user, requested, f"Perspective Impact Mapping B{idx}")
+
+            indexed_results: Dict[int, Dict[str, Any]] = {}
+            with ThreadPoolExecutor(max_workers=min(LLM_CONCURRENCY, len(batches)), thread_name_prefix="atis-news-impact") as pool:
+                futures = [pool.submit(run_batch, item) for item in enumerate(batches, 1)]
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    indexed_results[idx] = result
+            results = [indexed_results[idx] for idx in sorted(indexed_results)]
+
         aggregate_domains: Dict[str, Dict[str, Any]] = {}
         excluded: List[Dict[str, Any]] = []
-        for idx, batch in enumerate(batches, 1):
-            registry = self._ecosystem_context(batch)
-            user = f"ARTICLE UNDERSTANDING:\n{article_json[:9000]}\n\nPERSPECTIVE ECOSYSTEM BATCH {idx}/{len(batches)}:\n{registry}"
-            try:
-                result = self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 3072), f"Perspective Impact Mapping B{idx}")
-            except LLMTokenLimitError:
-                # Reduce the batch once more instead of failing the entire news analysis.
-                smaller = batch[:max(4, len(batch) // 2)]
-                registry = self._ecosystem_context(smaller)
-                user = f"ARTICLE UNDERSTANDING:\n{article_json[:6000]}\n\nPERSPECTIVE ECOSYSTEM:\n{registry}"
-                result = self._call_json(system, user, 2048, f"Perspective Impact Mapping B{idx} Compact")
+        for result in results:
             for domain in _pf_safe_list(result.get("impact_domains")):
                 if not isinstance(domain, dict):
                     continue
                 key = _pf_norm(domain.get("domain", ""))
                 if not key:
                     continue
+                domain = dict(domain)
+                hints = [str(x).strip() for x in _pf_safe_list(domain.get("ecosystem_node_hints")) if not isinstance(x, (dict, list)) and str(x).strip()]
+                domain["ecosystem_node_hints"] = hints
                 existing = aggregate_domains.get(key)
                 if existing is None:
-                    aggregate_domains[key] = dict(domain)
+                    aggregate_domains[key] = domain
                 else:
-                    merged_hints = []
-                    for hint in (_pf_safe_list(existing.get("ecosystem_node_hints")) + _pf_safe_list(domain.get("ecosystem_node_hints"))):
-                        if isinstance(hint, dict):
-                            hint = hint.get("node_id") or hint.get("canonical_id") or hint.get("name")
-                        if hint is not None and str(hint).strip():
-                            merged_hints.append(str(hint).strip())
-                    existing["ecosystem_node_hints"] = sorted(set(merged_hints))[:12]
-                    if str(domain.get("priority", "medium")) == "high":
+                    merged_hints = {str(x).strip() for x in _pf_safe_list(existing.get("ecosystem_node_hints")) if not isinstance(x, (dict, list)) and str(x).strip()}
+                    merged_hints.update(hints)
+                    existing["ecosystem_node_hints"] = sorted(merged_hints)[:12]
+                    if str(domain.get("priority", "medium")).lower() == "high":
                         existing["priority"] = "high"
                     if not existing.get("why_relevant") and domain.get("why_relevant"):
-                        existing["why_relevant"] = domain.get("why_relevant")
+                        existing["why_relevant"] = str(domain.get("why_relevant"))
                     if not existing.get("mechanism") and domain.get("mechanism"):
-                        existing["mechanism"] = domain.get("mechanism")
-            excluded.extend(_pf_safe_list(result.get("excluded_domains")))
-        domains = sorted(aggregate_domains.values(), key=lambda d: (0 if d.get("priority") == "high" else 1 if d.get("priority") == "medium" else 2, _pf_norm(d.get("domain", ""))))[:MAX_IMPACT_DOMAINS]
+                        existing["mechanism"] = str(domain.get("mechanism"))
+            excluded.extend(x for x in _pf_safe_list(result.get("excluded_domains")) if isinstance(x, dict))
+        domains = sorted(aggregate_domains.values(), key=lambda d: (0 if str(d.get("priority", "medium")).lower() == "high" else 1 if str(d.get("priority", "medium")).lower() == "medium" else 2, _pf_norm(d.get("domain", ""))))[:MAX_IMPACT_DOMAINS]
         return {"impact_domains": domains, "excluded_domains": excluded[:MAX_IMPACT_DOMAINS]}
 
     # ------------------------------------------------------------------ #
@@ -2840,12 +2936,7 @@ Required shape:
         for domain in _pf_safe_list(impact.get("impact_domains")):
             if not isinstance(domain, dict):
                 continue
-            hints = []
-            for hint in _pf_safe_list(domain.get("ecosystem_node_hints")):
-                if isinstance(hint, dict):
-                    hint = hint.get("node_id") or hint.get("canonical_id") or hint.get("name")
-                if hint is not None and str(hint).strip():
-                    hints.append(str(hint).strip())
+            hints = domain.get("ecosystem_node_hints", [])
             if not hints:
                 # Domain-level targeting: sector/type matching is retrieval, not graph evidence.
                 sector = _pf_norm(domain.get("domain", ""))
@@ -2856,7 +2947,7 @@ Required shape:
                 if canon:
                     found_for_domain = True
                     rec = self._node_record(canon)
-                    rec["target_domains"] = sorted(set(rec.get("target_domains", []) + [domain.get("domain", "")]))
+                    rec["target_domains"] = sorted({str(x).strip() for x in (_pf_safe_list(rec.get("target_domains")) + [domain.get("domain", "")]) if str(x).strip()})
                     resolved[canon] = rec
                 else:
                     unresolved.append({"hint": str(hint), "domain": domain.get("domain", ""), "status": "UNRESOLVED"})
@@ -3021,26 +3112,49 @@ Shape:
             f"VERIFIED NODES={json.dumps(compact_nodes, ensure_ascii=False)}\n"
             f"VERIFIED EDGES={json.dumps(compact_edges, ensure_ascii=False)}"
         )
-        return self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 2048), f"Graph Consequence Partition {partition_no}")
+        return self._call_json(system, user, MAX_STAGE_OUTPUT_TOKENS, f"Graph Consequence Partition {partition_no}")
 
     def analyze_graph(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], reasoning_log: ReasoningLog) -> Dict[str, Any]:
         nodes = [n for n in graph.get("nodes", []) if isinstance(n, dict)]
         edges = [e for e in graph.get("edges", []) if isinstance(e, dict)]
         if not nodes:
             return {"consequences": [], "gaps": [{"gap": "No targeted graph nodes were resolved", "status": "RESEARCH_REQUIRED", "related_nodes": []}], "opportunity_signals": [], "risk_signals": []}
-        partitions: List[List[Dict[str, Any]]] = []
-        for i in range(0, len(nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION):
-            if len(partitions) >= MAX_PARTITIONS:
-                break
-            partitions.append(nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION])
+
+        partitions = [nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION] for i in range(0, len(nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION)]
+        if len(partitions) > MAX_GRAPH_LLM_CALLS:
+            # Keep complete, highest-depth/relevance records rather than silently
+            # truncating serialized graph data or creating excessive LLM calls.
+            ranked_nodes = sorted(
+                nodes,
+                key=lambda n: (
+                    int(n.get("graph_depth", 99) or 99),
+                    0 if n.get("graph_category") == "target" else 1,
+                    str(n.get("node_id", "")),
+                ),
+            )
+            ranked_nodes = ranked_nodes[:MAX_GRAPH_NODES_PER_LLM_PARTITION * MAX_GRAPH_LLM_CALLS]
+            partitions = [ranked_nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION] for i in range(0, len(ranked_nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION)]
+            logger.warning("[GRAPH] graph workload capped at %d complete LLM partitions", len(partitions))
         reasoning_log.partitions = len(partitions)
+
+        def run_partition(item: Tuple[int, List[Dict[str, Any]]]) -> Tuple[int, Dict[str, Any]]:
+            idx, part = item
+            part_ids = {str(n.get("node_id", "")) for n in part}
+            part_edges = [e for e in edges if str(e.get("from_node", "")) in part_ids or str(e.get("to_node", "")) in part_ids]
+            return idx, self.analyze_graph_partition(article, impact, part, part_edges, idx)
+
+        results: Dict[int, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(LLM_CONCURRENCY, len(partitions)), thread_name_prefix="atis-news-graph") as pool:
+            futures = [pool.submit(run_partition, item) for item in enumerate(partitions, 1)]
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results[idx] = result
+
         combined = {"consequences": [], "gaps": [], "opportunity_signals": [], "risk_signals": []}
-        for idx, part in enumerate(partitions, 1):
-            part_ids = {n["node_id"] for n in part}
-            part_edges = [e for e in edges if e.get("from_node") in part_ids or e.get("to_node") in part_ids]
-            result = self.analyze_graph_partition(article, impact, part, part_edges, idx)
+        for idx in sorted(results):
+            result = results[idx]
             for key in combined:
-                combined[key].extend(_pf_safe_list(result.get(key)))
+                combined[key].extend(x for x in _pf_safe_list(result.get(key)) if isinstance(x, dict))
             reasoning_log.evidence_calls += 1
         return combined
 
@@ -3153,13 +3267,13 @@ Return:
         }
         user = (
             f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
-            f"ARTICLE={json.dumps(article, ensure_ascii=False)[:6000]}\n"
-            f"IMPACT={json.dumps(impact, ensure_ascii=False)[:5000]}\n"
-            f"GRAPH={json.dumps(graph_summary, ensure_ascii=False)[:12000]}\n"
-            f"CONSEQUENCES={json.dumps(consequences, ensure_ascii=False)[:10000]}\n"
-            f"IMPACT_CHAIN={json.dumps(impact_chain, ensure_ascii=False)[:10000]}"
+            f"ARTICLE={json.dumps(article, ensure_ascii=False)}\n"
+            f"IMPACT={json.dumps(impact, ensure_ascii=False)}\n"
+            f"GRAPH={json.dumps(graph_summary, ensure_ascii=False)}\n"
+            f"CONSEQUENCES={json.dumps(consequences, ensure_ascii=False)}\n"
+            f"IMPACT_CHAIN={json.dumps(impact_chain, ensure_ascii=False)}"
         )
-        result = self._call_json(system, user, min(MAX_FINAL_OUTPUT_TOKENS, 3072), "Final News Synthesis")
+        result = self._call_json(system, user, MAX_FINAL_OUTPUT_TOKENS, "Final News Synthesis")
         result["impact_chain"] = impact_chain
         return result
 
@@ -3229,20 +3343,91 @@ Return:
         return dashboard
 
     # ------------------------------------------------------------------ #
+    # Deadline-safe deterministic fallback
+    # ------------------------------------------------------------------ #
+    def _fallback_dashboard(
+        self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any],
+        consequences: Dict[str, Any], impact_chain: List[Dict[str, Any]], reason: str,
+    ) -> Dict[str, Any]:
+        """Return grounded partial intelligence when the final LLM cannot safely run.
+
+        This contains only article facts, database graph facts, and already-computed
+        LLM interpretations. It deliberately does not invent an executive conclusion.
+        """
+        event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
+        summary = str(event.get("summary") or "").strip()
+        return {
+            "status": "partial",
+            "partial": True,
+            "detail": reason,
+            "trigger_event": str(event.get("title") or "News event"),
+            "market_equilibrium_shift": "",
+            "executive_summary": summary,
+            "analytical_perspective": {
+                "country": self.perspective.country,
+                "country_code": self.perspective.country_code,
+                "description": "Country through which this event is interpreted.",
+            },
+            "facts": _pf_safe_list(article.get("facts")),
+            "meaning": _pf_safe_list(article.get("meaning")),
+            "impact_domains": _pf_safe_list(impact.get("impact_domains")),
+            "impact_chain": impact_chain,
+            "findings": _pf_safe_list(consequences.get("consequences")),
+            "opportunities": _pf_safe_list(consequences.get("opportunity_signals")),
+            "risks": _pf_safe_list(consequences.get("risk_signals")),
+            "gaps": _pf_safe_list(consequences.get("gaps")),
+            "entities": _pf_safe_list(article.get("actors")),
+            "graph_analysis": {
+                "direct": graph.get("direct_nodes", 0),
+                "first_order": graph.get("first_order_nodes", 0),
+                "second_order": graph.get("second_order_nodes", 0),
+                "backlink_candidates": graph.get("backlink_candidates", 0),
+                "paths": graph.get("paths", [])[:MAX_GRAPH_PATHS],
+            },
+            "source_country": event.get("source_country", ""),
+            "event_country": event.get("event_country", ""),
+        }
+
+    # ------------------------------------------------------------------ #
     # Full pipeline
     # ------------------------------------------------------------------ #
     def run(self, article_text: str, reasoning_log: ReasoningLog) -> Dict[str, Any]:
         if not article_text or not article_text.strip():
             raise ValueError("News article text is empty")
         article_text = article_text.strip()
+        pipeline_started = time.monotonic()
         if len(article_text) > MAX_ARTICLE_CHARS:
-            article_text = article_text[:MAX_ARTICLE_CHARS] + "\n[ARTICLE TRUNCATED BEFORE ANALYSIS]"
+            raise ValueError(
+                f"News article is {len(article_text):,} characters, exceeding the configured "
+                f"ATIS_NEWS_MAX_ARTICLE_CHARS limit of {MAX_ARTICLE_CHARS:,}. "
+                "Increase the environment limit rather than silently truncating the article."
+            )
 
         ecosystem = self.load_perspective_ecosystem()
         reasoning_log.perspective_nodes = len(ecosystem)
-        article = self.understand_article(article_text)
+        try:
+            article = self.understand_article(article_text)
+        except NewsPipelineDeadline as exc:
+            logger.warning("[DEADLINE] %s", exc)
+            dashboard = self._fallback_dashboard(
+                {"event": {}, "facts": [], "meaning": [], "actors": [], "uncertainties": []},
+                {"impact_domains": []},
+                {"nodes": [], "edges": [], "paths": [], "direct_nodes": 0, "first_order_nodes": 0, "second_order_nodes": 0, "backlink_candidates": 0},
+                {"consequences": [], "gaps": [{"gap": str(exc), "status": "RESEARCH_REQUIRED", "related_nodes": []}], "opportunity_signals": [], "risk_signals": []},
+                [],
+                str(exc),
+            )
+            dashboard["status"] = "partial"
+            dashboard["partial"] = True
+            dashboard["research_required"] = dashboard.get("gaps", [])
+            reasoning_log.total_llm_calls = self.calls
+            return dashboard
         reasoning_log.entities_extracted = len(_pf_safe_list(article.get("actors")))
-        impact = self.map_impact_domains(article, ecosystem)
+        try:
+            impact = self.map_impact_domains(article, ecosystem)
+        except NewsPipelineDeadline as exc:
+            logger.warning("[DEADLINE] %s", exc)
+            impact = {"impact_domains": [], "excluded_domains": [], "deadline": str(exc)}
         reasoning_log.impact_domains = len(_pf_safe_list(impact.get("impact_domains")))
         targets, unresolved = self.retrieve_targets(impact, ecosystem)
         reasoning_log.retrieval_targets = len(targets)
@@ -3258,7 +3443,17 @@ Return:
 
         if graph.get("nodes"):
             reasoning_log.reasoning_mode = ReasoningMode.MULTI_STAGE.value
-            consequences = self.analyze_graph(article, impact, graph, reasoning_log)
+            try:
+                consequences = self.analyze_graph(article, impact, graph, reasoning_log)
+            except NewsPipelineDeadline as exc:
+                logger.warning("[DEADLINE] %s", exc)
+                consequences = {
+                    "consequences": [],
+                    "gaps": [{"gap": str(exc), "status": "RESEARCH_REQUIRED", "related_nodes": [n.get("node_id", "") for n in graph.get("nodes", [])[:10]]}],
+                    "opportunity_signals": [],
+                    "risk_signals": [],
+                }
+                self.deadline_exhausted = True
         else:
             reasoning_log.reasoning_mode = "perspective_only_no_graph_evidence"
             consequences = {
@@ -3272,8 +3467,23 @@ Return:
                 "risk_signals": [],
             }
         impact_chain = self.build_impact_chain(article, impact, graph, consequences)
-        dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
-        dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
+
+        # Reserve time for the HTTP response itself. If the upstream analysis has
+        # consumed the safe execution window, do not start another network call.
+        elapsed = time.monotonic() - pipeline_started
+        if elapsed >= max(1.0, PIPELINE_DEADLINE_SECONDS - 12.0):
+            logger.warning("[DEADLINE] %.1fs elapsed; skipping final LLM synthesis and returning grounded partial result", elapsed)
+            dashboard = self._fallback_dashboard(
+                article, impact, graph, consequences, impact_chain,
+                f"Final synthesis skipped after {elapsed:.1f}s to protect the API request deadline.",
+            )
+        else:
+            try:
+                dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
+                dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
+            except NewsPipelineDeadline as exc:
+                logger.warning("[DEADLINE] %s", exc)
+                dashboard = self._fallback_dashboard(article, impact, graph, consequences, impact_chain, str(exc))
         dashboard["facts"] = article.get("facts", [])
         dashboard["meaning"] = article.get("meaning", [])
         dashboard["impact_domains"] = impact.get("impact_domains", [])
@@ -3282,6 +3492,17 @@ Return:
         reasoning_log.gaps = len(_pf_safe_list(dashboard.get("gaps")))
         reasoning_log.opportunities = len(_pf_safe_list(dashboard.get("opportunities")))
         reasoning_log.total_llm_calls = self.calls
+        dashboard["status"] = "partial" if self.deadline_exhausted else dashboard.get("status", "complete")
+        dashboard["partial"] = bool(self.deadline_exhausted or dashboard.get("partial", False))
+        dashboard["pipeline_execution"] = {
+            "deadline_seconds": PIPELINE_DEADLINE_SECONDS,
+            "elapsed_seconds": round(time.monotonic() - pipeline_started, 3),
+            "remaining_seconds": round(self._remaining_seconds(), 3),
+            "llm_calls": self.calls,
+            "llm_timeouts": self.timeouts,
+            "truncated_retries": self.truncated_retries,
+            "deadline_exhausted": self.deadline_exhausted,
+        }
         return dashboard
 
 
@@ -3416,8 +3637,8 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}.json"
     try:
-        dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
         output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
+        dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
         logger.info("[FINAL] Dashboard persisted: %s", output_path.resolve())
     except Exception as exc:
         logger.error("[FINAL] Failed to persist dashboard: %s", exc)
