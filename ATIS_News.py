@@ -20,7 +20,7 @@ Public API (backward compatible):
   - run_news_pipeline(article_text, perspective=None) -> Dict[str, Any]
 
 Determinism:
-  - temperature=0.0, seed=42 on all LLM calls
+  - temperature=0.0 on all LLM calls; provider seed parameters are intentionally omitted.
   - sorted iterations for stable ordering
   - AnalysisCache for disk-based result caching
   - KnowledgeState for vault versioning
@@ -1420,7 +1420,7 @@ class NewsLLMOrchestrator:
         self.budget.require_budget(input_tokens, max_tokens, stage_name)
 
         self._call_count += 1
-        return self.client.chat(messages, temperature=0.0, seed=42, max_tokens=max_tokens)
+        return self.client.chat(messages, temperature=0.0, max_tokens=max_tokens)
 
     def _call_api_with_retry(
         self,
@@ -1995,7 +1995,7 @@ def post_process_opportunities(
 # --------------------------------------------------------------------------- #
 # Main Orchestration Entry Point
 # --------------------------------------------------------------------------- #
-def process_article_pipeline(
+def _legacy_process_article_pipeline(
     article_path: str,
     perspective: Any | None = None,
 ) -> Dict[str, Any]:
@@ -2276,7 +2276,7 @@ def _estimate_single_stage_input(
 # --------------------------------------------------------------------------- #
 # Web Entry Point
 # --------------------------------------------------------------------------- #
-def run_news_pipeline(
+def _legacy_run_news_pipeline(
     article_text: str,
     perspective: Any | None = None,
 ) -> Dict[str, Any]:
@@ -2448,21 +2448,947 @@ def run_news_pipeline(
     return dashboard
 
 
+
+# =============================================================================
+# ATIS NEWS v3 — PERSPECTIVE-FIRST INTELLIGENCE LAYER
+# =============================================================================
+#
+# The legacy NewsLLMOrchestrator and evidence-selection code above are retained
+# for backward compatibility with older callers. The production entry points at
+# the bottom of this file use the PerspectiveFirstNewsEngine below.
+#
+# Core rule:
+#   ARTICLE -> MEANING -> PERSPECTIVE ECOSYSTEM -> TARGETED DB RETRIEVAL
+#   -> ACTUAL GRAPH TRAVERSAL -> CONSEQUENCES -> GAPS -> OPPORTUNITIES/RISKS
+#
+# The article is NOT used as a keyword query against the vault. The selected
+# perspective defines the analytical universe. Database nodes and wiki-links are
+# the only authority for what entities and relationships exist in ATIS.
+# =============================================================================
+
+PERSPECTIVE_FIRST_VERSION = "3.0.0"
+MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "30000"))
+MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "500"))
+MAX_IMPACT_DOMAINS = int(os.getenv("ATIS_NEWS_MAX_IMPACT_DOMAINS", "8"))
+MAX_RETRIEVAL_TARGETS = int(os.getenv("ATIS_NEWS_MAX_RETRIEVAL_TARGETS", "30"))
+MAX_GRAPH_NODES = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES", "80"))
+MAX_GRAPH_PATHS = int(os.getenv("ATIS_NEWS_MAX_GRAPH_PATHS", "60"))
+MAX_GRAPH_DEPTH = int(os.getenv("ATIS_NEWS_MAX_GRAPH_DEPTH", "2"))
+MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "12"))
+MAX_FINAL_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_FINAL_OUTPUT_TOKENS", "4096"))
+MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "3072"))
+MIN_NODE_RESOLUTION_SCORE = float(os.getenv("ATIS_NEWS_MIN_NODE_RESOLUTION_SCORE", "0.72"))
+MIN_OPPORTUNITY_GRAPH_SCORE = float(os.getenv("ATIS_NEWS_MIN_OPPORTUNITY_GRAPH_SCORE", "0.55"))
+
+
+def _pf_norm(value: Any) -> str:
+    """Normalize names for deterministic comparison without treating similarity as proof."""
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _pf_tokens(value: Any) -> Set[str]:
+    return {x for x in re.findall(r"[a-z0-9]+", _pf_norm(value)) if len(x) > 2}
+
+
+def _pf_similarity(a: Any, b: Any) -> float:
+    aa, bb = _pf_tokens(a), _pf_tokens(b)
+    if not aa or not bb:
+        return 0.0
+    return len(aa & bb) / max(1, len(aa | bb))
+
+
+def _pf_country_matches(value: str, country: str) -> bool:
+    a = _pf_norm(value)
+    b = _pf_norm(country)
+    if not b:
+        return False
+    return a == b or b in a.split() or _pf_norm(COUNTRY_CODES.get(b, b)) == a
+
+
+def _pf_safe_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _pf_text(value: Any, limit: int = 1200) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[:limit] + " [TRUNCATED]"
+
+
+class PerspectiveFirstNewsEngine:
+    """
+    Production News engine implementing the perspective-first ATIS architecture.
+
+    The engine deliberately separates four responsibilities:
+      * LLM: article understanding and interpretation.
+      * Vault: authoritative perspective ecosystem and node contents.
+      * Graph: authoritative relationships/backlinks.
+      * LLM: interpretation of already-verified graph evidence.
+
+    No LLM call is permitted to manufacture a graph edge.
+    """
+
+    def __init__(self, vault: ObsidianVaultManager, perspective: PerspectiveContext) -> None:
+        self.vault = vault
+        self.perspective = perspective
+        self.client: LLMClient = get_client()
+        self.config = self.client.config
+        self.budget = TokenBudgetManager(self.client.adapter.capabilities)
+        self.cache = AnalysisCache()
+        self.calls = 0
+        self.truncated_retries = 0
+
+    # ------------------------------------------------------------------ #
+    # LLM boundary / token safety
+    # ------------------------------------------------------------------ #
+    def _model_output_cap(self) -> int:
+        return int(self.budget.max_output_tokens)
+
+    @staticmethod
+    def _is_truncated(raw: str) -> bool:
+        if not raw or not raw.strip():
+            return True
+        text = raw.strip()
+        if text.endswith("..."):
+            return True
+        stack: List[str] = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "]}" and stack:
+                expected = "]" if stack[-1] == "[" else "}"
+                if ch == expected:
+                    stack.pop()
+                else:
+                    return True
+        return in_string or bool(stack)
+
+    def _call_json(self, system_prompt: str, user_prompt: str, requested_output: int, stage: str) -> Dict[str, Any]:
+        """Bound every call before transmission; retry once in a more compact form."""
+        cap = self._model_output_cap()
+        requested = min(max(512, int(requested_output)), cap)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        input_tokens = self.budget.estimate_messages_tokens(messages)
+        if not self.budget.fits_in_budget(input_tokens, requested):
+            requested = self.budget.compute_safe_output_tokens(input_tokens)
+            if not self.budget.fits_in_budget(input_tokens, requested):
+                raise LLMTokenLimitError(
+                    f"[{stage}] call rejected before transmission: input~{input_tokens:,}, "
+                    f"output={requested:,}, context={self.budget.provider_context_limit:,}"
+                )
+        self.calls += 1
+        logger.info("[LLM] %s | input~%d | output<=%d | context=%d", stage, input_tokens, requested, self.budget.provider_context_limit)
+        # IMPORTANT: no seed/random_seed. Leanstral-compatible provider boundary.
+        raw = self.client.chat(messages, temperature=0.0, max_tokens=requested)
+        if self._is_truncated(raw):
+            self.truncated_retries += 1
+            logger.warning("[LLM] %s returned truncated output; retrying compactly", stage)
+            compact_user = user_prompt[: max(2000, int(len(user_prompt) * 0.70))]
+            compact_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": compact_user},
+            ]
+            compact_input = self.budget.estimate_messages_tokens(compact_messages)
+            retry_output = self.budget.compute_safe_output_tokens(compact_input)
+            retry_output = min(max(512, retry_output), cap)
+            if not self.budget.fits_in_budget(compact_input, retry_output):
+                raise LLMTokenLimitError(f"[{stage}] compact retry cannot fit provider context")
+            self.calls += 1
+            raw = self.client.chat(compact_messages, temperature=0.0, max_tokens=retry_output)
+        return safe_json_loads(raw, stage_name=stage)
+
+    # ------------------------------------------------------------------ #
+    # Perspective ecosystem — database first, never a generic dump
+    # ------------------------------------------------------------------ #
+    def load_perspective_ecosystem(self) -> List[Dict[str, Any]]:
+        country = _pf_norm(self.perspective.country)
+        candidates: List[Dict[str, Any]] = []
+        for canon in sorted(self.vault.node_metadata):
+            meta = self.vault.node_metadata[canon]
+            node_country = _pf_norm(meta.get("country", ""))
+            if not node_country:
+                path = str(meta.get("path", "")).lower()
+                node_country = country if country and country in path else ""
+            if node_country != country:
+                continue
+            candidates.append({
+                "node_id": self.vault.file_map.get(canon, canon),
+                "canonical_id": canon,
+                "type": meta.get("type", ""),
+                "sector": meta.get("sector", ""),
+                "summary": meta.get("summary", ""),
+                "path": meta.get("path", ""),
+            })
+        candidates.sort(key=lambda x: (x["sector"], x["type"], x["node_id"]))
+        logger.info("[PERSPECTIVE] %s ecosystem nodes available: %d", self.perspective.country, len(candidates))
+        return candidates[:MAX_PERSPECTIVE_ECOSYSTEM_NODES]
+
+    def _ecosystem_context(self, ecosystem: List[Dict[str, Any]]) -> str:
+        lines = [
+            f"PERSPECTIVE COUNTRY: {self.perspective.country} ({self.perspective.country_code})",
+            "This registry defines the perspective ecosystem. It is retrieval guidance, not proof of impact.",
+        ]
+        for n in ecosystem:
+            lines.append(
+                f"- NODE={n['node_id']} | type={n['type'] or 'unknown'} | sector={n['sector'] or 'unknown'} | summary={_pf_text(n['summary'], 240)}"
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    # Stage 1 — article facts and meaning
+    # ------------------------------------------------------------------ #
+    def understand_article(self, article_text: str) -> Dict[str, Any]:
+        system = """You are ATIS News Stage 1: Article Understanding.
+Your job is to understand ONLY what is contained in the supplied article.
+Do not search for external facts. Do not invent entities or relationships.
+Separate direct article facts from interpretation.
+Return JSON only.
+
+Required shape:
+{
+  "event": {"title":"", "summary":"", "event_country":"", "source_country":""},
+  "facts": [{"fact":"", "evidence":"", "importance":"high|medium|low"}],
+  "actors": [{"name":"", "role":"", "evidence":""}],
+  "mechanisms": [{"mechanism":"", "evidence":""}],
+  "meaning": [{"interpretation":"", "based_on_fact_indexes":[0]}],
+  "uncertainties": ["..."]
+}
+"""
+        user = f"ARTICLE:\n{article_text[:MAX_ARTICLE_CHARS]}"
+        result = self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 3072), "Article Understanding")
+        result.setdefault("event", {})
+        result.setdefault("facts", [])
+        result.setdefault("actors", [])
+        result.setdefault("mechanisms", [])
+        result.setdefault("meaning", [])
+        result.setdefault("uncertainties", [])
+        logger.info("[FACTS] %d facts | %d actors | %d mechanisms | %d meanings", len(_pf_safe_list(result["facts"])), len(_pf_safe_list(result["actors"])), len(_pf_safe_list(result["mechanisms"])), len(_pf_safe_list(result["meaning"])))
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Stage 2 — map meaning against the perspective ecosystem
+    # ------------------------------------------------------------------ #
+    def map_impact_domains(self, article: Dict[str, Any], ecosystem: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Map the event to the perspective ecosystem without sending the whole registry in one call."""
+        system = """You are ATIS News Stage 2: Perspective Impact Mapper.
+The analytical perspective is the selected country. Determine which areas of THAT
+country's supplied ecosystem should be investigated because of the event.
+
+IMPORTANT:
+- Do not claim that an impact exists merely because it is plausible.
+- Identify investigation targets/domains, not final opportunities.
+- Use only the supplied article understanding and supplied perspective ecosystem.
+- Do not create database relationships.
+- Do not use article entity names as direct vault queries.
+- The ecosystem registry contains node IDs that may be used as retrieval hints.
+Return JSON only.
+
+Required shape:
+{
+  "impact_domains":[
+    {"domain":"", "why_relevant":"", "mechanism":"", "priority":"high|medium|low", "ecosystem_node_hints":["exact supplied NODE IDs"]}
+  ],
+  "excluded_domains":[{"domain":"","reason":""}]
+}
+"""
+        # Use the model's actual context capacity to batch the perspective registry.
+        article_json = json.dumps(article, ensure_ascii=False)
+        safe_input_budget = max(1500, self.budget.usable_context_budget - self.budget.estimate_tokens(system) - 3072)
+        per_node_estimate = max(20, self.budget.estimate_tokens("NODE=xxxxxxxx | type= | sector= | summary=" + "x" * 180))
+        batch_size = max(8, min(80, safe_input_budget // per_node_estimate))
+        batches = [ecosystem[i:i + batch_size] for i in range(0, len(ecosystem), batch_size)] or [[]]
+        batches = batches[:MAX_PARTITIONS]
+        aggregate_domains: Dict[str, Dict[str, Any]] = {}
+        excluded: List[Dict[str, Any]] = []
+        for idx, batch in enumerate(batches, 1):
+            registry = self._ecosystem_context(batch)
+            user = f"ARTICLE UNDERSTANDING:\n{article_json[:9000]}\n\nPERSPECTIVE ECOSYSTEM BATCH {idx}/{len(batches)}:\n{registry}"
+            try:
+                result = self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 3072), f"Perspective Impact Mapping B{idx}")
+            except LLMTokenLimitError:
+                # Reduce the batch once more instead of failing the entire news analysis.
+                smaller = batch[:max(4, len(batch) // 2)]
+                registry = self._ecosystem_context(smaller)
+                user = f"ARTICLE UNDERSTANDING:\n{article_json[:6000]}\n\nPERSPECTIVE ECOSYSTEM:\n{registry}"
+                result = self._call_json(system, user, 2048, f"Perspective Impact Mapping B{idx} Compact")
+            for domain in _pf_safe_list(result.get("impact_domains")):
+                if not isinstance(domain, dict):
+                    continue
+                key = _pf_norm(domain.get("domain", ""))
+                if not key:
+                    continue
+                existing = aggregate_domains.get(key)
+                if existing is None:
+                    aggregate_domains[key] = dict(domain)
+                else:
+                    existing["ecosystem_node_hints"] = sorted(set(_pf_safe_list(existing.get("ecosystem_node_hints")) + _pf_safe_list(domain.get("ecosystem_node_hints"))))[:12]
+                    if str(domain.get("priority", "medium")) == "high":
+                        existing["priority"] = "high"
+                    if not existing.get("why_relevant") and domain.get("why_relevant"):
+                        existing["why_relevant"] = domain.get("why_relevant")
+                    if not existing.get("mechanism") and domain.get("mechanism"):
+                        existing["mechanism"] = domain.get("mechanism")
+            excluded.extend(_pf_safe_list(result.get("excluded_domains")))
+        domains = sorted(aggregate_domains.values(), key=lambda d: (0 if d.get("priority") == "high" else 1 if d.get("priority") == "medium" else 2, _pf_norm(d.get("domain", ""))))[:MAX_IMPACT_DOMAINS]
+        return {"impact_domains": domains, "excluded_domains": excluded[:MAX_IMPACT_DOMAINS]}
+
+    # ------------------------------------------------------------------ #
+    # Targeted DB retrieval
+    # ------------------------------------------------------------------ #
+    def _node_record(self, canon: str) -> Dict[str, Any]:
+        meta = self.vault.node_metadata.get(canon, {})
+        return {
+            "node_id": self.vault.file_map.get(canon, canon),
+            "canonical_id": canon,
+            "country": meta.get("country", ""),
+            "type": meta.get("type", ""),
+            "sector": meta.get("sector", ""),
+            "summary": meta.get("summary", ""),
+            "path": meta.get("path", ""),
+            "content": self.vault.node_content.get(canon, ""),
+        }
+
+    def _resolve_supplied_node(self, hint: str, ecosystem: List[Dict[str, Any]]) -> Optional[str]:
+        """Resolve only against supplied perspective ecosystem; similarity is never relationship evidence."""
+        target = _pf_norm(hint)
+        if not target:
+            return None
+        exact = []
+        for n in ecosystem:
+            if _pf_norm(n["node_id"]) == target or _pf_norm(n["canonical_id"]) == target:
+                exact.append(n["canonical_id"])
+        if exact:
+            return exact[0]
+        # Alias/normalized match against node name only.
+        candidates: List[Tuple[float, str]] = []
+        for n in ecosystem:
+            score = max(_pf_similarity(hint, n["node_id"]), _pf_similarity(hint, n.get("summary", "")))
+            if score >= MIN_NODE_RESOLUTION_SCORE:
+                candidates.append((score, n["canonical_id"]))
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        if candidates:
+            # Require a clear winner; do not force ambiguous matches.
+            if len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.12:
+                return candidates[0][1]
+        return None
+
+    def retrieve_targets(self, impact: Dict[str, Any], ecosystem: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        resolved: Dict[str, Dict[str, Any]] = {}
+        unresolved: List[Dict[str, Any]] = []
+        for domain in _pf_safe_list(impact.get("impact_domains")):
+            if not isinstance(domain, dict):
+                continue
+            hints = domain.get("ecosystem_node_hints", [])
+            if not hints:
+                # Domain-level targeting: sector/type matching is retrieval, not graph evidence.
+                sector = _pf_norm(domain.get("domain", ""))
+                hints = [n["node_id"] for n in ecosystem if sector and sector in _pf_norm(n.get("sector", ""))][:8]
+            found_for_domain = False
+            for hint in hints:
+                canon = self._resolve_supplied_node(str(hint), ecosystem)
+                if canon:
+                    found_for_domain = True
+                    rec = self._node_record(canon)
+                    rec["target_domains"] = sorted(set(rec.get("target_domains", []) + [domain.get("domain", "")]))
+                    resolved[canon] = rec
+                else:
+                    unresolved.append({"hint": str(hint), "domain": domain.get("domain", ""), "status": "UNRESOLVED"})
+            if not found_for_domain:
+                unresolved.append({"hint": domain.get("domain", ""), "domain": domain.get("domain", ""), "status": "NO_TARGET_NODE_RESOLVED"})
+        nodes = sorted(resolved.values(), key=lambda n: (n.get("sector", ""), n["node_id"]))[:MAX_RETRIEVAL_TARGETS]
+        logger.info("[RETRIEVAL] targeted nodes=%d unresolved targets=%d", len(nodes), len(unresolved))
+        return nodes, unresolved
+
+    # ------------------------------------------------------------------ #
+    # Actual graph traversal
+    # ------------------------------------------------------------------ #
+    def _canonical_from_actual(self, node_id: str) -> Optional[str]:
+        canon = self.vault._canonicalize(node_id)
+        if canon in self.vault.file_map:
+            return canon
+        return None
+
+    def traverse_graph(self, target_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        seeds = sorted({n["canonical_id"] for n in target_nodes if n.get("canonical_id") in self.vault.file_map})
+        visited: Dict[str, int] = {s: 0 for s in seeds}
+        queue: List[str] = list(seeds)
+        paths: List[Dict[str, Any]] = []
+        direct_edges: List[Dict[str, Any]] = []
+        first_nodes: Set[str] = set()
+        second_nodes: Set[str] = set()
+        backlink_candidates = 0
+
+        while queue and len(visited) <= MAX_GRAPH_NODES:
+            current = queue.pop(0)
+            depth = visited[current]
+            if depth >= MAX_GRAPH_DEPTH:
+                continue
+            current_actual = self.vault.file_map.get(current, current)
+            outgoing = sorted(self.vault.outbound_links.get(current, []), key=lambda x: self.vault._canonicalize(x))
+            incoming = sorted(self.vault.backlink_map.get(current, set()), key=lambda x: self.vault._canonicalize(x))
+            edges: List[Tuple[str, str]] = []
+            for target in outgoing:
+                target_canon = self.vault._canonicalize(target)
+                if target_canon in self.vault.file_map:
+                    edges.append((target_canon, "outbound_link"))
+            for source in incoming:
+                source_canon = self.vault._canonicalize(source)
+                if source_canon in self.vault.file_map:
+                    edges.append((source_canon, "inbound_backlink"))
+                    if source_canon not in visited:
+                        backlink_candidates += 1
+            seen_edge: Set[Tuple[str, str]] = set()
+            for neighbour, relation_type in sorted(edges, key=lambda x: (x[0], x[1])):
+                if (neighbour, relation_type) in seen_edge:
+                    continue
+                seen_edge.add((neighbour, relation_type))
+                next_depth = depth + 1
+                # A node already reached at an equal or lower depth is not a new
+                # first/second-order node. This prevents reverse backlinks from
+                # turning a seed node into a false second-order discovery.
+                if neighbour in visited:
+                    continue
+                if next_depth == 1:
+                    first_nodes.add(neighbour)
+                else:
+                    second_nodes.add(neighbour)
+                edge = {
+                    "from_node": current_actual,
+                    "to_node": self.vault.file_map.get(neighbour, neighbour),
+                    "relationship_type": relation_type,
+                    "depth": next_depth,
+                    "source": "database",
+                }
+                direct_edges.append(edge)
+                paths.append({
+                    "nodes": [self.vault.file_map.get(current, current), self.vault.file_map.get(neighbour, neighbour)],
+                    "edges": [edge],
+                    "depth": next_depth,
+                    "source": "database",
+                })
+                if len(visited) < MAX_GRAPH_NODES:
+                    visited[neighbour] = next_depth
+                    queue.append(neighbour)
+        # Convert reachable nodes to records.
+        direct_set = set(seeds)
+        graph_nodes: Dict[str, Dict[str, Any]] = {}
+        for canon, depth in sorted(visited.items(), key=lambda x: (x[1], x[0])):
+            rec = self._node_record(canon)
+            if canon in direct_set:
+                category = "target"
+            elif depth == 1:
+                category = "first_order"
+            else:
+                category = "second_order"
+            rec["graph_depth"] = depth
+            rec["graph_category"] = category
+            graph_nodes[canon] = rec
+        paths = paths[:MAX_GRAPH_PATHS]
+        logger.info(
+            "[GRAPH] targets=%d | direct=%d | first-order=%d | second-order=%d | backlink candidates=%d | paths=%d",
+            len(seeds), len(direct_set), len(first_nodes), len(second_nodes), backlink_candidates, len(paths)
+        )
+        return {
+            "target_nodes": sorted(graph_nodes[c] for c in direct_set if c in graph_nodes),
+            "nodes": list(graph_nodes.values()),
+            "edges": direct_edges[:MAX_GRAPH_PATHS],
+            "paths": paths,
+            "direct_nodes": len(direct_set),
+            "first_order_nodes": len(first_nodes),
+            "second_order_nodes": len(second_nodes),
+            "backlink_candidates": backlink_candidates,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Graph interpretation — LLM sees verified graph, not raw vault universe
+    # ------------------------------------------------------------------ #
+    def _graph_context(self, graph: Dict[str, Any]) -> str:
+        lines = ["VERIFIED DATABASE GRAPH — relationships are authoritative and may not be invented."]
+        for edge in graph.get("edges", [])[:MAX_GRAPH_PATHS]:
+            lines.append(
+                f"EDGE: {edge['from_node']} --{edge['relationship_type']}--> {edge['to_node']} | depth={edge['depth']} | source=database"
+            )
+        lines.append("NODE EVIDENCE:")
+        for n in graph.get("nodes", [])[:MAX_GRAPH_NODES]:
+            lines.append(
+                f"NODE: {n['node_id']} | country={n.get('country','')} | type={n.get('type','')} | sector={n.get('sector','')} | depth={n.get('graph_depth')} | category={n.get('graph_category')} | summary={_pf_text(n.get('summary',''), 220)}"
+            )
+        return "\n".join(lines)
+
+    def analyze_graph_partition(self, article: Dict[str, Any], impact: Dict[str, Any], graph_nodes: List[Dict[str, Any]], graph_edges: List[Dict[str, Any]], partition_no: int) -> Dict[str, Any]:
+        system = """You are ATIS News Graph Consequence Analyst.
+You are given a news event, its meaning, perspective impact domains, and a subset
+of VERIFIED database graph nodes/edges.
+
+The database graph is authoritative. You may interpret it, but you may NOT create
+new graph edges or factual entities. If a relationship is absent, it is absent.
+Distinguish supported consequence from hypothesis and research-required gaps.
+Do not turn mere node co-occurrence into a relationship.
+Return JSON only.
+
+Shape:
+{
+ "consequences":[{"statement":"","order":"direct|first_order|second_order","supporting_nodes":[""],"supporting_edges":["FROM->TO"],"confidence":0.0}],
+ "gaps":[{"gap":"","missing_relationship":"","status":"RESEARCH_REQUIRED","related_nodes":[""]}],
+ "opportunity_signals":[{"signal":"","status":"SUPPORTED|RESEARCH_REQUIRED","supporting_nodes":[""],"supporting_edges":[""]}],
+ "risk_signals":[{"signal":"","status":"SUPPORTED|RESEARCH_REQUIRED","supporting_nodes":[""],"supporting_edges":[""]}]
+}
+"""
+        compact_nodes = []
+        for n in graph_nodes[:MAX_GRAPH_NODES_PER_LLM_PARTITION]:
+            compact_nodes.append({k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")})
+        compact_edges = [
+            {"from_node": e["from_node"], "to_node": e["to_node"], "relationship_type": e["relationship_type"], "depth": e["depth"]}
+            for e in graph_edges[:MAX_GRAPH_NODES_PER_LLM_PARTITION * 2]
+        ]
+        user = (
+            f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
+            f"ARTICLE MEANING={json.dumps(article.get('meaning', []), ensure_ascii=False)}\n"
+            f"IMPACT DOMAINS={json.dumps(impact.get('impact_domains', []), ensure_ascii=False)}\n"
+            f"VERIFIED NODES={json.dumps(compact_nodes, ensure_ascii=False)}\n"
+            f"VERIFIED EDGES={json.dumps(compact_edges, ensure_ascii=False)}"
+        )
+        return self._call_json(system, user, MAX_STAGE_OUTPUT_TOKENS, f"Graph Consequence Partition {partition_no}")
+
+    def analyze_graph(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], reasoning_log: ReasoningLog) -> Dict[str, Any]:
+        nodes = [n for n in graph.get("nodes", []) if isinstance(n, dict)]
+        edges = [e for e in graph.get("edges", []) if isinstance(e, dict)]
+        if not nodes:
+            return {"consequences": [], "gaps": [{"gap": "No targeted graph nodes were resolved", "status": "RESEARCH_REQUIRED", "related_nodes": []}], "opportunity_signals": [], "risk_signals": []}
+        partitions: List[List[Dict[str, Any]]] = []
+        for i in range(0, len(nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION):
+            if len(partitions) >= MAX_PARTITIONS:
+                break
+            partitions.append(nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION])
+        reasoning_log.partitions = len(partitions)
+        combined = {"consequences": [], "gaps": [], "opportunity_signals": [], "risk_signals": []}
+        for idx, part in enumerate(partitions, 1):
+            part_ids = {n["node_id"] for n in part}
+            part_edges = [e for e in edges if e.get("from_node") in part_ids or e.get("to_node") in part_ids]
+            result = self.analyze_graph_partition(article, impact, part, part_edges, idx)
+            for key in combined:
+                combined[key].extend(_pf_safe_list(result.get(key)))
+            reasoning_log.evidence_calls += 1
+        return combined
+
+    # ------------------------------------------------------------------ #
+    # Impact-chain construction from verified stages
+    # ------------------------------------------------------------------ #
+    def build_impact_chain(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], consequences: Dict[str, Any]) -> List[Dict[str, Any]]:
+        chain: List[Dict[str, Any]] = []
+        event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
+        chain.append({
+            "stage": "external_event",
+            "label": event.get("title") or event.get("summary") or "Article event",
+            "status": "SUPPORTED",
+            "source": "article",
+            "evidence": [f"article_fact_{i}" for i, _ in enumerate(_pf_safe_list(article.get("facts")))],
+        })
+        meanings = _pf_safe_list(article.get("meaning"))
+        if meanings:
+            chain.append({
+                "stage": "meaning",
+                "label": _pf_text(meanings[0].get("interpretation", ""), 500) if isinstance(meanings[0], dict) else _pf_text(meanings[0], 500),
+                "status": "INTERPRETATION",
+                "source": "llm_article_interpretation",
+                "evidence": meanings[0].get("based_on_fact_indexes", []) if isinstance(meanings[0], dict) else [],
+            })
+        for domain in _pf_safe_list(impact.get("impact_domains"))[:MAX_IMPACT_DOMAINS]:
+            if isinstance(domain, dict):
+                chain.append({
+                    "stage": "zimbabwe_ecosystem" if _pf_norm(self.perspective.country) == "zimbabwe" else "perspective_ecosystem",
+                    "label": domain.get("domain", ""),
+                    "status": "INVESTIGATION_TARGET",
+                    "source": "perspective_ecosystem",
+                    "mechanism": domain.get("mechanism", ""),
+                    "priority": domain.get("priority", "medium"),
+                })
+        for edge in graph.get("edges", [])[:MAX_GRAPH_PATHS]:
+            chain.append({
+                "stage": "graph_relationship",
+                "label": f"{edge.get('from_node')} → {edge.get('to_node')}",
+                "status": "SUPPORTED",
+                "source": "database",
+                "relationship": edge.get("relationship_type"),
+                "depth": edge.get("depth"),
+                "evidence": [f"{edge.get('from_node')}->{edge.get('to_node')}"]
+            })
+        for item in _pf_safe_list(consequences.get("consequences"))[:20]:
+            if isinstance(item, dict):
+                chain.append({
+                    "stage": "consequence" if item.get("order") != "second_order" else "second_order_effect",
+                    "label": item.get("statement", ""),
+                    "status": "SUPPORTED" if item.get("supporting_edges") or item.get("supporting_nodes") else "RESEARCH_REQUIRED",
+                    "source": "verified_graph_interpretation",
+                    "evidence": item.get("supporting_nodes", []),
+                    "graph_edges": item.get("supporting_edges", []),
+                    "confidence": item.get("confidence", 0.0),
+                })
+        for gap in _pf_safe_list(consequences.get("gaps"))[:20]:
+            if isinstance(gap, dict):
+                chain.append({
+                    "stage": "gap",
+                    "label": gap.get("gap", ""),
+                    "status": "RESEARCH_REQUIRED",
+                    "source": "database_graph_gap",
+                    "evidence": gap.get("related_nodes", []),
+                    "missing_relationship": gap.get("missing_relationship", ""),
+                })
+        return chain[:MAX_GRAPH_PATHS + MAX_IMPACT_DOMAINS + 10]
+
+    # ------------------------------------------------------------------ #
+    # Final synthesis from distilled evidence
+    # ------------------------------------------------------------------ #
+    def final_synthesis(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], consequences: Dict[str, Any], impact_chain: List[Dict[str, Any]]) -> Dict[str, Any]:
+        system = """You are the ATIS News Final Synthesis Engine.
+Produce the final dashboard from the supplied structured analysis.
+
+HARD RULES:
+1. The selected perspective country is the lens. Never switch to a local source-country perspective.
+2. Database nodes and edges are authoritative. Do not invent missing edges.
+3. Opportunities must be supported by at least one verified database node AND one verified graph edge/path, unless explicitly labelled RESEARCH_REQUIRED.
+4. If evidence is missing, say RESEARCH_REQUIRED rather than filling the gap with world knowledge.
+5. Never infer a relationship merely because two nodes appear in the same context.
+6. Preserve the impact chain exactly as an evidence trail.
+7. Return concise JSON. Do not write an essay.
+
+Return:
+{
+ "trigger_event":"",
+ "market_equilibrium_shift":"",
+ "executive_summary":"",
+ "analytical_perspective":{"country":"","country_code":"","description":""},
+ "facts":[],
+ "meaning":[],
+ "impact_domains":[],
+ "impact_chain":[],
+ "findings":[],
+ "opportunities":[{"opportunity_id":"","title":"","status":"SUPPORTED|RESEARCH_REQUIRED","perspective_country":"","opportunity_country":"","perspective_actor":"","perspective_capability":"","pathway":"","justification":"","urgency_score":0.0,"feasibility_score":0.0,"source_nodes":[],"graph_paths":[],"required_missing_nodes":[]}],
+ "risks":[{"text":"","status":"SUPPORTED|RESEARCH_REQUIRED","severity":"high|medium|low","source_nodes":[],"graph_paths":[]}],
+ "gaps":[{"gap":"","status":"RESEARCH_REQUIRED","related_nodes":[],"missing_relationship":""}],
+ "entities":[],
+ "graph_analysis":{"direct":0,"first_order":0,"second_order":0,"backlink_candidates":0,"paths":[]}
+}
+"""
+        # Final prompt uses distilled graph and consequences, not the entire vault.
+        graph_summary = {
+            "nodes": [
+                {k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")}
+                for n in graph.get("nodes", [])[:MAX_GRAPH_NODES]
+            ],
+            "edges": graph.get("edges", [])[:MAX_GRAPH_PATHS],
+        }
+        user = (
+            f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
+            f"ARTICLE={json.dumps(article, ensure_ascii=False)[:6000]}\n"
+            f"IMPACT={json.dumps(impact, ensure_ascii=False)[:5000]}\n"
+            f"GRAPH={json.dumps(graph_summary, ensure_ascii=False)[:12000]}\n"
+            f"CONSEQUENCES={json.dumps(consequences, ensure_ascii=False)[:10000]}\n"
+            f"IMPACT_CHAIN={json.dumps(impact_chain, ensure_ascii=False)[:10000]}"
+        )
+        result = self._call_json(system, user, MAX_FINAL_OUTPUT_TOKENS, "Final News Synthesis")
+        result["impact_chain"] = impact_chain
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Deterministic validation / post-processing
+    # ------------------------------------------------------------------ #
+    def validate_and_ground(self, dashboard: Dict[str, Any], graph: Dict[str, Any], ecosystem: List[Dict[str, Any]], article: Dict[str, Any], impact: Dict[str, Any], consequences: Dict[str, Any]) -> Dict[str, Any]:
+        valid_nodes = {n["node_id"] for n in graph.get("nodes", [])}
+        valid_edges = {f"{e.get('from_node')}->{e.get('to_node')}" for e in graph.get("edges", [])}
+        perspective_nodes = {n["node_id"] for n in ecosystem}
+        opportunities: List[Dict[str, Any]] = []
+        for opp in _pf_safe_list(dashboard.get("opportunities")):
+            if not isinstance(opp, dict):
+                continue
+            source_nodes = [str(x) for x in _pf_safe_list(opp.get("source_nodes")) if str(x) in valid_nodes]
+            graph_paths = [str(x) for x in _pf_safe_list(opp.get("graph_paths")) if str(x) in valid_edges]
+            actor = str(opp.get("perspective_actor", ""))
+            actor_supported = not actor or actor in perspective_nodes
+            supported = bool(source_nodes and graph_paths and actor_supported)
+            item = dict(opp)
+            item["source_nodes"] = source_nodes
+            item["graph_paths"] = graph_paths
+            if not supported:
+                item["status"] = "RESEARCH_REQUIRED"
+                item["opportunity_confidence"] = min(float(item.get("opportunity_confidence", 0.0) or 0.0), 0.49)
+                if not item.get("required_missing_nodes"):
+                    item["required_missing_nodes"] = ["verified graph pathway and/or perspective actor evidence"]
+            else:
+                item["status"] = "SUPPORTED"
+                item["opportunity_confidence"] = max(float(item.get("opportunity_confidence", 0.0) or 0.0), MIN_OPPORTUNITY_GRAPH_SCORE)
+            item.setdefault("perspective_country", self.perspective.country)
+            item.setdefault("perspective_country_code", self.perspective.country_code)
+            opportunities.append(item)
+        dashboard["opportunities"] = opportunities
+
+        risks: List[Dict[str, Any]] = []
+        for risk in _pf_safe_list(dashboard.get("risks")):
+            if not isinstance(risk, dict):
+                continue
+            item = dict(risk)
+            item["source_nodes"] = [str(x) for x in _pf_safe_list(item.get("source_nodes")) if str(x) in valid_nodes]
+            item["graph_paths"] = [str(x) for x in _pf_safe_list(item.get("graph_paths")) if str(x) in valid_edges]
+            if not item["source_nodes"]:
+                item["status"] = "RESEARCH_REQUIRED"
+            else:
+                item.setdefault("status", "SUPPORTED")
+            risks.append(item)
+        dashboard["risks"] = risks
+
+        dashboard.setdefault("gaps", consequences.get("gaps", []))
+        dashboard.setdefault("findings", [])
+        dashboard.setdefault("entities", article.get("actors", []))
+        dashboard["analytical_perspective"] = {
+            "country": self.perspective.country,
+            "country_code": self.perspective.country_code,
+            "description": "Country through which this event is interpreted.",
+        }
+        dashboard["graph_analysis"] = {
+            "direct": graph.get("direct_nodes", 0),
+            "first_order": graph.get("first_order_nodes", 0),
+            "second_order": graph.get("second_order_nodes", 0),
+            "backlink_candidates": graph.get("backlink_candidates", 0),
+            "paths": graph.get("paths", [])[:MAX_GRAPH_PATHS],
+        }
+        dashboard["source_country"] = article.get("event", {}).get("source_country", "") if isinstance(article.get("event"), dict) else ""
+        dashboard["event_country"] = article.get("event", {}).get("event_country", "") if isinstance(article.get("event"), dict) else ""
+        return dashboard
+
+    # ------------------------------------------------------------------ #
+    # Full pipeline
+    # ------------------------------------------------------------------ #
+    def run(self, article_text: str, reasoning_log: ReasoningLog) -> Dict[str, Any]:
+        if not article_text or not article_text.strip():
+            raise ValueError("News article text is empty")
+        article_text = article_text.strip()
+        if len(article_text) > MAX_ARTICLE_CHARS:
+            article_text = article_text[:MAX_ARTICLE_CHARS] + "\n[ARTICLE TRUNCATED BEFORE ANALYSIS]"
+
+        ecosystem = self.load_perspective_ecosystem()
+        reasoning_log.perspective_nodes = len(ecosystem)
+        article = self.understand_article(article_text)
+        reasoning_log.entities_extracted = len(_pf_safe_list(article.get("actors")))
+        impact = self.map_impact_domains(article, ecosystem)
+        reasoning_log.impact_domains = len(_pf_safe_list(impact.get("impact_domains")))
+        targets, unresolved = self.retrieve_targets(impact, ecosystem)
+        reasoning_log.retrieval_targets = len(targets)
+        reasoning_log.candidate_nodes = len(self.vault.file_map)
+        graph = self.traverse_graph(targets)
+        reasoning_log.direct_graph_nodes = graph.get("direct_nodes", 0)
+        reasoning_log.first_order_graph_nodes = graph.get("first_order_nodes", 0)
+        reasoning_log.second_order_graph_nodes = graph.get("second_order_nodes", 0)
+        reasoning_log.backlink_candidates = graph.get("backlink_candidates", 0)
+        reasoning_log.graph_paths = len(graph.get("paths", []))
+        reasoning_log.relevant_nodes = len(graph.get("nodes", []))
+        reasoning_log.selected_evidence = len(graph.get("nodes", []))
+
+        if graph.get("nodes"):
+            reasoning_log.reasoning_mode = ReasoningMode.MULTI_STAGE.value
+            consequences = self.analyze_graph(article, impact, graph, reasoning_log)
+        else:
+            reasoning_log.reasoning_mode = "perspective_only_no_graph_evidence"
+            consequences = {
+                "consequences": [],
+                "gaps": [{
+                    "gap": "No evidence-backed relationship was found between the identified perspective targets and the current graph.",
+                    "status": "RESEARCH_REQUIRED",
+                    "related_nodes": [n["node_id"] for n in targets],
+                }],
+                "opportunity_signals": [],
+                "risk_signals": [],
+            }
+        impact_chain = self.build_impact_chain(article, impact, graph, consequences)
+        dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
+        dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
+        dashboard["facts"] = article.get("facts", [])
+        dashboard["meaning"] = article.get("meaning", [])
+        dashboard["impact_domains"] = impact.get("impact_domains", [])
+        dashboard["impact_chain"] = impact_chain
+        dashboard["research_required"] = unresolved + _pf_safe_list(consequences.get("gaps"))
+        reasoning_log.gaps = len(_pf_safe_list(dashboard.get("gaps")))
+        reasoning_log.opportunities = len(_pf_safe_list(dashboard.get("opportunities")))
+        reasoning_log.total_llm_calls = self.calls
+        return dashboard
+
+
+# --------------------------------------------------------------------------- #
+# Backward-compatible helper builders now operate on the perspective-first data
+# --------------------------------------------------------------------------- #
+def _pf_build_reasoning_metadata(
+    reasoning_log: ReasoningLog,
+    engine: PerspectiveFirstNewsEngine,
+    vault: ObsidianVaultManager,
+    perspective: PerspectiveContext,
+    article: Dict[str, Any],
+    dashboard: Dict[str, Any],
+    knowledge_state: KnowledgeState,
+) -> Dict[str, Any]:
+    event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
+    core_event = event.get("title") or event.get("summary") or dashboard.get("trigger_event") or "Unknown event"
+    try:
+        knowledge_hash = knowledge_state.knowledge_state_hash
+    except Exception:
+        knowledge_hash = getattr(knowledge_state, "hash", "")
+    evidence_ids = sorted(str(x) for x in dashboard.get("graph_analysis", {}).get("paths", []))
+    entity_ids = sorted(str(x.get("node_id", x)) if isinstance(x, dict) else str(x) for x in dashboard.get("entities", []))
+    try:
+        fingerprint = compute_analysis_fingerprint(
+            story_id=core_event,
+            perspective=perspective,
+            evidence_ids=evidence_ids,
+            entity_ids=entity_ids,
+            relationship_ids=sorted(f"{e.get('from_node')}->{e.get('to_node')}" for e in dashboard.get("graph_analysis", {}).get("paths", []) if isinstance(e, dict)),
+            knowledge_state_hash=knowledge_hash,
+        )
+    except Exception:
+        fingerprint = hashlib.sha256(json.dumps(dashboard, sort_keys=True, default=str).encode()).hexdigest()[:24]
+    reasoning_data = reasoning_log.to_dict()
+    # The original ReasoningLog predates the perspective-first counters. Include
+    # them without breaking callers that depend on its legacy to_dict shape.
+    for attr in (
+        "perspective_nodes", "impact_domains", "retrieval_targets",
+        "direct_graph_nodes", "first_order_graph_nodes", "second_order_graph_nodes",
+        "graph_paths", "gaps", "opportunities",
+    ):
+        reasoning_data[attr] = getattr(reasoning_log, attr, 0)
+
+    return {
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "architecture": "perspective_first_graph_grounded",
+        "architecture_version": PERSPECTIVE_FIRST_VERSION,
+        "source_article": "web_upload",
+        "core_event": core_event,
+        "source_country": dashboard.get("source_country", ""),
+        "event_country": dashboard.get("event_country", ""),
+        "perspective_country": perspective.country,
+        "perspective_country_code": perspective.country_code,
+        "model_primary": getattr(engine.config, "model", ""),
+        "model_fallback": getattr(engine.config, "fallback_model", ""),
+        "seed_sent_to_provider": False,
+        "selected_evidence_nodes": dashboard.get("graph_analysis", {}).get("direct", 0) + dashboard.get("graph_analysis", {}).get("first_order", 0) + dashboard.get("graph_analysis", {}).get("second_order", 0),
+        "cross_border_bridges_found": len(vault.build_cross_border_bridge_context(perspective, dashboard.get("source_country", "") or perspective.country)),
+        "analysis_version": ANALYSIS_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "analysis_fingerprint": fingerprint,
+        "knowledge_state": knowledge_state.as_dict() if hasattr(knowledge_state, "as_dict") else {"hash": knowledge_hash},
+        "reasoning_log": reasoning_data,
+        "llm_calls": engine.calls,
+        "truncated_retries": engine.truncated_retries,
+    }
+
+
+def _pf_finalize_dashboard(
+    dashboard: Dict[str, Any],
+    perspective: PerspectiveContext,
+    engine: PerspectiveFirstNewsEngine,
+    reasoning_log: ReasoningLog,
+    vault: ObsidianVaultManager,
+) -> Dict[str, Any]:
+    """Canonical response shaping while retaining legacy frontend fields."""
+    dashboard = dict(dashboard or {})
+    dashboard.setdefault("intelligence_id", f"ATIS-INT-{hashlib.sha256(str(dashboard.get('trigger_event','')).encode()).hexdigest()[:12].upper()}")
+    dashboard.setdefault("trigger_event", "Unknown event")
+    dashboard.setdefault("executive_summary", "No executive summary was generated.")
+    dashboard["perspective"] = perspective.as_dict()
+    dashboard["analytical_perspective"] = dashboard.get("analytical_perspective") or {
+        "country": perspective.country,
+        "country_code": perspective.country_code,
+        "description": "Country through which this event is interpreted.",
+    }
+    dashboard.setdefault("cross_border_analysis", {
+        "event_country": dashboard.get("event_country", ""),
+        "source_country": dashboard.get("source_country", ""),
+        "cross_border_bridges": [],
+        "cross_border_bridges_count": 0,
+    })
+    dashboard.setdefault("opportunities", [])
+    dashboard.setdefault("risks", [])
+    dashboard.setdefault("gaps", [])
+    dashboard.setdefault("entities", [])
+    dashboard.setdefault("findings", [])
+    dashboard.setdefault("facts", [])
+    dashboard.setdefault("meaning", [])
+    dashboard.setdefault("impact_domains", [])
+    dashboard.setdefault("impact_chain", [])
+    return dashboard
+
+
+# --------------------------------------------------------------------------- #
+# Production entry points — these override the legacy orchestration functions
+# without removing their implementation above.
+# --------------------------------------------------------------------------- #
+def _run_perspective_first_news(article_text: str, perspective: Any | None = None, source_label: str = "web_upload") -> Dict[str, Any]:
+    perspective = perspective or PerspectiveContext()
+    reasoning_log = ReasoningLog()
+    logger.info("=" * 78)
+    logger.info("ATIS NEWS v%s | PERSPECTIVE-FIRST | %s (%s)", PERSPECTIVE_FIRST_VERSION, perspective.country, perspective.country_code)
+    logger.info("=" * 78)
+    vault = ObsidianVaultManager()
+    engine = PerspectiveFirstNewsEngine(vault, perspective)
+    knowledge_state = KnowledgeState(vault_path=vault.vault_dir)
+    knowledge_state.compute()
+    dashboard = engine.run(article_text, reasoning_log)
+    dashboard = _pf_finalize_dashboard(dashboard, perspective, engine, reasoning_log, vault)
+    dashboard["pipeline_metadata"] = _pf_build_reasoning_metadata(reasoning_log, engine, vault, perspective, {
+        "event": {"title": dashboard.get("trigger_event", ""), "source_country": dashboard.get("source_country", ""), "event_country": dashboard.get("event_country", "")},
+        "facts": dashboard.get("facts", []),
+    }, dashboard, knowledge_state)
+    dashboard["pipeline_metadata"]["source_article"] = source_label
+    dashboard["pipeline_metadata"]["reasoning_log"] = dict(dashboard["pipeline_metadata"].get("reasoning_log", {}))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}.json"
+    try:
+        output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
+        dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
+        logger.info("[FINAL] Dashboard persisted: %s", output_path.resolve())
+    except Exception as exc:
+        logger.error("[FINAL] Failed to persist dashboard: %s", exc)
+    logger.info("\n%s", reasoning_log.log_tree())
+    logger.info("=" * 78)
+    logger.info("ATIS NEWS PIPELINE COMPLETE")
+    logger.info("=" * 78)
+    return dashboard
+
+
+def process_article_pipeline(article_path: str, perspective: Any | None = None) -> Dict[str, Any]:
+    article_file = Path(article_path)
+    if not article_file.exists():
+        raise FileNotFoundError(f"Article not found: {article_path}")
+    article_text = article_file.read_text(encoding="utf-8")
+    return _run_perspective_first_news(article_text, perspective, source_label="file_upload")
+
+
+def run_news_pipeline(article_text: str, perspective: Any | None = None) -> Dict[str, Any]:
+    return _run_perspective_first_news(article_text, perspective, source_label="web_upload")
+
+
 # --------------------------------------------------------------------------- #
 # CLI Entry Point
 # --------------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ATIS News — Intelligent Retrieval & Multi-Stage Reasoning Engine",
-        epilog="Example: python ATIS_News.py ./articles/cobalt_news.txt",
+        description="ATIS News — Perspective-First, Graph-Grounded Intelligence Engine",
+        epilog="Example: python ATIS_News.py ./articles/news.txt",
     )
-    parser.add_argument(
-        "article_path",
-        metavar="ARTICLE",
-        help="Path to the plain-text news article to process.",
-    )
+    parser.add_argument("article_path", metavar="ARTICLE", help="Path to the plain-text news article to process.")
     args = parser.parse_args()
-
     try:
         result = process_article_pipeline(args.article_path)
         print(json.dumps(result, indent=2, ensure_ascii=False))
