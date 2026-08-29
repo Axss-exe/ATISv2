@@ -106,6 +106,18 @@ class EvidenceCategory(Enum):
     BRIDGE = "bridge"             # Cross-border bridge nodes
     GLOBAL = "global"             # Background registry nodes
 
+# Explicit analytical priority. Never rely on lexical ordering of enum values.
+EVIDENCE_CATEGORY_PRIORITY = {
+    EvidenceCategory.DIRECT: 0,
+    EvidenceCategory.FIRST_ORDER: 1,
+    EvidenceCategory.SECOND_ORDER: 2,
+    EvidenceCategory.PERIPHERAL: 3,
+    EvidenceCategory.PERSPECTIVE: 4,
+    EvidenceCategory.BRIDGE: 5,
+    EvidenceCategory.GLOBAL: 6,
+}
+
+
 class OpportunityType(Enum):
     EXPLICIT = "explicit"         # Source directly indicates opportunity
     DERIVED = "derived"           # Evidence supports reasonable strategic opportunity
@@ -951,7 +963,7 @@ class ObsidianVaultManager:
                     existing.evidence_strength = max(existing.evidence_strength, node.evidence_strength)
                     existing.source_entities = list(set(existing.source_entities + node.source_entities))
                     # Upgrade category if better
-                    if node.category.value < existing.category.value:
+                    if EVIDENCE_CATEGORY_PRIORITY.get(node.category, 999) < EVIDENCE_CATEGORY_PRIORITY.get(existing.category, 999):
                         existing.category = node.category
                 else:
                     all_nodes[canon] = node
@@ -980,37 +992,37 @@ class ObsidianVaultManager:
 
         # Direct: take all (they're the most relevant)
         direct = [n for n in deduped.values() if n.category == EvidenceCategory.DIRECT]
-        direct.sort(key=lambda n: n.composite_score, reverse=True)
+        direct.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(direct[:MAX_DIRECT_EVIDENCE_NODES])
 
         # First-order
         first = [n for n in deduped.values() if n.category == EvidenceCategory.FIRST_ORDER]
-        first.sort(key=lambda n: n.composite_score, reverse=True)
+        first.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(first[:MAX_FIRST_ORDER_NODES])
 
         # Second-order
         second = [n for n in deduped.values() if n.category == EvidenceCategory.SECOND_ORDER]
-        second.sort(key=lambda n: n.composite_score, reverse=True)
+        second.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(second[:MAX_SECOND_ORDER_NODES])
 
         # Peripheral (low-value second-order)
         peripheral = [n for n in deduped.values() if n.category == EvidenceCategory.PERIPHERAL]
-        peripheral.sort(key=lambda n: n.composite_score, reverse=True)
+        peripheral.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(peripheral[:MAX_PERIPHERAL_NODES])
 
         # Perspective
         persp = [n for n in deduped.values() if n.category == EvidenceCategory.PERSPECTIVE]
-        persp.sort(key=lambda n: n.composite_score, reverse=True)
+        persp.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(persp[:MAX_PERSPECTIVE_NODES])
 
         # Bridge
         bridge = [n for n in deduped.values() if n.category == EvidenceCategory.BRIDGE]
-        bridge.sort(key=lambda n: n.composite_score, reverse=True)
+        bridge.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(bridge[:MAX_BRIDGE_NODES])
 
         # Global (diversity)
         glob = [n for n in deduped.values() if n.category == EvidenceCategory.GLOBAL]
-        glob.sort(key=lambda n: n.composite_score, reverse=True)
+        glob.sort(key=lambda n: (-n.composite_score, n.canonical_id))
         final_selection.extend(glob[:MAX_GLOBAL_REGISTRY_NODES])
 
         # Compute diversity scores
@@ -1030,7 +1042,7 @@ class ObsidianVaultManager:
             n.diversity_score = (sector_rarity + country_rarity + type_rarity) / 3.0
 
         # Re-sort by composite score (which now includes diversity)
-        final_selection.sort(key=lambda n: n.composite_score, reverse=True)
+        final_selection.sort(key=lambda n: (-n.composite_score, n.canonical_id))
 
         # Update reasoning log
         reasoning_log.candidate_nodes = len(self.file_map)
@@ -1813,7 +1825,7 @@ def partition_evidence(
     available_per_partition = budget.usable_context_budget - base_tokens - 4096  # reserve output
 
     for sector, sector_nodes in sorted_sectors:
-        for node in sorted(sector_nodes, key=lambda n: n.composite_score, reverse=True):
+        for node in sorted(sector_nodes, key=lambda n: (-n.composite_score, n.canonical_id)):
             node_block = _estimate_node_block_tokens(node)
 
             if not current_partition_nodes:
@@ -1852,7 +1864,7 @@ def partition_evidence(
     if len(partitions) > MAX_PARTITIONS:
         logger.warning("Too many partitions (%d). Merging smallest into largest.", len(partitions))
         # Sort by importance (total score)
-        partitions.sort(key=lambda p: sum(n.composite_score for n in p.nodes), reverse=True)
+        partitions.sort(key=lambda p: (-sum(n.composite_score for n in p.nodes), p.partition_id))
         merged = partitions[:MAX_PARTITIONS - 1]
         remainder = []
         for p in partitions[MAX_PARTITIONS - 1:]:
@@ -1891,7 +1903,7 @@ def build_perspective_registry(
 ) -> str:
     """Build perspective actor registry from selected perspective nodes."""
     perspective_nodes = [n for n in selected_nodes if n.category == EvidenceCategory.PERSPECTIVE]
-    perspective_nodes.sort(key=lambda n: n.composite_score, reverse=True)
+    perspective_nodes.sort(key=lambda n: (-n.composite_score, n.canonical_id))
 
     lines = [f"=== PERSPECTIVE ACTOR REGISTRY ({perspective.country}) ==="]
     for node in perspective_nodes[:max_nodes]:
@@ -2516,6 +2528,19 @@ def _pf_text(value: Any, limit: int = 1200) -> str:
     return text if len(text) <= limit else text[:limit] + " [TRUNCATED]"
 
 
+def _pf_safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert model-provided numeric fields safely without allowing malformed JSON to crash grounding."""
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not (-1e9 < number < 1e9):
+        return default
+    return number
+
+
 class PerspectiveFirstNewsEngine:
     """
     Production News engine implementing the perspective-first ATIS architecture.
@@ -2905,7 +2930,13 @@ Required shape:
             len(seeds), len(direct_set), len(first_nodes), len(second_nodes), backlink_candidates, len(paths)
         )
         return {
-            "target_nodes": sorted(graph_nodes[c] for c in direct_set if c in graph_nodes),
+            # Sort canonical IDs first; graph_nodes values are dictionaries and are
+            # not orderable in Python 3. This also guarantees deterministic output.
+            "target_nodes": [
+                graph_nodes[c]
+                for c in sorted(direct_set)
+                if c in graph_nodes
+            ],
             "nodes": list(graph_nodes.values()),
             "edges": direct_edges[:MAX_GRAPH_PATHS],
             "paths": paths,
@@ -3127,12 +3158,12 @@ Return:
             item["graph_paths"] = graph_paths
             if not supported:
                 item["status"] = "RESEARCH_REQUIRED"
-                item["opportunity_confidence"] = min(float(item.get("opportunity_confidence", 0.0) or 0.0), 0.49)
+                item["opportunity_confidence"] = min(_pf_safe_float(item.get("opportunity_confidence", 0.0)), 0.49)
                 if not item.get("required_missing_nodes"):
                     item["required_missing_nodes"] = ["verified graph pathway and/or perspective actor evidence"]
             else:
                 item["status"] = "SUPPORTED"
-                item["opportunity_confidence"] = max(float(item.get("opportunity_confidence", 0.0) or 0.0), MIN_OPPORTUNITY_GRAPH_SCORE)
+                item["opportunity_confidence"] = max(_pf_safe_float(item.get("opportunity_confidence", 0.0)), MIN_OPPORTUNITY_GRAPH_SCORE)
             item.setdefault("perspective_country", self.perspective.country)
             item.setdefault("perspective_country_code", self.perspective.country_code)
             opportunities.append(item)
@@ -3246,7 +3277,11 @@ def _pf_build_reasoning_metadata(
         knowledge_hash = knowledge_state.knowledge_state_hash
     except Exception:
         knowledge_hash = getattr(knowledge_state, "hash", "")
-    evidence_ids = sorted(str(x) for x in dashboard.get("graph_analysis", {}).get("paths", []))
+    evidence_ids = sorted(
+        f"{p.get('from_node', '')}->{p.get('to_node', '')}:{p.get('depth', '')}:{p.get('relationship_type', '')}"
+        if isinstance(p, dict) else str(p)
+        for p in dashboard.get("graph_analysis", {}).get("paths", [])
+    )
     entity_ids = sorted(str(x.get("node_id", x)) if isinstance(x, dict) else str(x) for x in dashboard.get("entities", []))
     try:
         fingerprint = compute_analysis_fingerprint(
