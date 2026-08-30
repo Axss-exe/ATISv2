@@ -451,6 +451,11 @@ class TokenBudget:
         available = self.provider_context_limit - input_tokens - self.safety_margin
         return min(available, self.max_output_tokens)
 
+    def fits_in_budget(self, input_tokens: int, output_tokens: int) -> bool:
+        """Check if the given tokens fit within the provider context budget."""
+        total = input_tokens + output_tokens + self.safety_margin
+        return total <= self.provider_context_limit
+
 
 # ---------------------------------------------------------------------------
 # Utility Functions
