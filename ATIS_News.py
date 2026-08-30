@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -100,8 +101,10 @@ class StatePersistenceManager:
 
     @staticmethod
     def _json_safe(value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, float, bool)):
+        if value is None or isinstance(value, (str, int, bool)):
             return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
         if isinstance(value, dict):
             return {str(k): StatePersistenceManager._json_safe(v) for k, v in value.items()}
         if isinstance(value, (list, tuple, set)):
@@ -2388,7 +2391,7 @@ def _legacy_process_article_pipeline(
 
     try:
         output_path_file.write_text(
-            json.dumps(dashboard, indent=2, ensure_ascii=False),
+            json.dumps(StatePersistenceManager._json_safe(dashboard), indent=2, ensure_ascii=False, allow_nan=False),
             encoding="utf-8",
         )
         logger.info("Dashboard persisted: %s", output_path_file.resolve())
@@ -2586,7 +2589,7 @@ def _legacy_run_news_pipeline(
     output_path_file = DASHBOARDS_DIR / output_filename
     try:
         output_path_file.write_text(
-            json.dumps(dashboard, indent=2, ensure_ascii=False),
+            json.dumps(StatePersistenceManager._json_safe(dashboard), indent=2, ensure_ascii=False, allow_nan=False),
             encoding="utf-8",
         )
         logger.info("Dashboard persisted: %s", output_path_file)
@@ -3217,6 +3220,11 @@ class PerspectiveFirstNewsEngine:
         """Return job execution budget; durable workers have no artificial deadline."""
         return float("inf")
 
+    def _remaining_seconds_display(self) -> str:
+        """Human/log representation that never leaks Infinity into JSON-facing telemetry."""
+        remaining = self._remaining_seconds()
+        return "unbounded" if not math.isfinite(remaining) else f"{remaining:.1f}s"
+
     def _stage_timeout(self, stage: str) -> float:
         name = stage.lower()
         if "article understanding" in name:
@@ -3320,8 +3328,8 @@ class PerspectiveFirstNewsEngine:
             requested = min(requested, safe_output)
 
         logger.info(
-            "[LLM] %s | input~%d | output<=%d | remaining=%.1fs",
-            stage, input_tokens, requested, self._remaining_seconds()
+            "[LLM] %s | input~%d | output<=%d | remaining=%s",
+            stage, input_tokens, requested, self._remaining_seconds_display()
         )
         self.calls += 1
         stage_l = stage.lower()
@@ -3929,12 +3937,22 @@ Schema:
                 "paths": paths,
             }
 
+        # The graph_relationship portion of impact_chain is a derived mirror of
+        # graph edges. Repeating all 1,000+ graph relationships inside every
+        # synthesis batch defeats partitioning: each batch carries the entire
+        # graph before its own graph payload is even considered. Keep the
+        # non-graph reasoning chain in the common context and send authoritative
+        # graph evidence only in the batch payload.
+        narrative_impact_chain = [
+            item for item in impact_chain
+            if not (isinstance(item, dict) and item.get("stage") == "graph_relationship")
+        ]
         common = (
             f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
             f"ARTICLE UNDERSTANDING={_json(article)}\n"
             f"PERSPECTIVE IMPACT={_json(impact)}\n"
             f"GRAPH CONSEQUENCES={_json(consequences)}\n"
-            f"IMPACT CHAIN={_json(impact_chain)}\n"
+            f"IMPACT CHAIN (NON-GRAPH NARRATIVE)={_json(narrative_impact_chain)}\n"
         )
         nodes = list(graph.get("nodes", []))
         full_payload = graph_payload_for(nodes)
@@ -4295,7 +4313,9 @@ Schema:
             "execution_model": "durable_worker",
             "transport_timeout_only": True,
             "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
-            "remaining_seconds": round(self._remaining_seconds(), 3),
+            # None means there is no artificial intelligence deadline. Do not
+            # serialize float("inf") because Starlette's JSON encoder rejects it.
+            "remaining_seconds": None if not math.isfinite(self._remaining_seconds()) else round(self._remaining_seconds(), 3),
             "llm_calls": self.calls,
             "llm_timeouts": self.timeouts,
             "truncated_retries": self.truncated_retries,
@@ -4569,11 +4589,16 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
         "http_request_independent": True,
     }
 
+    # Starlette's JSONResponse uses allow_nan=False semantics. Sanitize all
+    # dashboard telemetry before both disk persistence and the API return so a
+    # legitimate "unbounded" execution budget can never become JSON Infinity.
+    dashboard = StatePersistenceManager._json_safe(dashboard)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", str(state.intelligence_id))[-40:]
     output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}_{safe_job}.json"
     try:
-        output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
+        output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
         dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
         logger.info("[FINAL] Dashboard persisted: %s", output_path.resolve())
     except Exception as exc:
