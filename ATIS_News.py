@@ -3887,13 +3887,26 @@ Schema:
     # ------------------------------------------------------------------
     # Final synthesis
     # ------------------------------------------------------------------
-    def final_synthesis(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], consequences: Dict[str, Any], impact_chain: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Produce final synthesis while evaluating the complete graph losslessly.
+    def final_synthesis(
+        self,
+        article: Dict[str, Any],
+        impact: Dict[str, Any],
+        graph: Dict[str, Any],
+        consequences: Dict[str, Any],
+        impact_chain: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Produce final synthesis with genuinely lossless, budget-aware batches.
 
-        A graph that fits the provider context is handled in one call. Otherwise
-        nodes are partitioned into complete batches; every batch is evaluated and
-        the resulting JSON objects are deterministically merged. No graph node or
-        edge is character-truncated to make the request fit.
+        The previous implementation partitioned graph *nodes* and then rebuilt
+        edges/paths by node membership. A highly connected node could therefore
+        pull hundreds of edges and paths into one nominal 40-node batch, making
+        the first batch impossible to fit. This implementation packs complete
+        records by their actual serialized cost and partitions nodes, edges,
+        paths, consequences, and narrative-chain records independently.
+
+        No record is character-truncated. Records are only moved between
+        batches. A record that cannot fit even by itself raises an explicit
+        context-overflow error.
         """
         system = """You are the ATIS News Final Synthesis Engine.
 Produce the final dashboard from the supplied structured analysis.
@@ -3904,7 +3917,7 @@ HARD RULES:
 3. Database nodes and edges are authoritative. Never invent an edge, actor, capability, or relationship.
 4. Opportunities must be supported by verified database nodes AND a verified graph path/edge, unless status=RESEARCH_REQUIRED.
 5. A plausible commercial idea without database support is RESEARCH_REQUIRED, not SUPPORTED.
-6. Preserve the supplied impact chain; do not rewrite its evidence trail.
+6. Preserve supplied impact-chain evidence; do not rewrite its evidence trail.
 7. Key entities must correspond to supplied database nodes or article actors and must carry provenance.
 8. Return concise but complete JSON. Do not omit fields simply because an analysis is partial.
 9. Return ONLY valid JSON.
@@ -3918,72 +3931,159 @@ Schema:
  "facts":[], "meaning":[], "impact_domains":[], "impact_chain":[],
  "findings":[{"text":"","source_nodes":[],"graph_paths":[],"status":"SUPPORTED|RESEARCH_REQUIRED"}],
  "opportunities":[{"opportunity_id":"","title":"","status":"SUPPORTED|RESEARCH_REQUIRED","perspective_country":"","opportunity_country":"","source_country":"","event_country":"","cross_border":false,"cross_border_countries":[],"perspective_actor":"","perspective_capability":"","pathway":"","justification":"","urgency_score":0.0,"feasibility_score":0.0,"source_nodes":[],"graph_paths":[],"required_missing_nodes":[]}],
- "risks":[{"text":"","status":"SUPPORTED|RESEARCH_REQUIRED","severity":"high|medium|low","source_nodes":[],"graph_paths":[]}],
+ "risks":[{"text":"","status":"SUPPORTED|RESEARCH_REQUIRED","severity":"high|medium|low","source_nodes":[],"graph_paths":[]},
+ ],
  "gaps":[{"gap":"","status":"RESEARCH_REQUIRED","related_nodes":[],"missing_relationship":""}],
  "key_entities":[{"entity_name":"","entity_type":"","country":"","sector":"","significance_score":0,"summary":"","source_node":""}]
 }
 """
 
-        def graph_payload_for(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
-            node_ids = {str(n.get("node_id")) for n in nodes if n.get("node_id")}
-            edges = [e for e in graph.get("edges", []) if str(e.get("from_node")) in node_ids or str(e.get("to_node")) in node_ids]
-            paths = [p for p in graph.get("paths", []) if any(str(x) in node_ids for x in _pf_safe_list(p.get("nodes")))]
-            return {
-                "nodes": [
-                    {k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")}
-                    for n in nodes
-                ],
-                "edges": edges,
-                "paths": paths,
-            }
+        def _records(value: Any) -> List[Dict[str, Any]]:
+            return [dict(x) for x in _pf_safe_list(value) if isinstance(x, dict)]
 
-        # The graph_relationship portion of impact_chain is a derived mirror of
-        # graph edges. Repeating all 1,000+ graph relationships inside every
-        # synthesis batch defeats partitioning: each batch carries the entire
-        # graph before its own graph payload is even considered. Keep the
-        # non-graph reasoning chain in the common context and send authoritative
-        # graph evidence only in the batch payload.
-        narrative_impact_chain = [
-            item for item in impact_chain
-            if not (isinstance(item, dict) and item.get("stage") == "graph_relationship")
-        ]
-        common = (
+        def _record_cost(record: Dict[str, Any]) -> int:
+            # Estimate the actual serialized record, not its character count.
+            return max(1, self.budget.estimate_tokens(_json(record)))
+
+        # Keep the immutable article/perspective context in every call. Large
+        # evidence collections are packed independently below.
+        base = (
             f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
             f"ARTICLE UNDERSTANDING={_json(article)}\n"
             f"PERSPECTIVE IMPACT={_json(impact)}\n"
-            f"GRAPH CONSEQUENCES={_json(consequences)}\n"
-            f"IMPACT CHAIN (NON-GRAPH NARRATIVE)={_json(narrative_impact_chain)}\n"
         )
-        nodes = list(graph.get("nodes", []))
-        full_payload = graph_payload_for(nodes)
-        full_user = common + f"VERIFIED GRAPH (COMPLETE)={_json(full_payload)}"
-        requested = MAX_FINAL_OUTPUT_TOKENS
-        if self.budget.fits_in_budget(_messages_tokens(self.budget, system, full_user), requested):
-            return self._call_json(system, full_user, requested, "Final News Synthesis")
 
-        batches = DataPartitioner.partition_records(nodes, max_per_batch=40)
-        logger.warning("[FINAL] complete graph does not fit; evaluating %d lossless graph batches", len(batches))
+        # Consequence lists can themselves be large. Treat each complete
+        # dictionary as an atomic record; no slicing of strings or dictionaries.
+        consequence_records: List[Dict[str, Any]] = []
+        for key in ("consequences", "opportunity_signals", "risk_signals", "gaps"):
+            for item in _records(consequences.get(key)):
+                consequence_records.append({"collection": key, "record": item})
+
+        narrative_records = [
+            {"collection": "impact_chain", "record": item}
+            for item in _records(impact_chain)
+            if item.get("stage") != "graph_relationship"
+        ]
+
+        node_records = [
+            {"collection": "graph_nodes", "record": dict(n)}
+            for n in _records(graph.get("nodes"))
+        ]
+        edge_records = [
+            {"collection": "graph_edges", "record": dict(e)}
+            for e in _records(graph.get("edges"))
+        ]
+        path_records = [
+            {"collection": "graph_paths", "record": dict(path)}
+            for path in _records(graph.get("paths"))
+        ]
+
+        atomic = consequence_records + narrative_records + node_records + edge_records + path_records
+
+        # We need enough room for the final output as well. Use the same
+        # provider-context budget the engine uses for normal calls.
+        requested = MAX_FINAL_OUTPUT_TOKENS
+        base_tokens = _messages_tokens(self.budget, system, base)
+        usable = self.budget.usable_context_budget - requested - base_tokens
+        if usable <= 0:
+            raise NewsPipelineContextOverflow(
+                f"Final synthesis immutable context alone consumes {base_tokens} tokens; "
+                f"no room remains for complete evidence records."
+            )
+
+        batches: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+
+        def flush() -> None:
+            nonlocal current, current_tokens
+            if current:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+
+        for record in atomic:
+            cost = _record_cost(record)
+            if cost > usable:
+                raise NewsPipelineContextOverflow(
+                    "A complete final-synthesis evidence record cannot fit within the "
+                    f"provider context budget ({cost} > {usable} tokens). "
+                    "ATIS refuses to truncate the record."
+                )
+            if current and current_tokens + cost > usable:
+                flush()
+            current.append(record)
+            current_tokens += cost
+        flush()
+
+        # A final call is still required when there is no graph/evidence: send
+        # the immutable context once so the model can produce a truthful
+        # research-required dashboard.
+        if not batches:
+            batches = [[]]
+
+        logger.info(
+            "[FINAL] lossless final synthesis: %d complete batches | "
+            "base_tokens=%d | evidence_budget=%d | records=%d",
+            len(batches), base_tokens, usable, len(atomic),
+        )
+
         results: List[Dict[str, Any]] = []
         for index, batch in enumerate(batches, start=1):
-            payload = graph_payload_for(batch)
-            user = common + f"VERIFIED GRAPH BATCH {index}/{len(batches)}={_json(payload)}"
+            grouped: Dict[str, List[Any]] = {}
+            for item in batch:
+                grouped.setdefault(str(item["collection"]), []).append(item["record"])
+
+            payload = {
+                "consequences": grouped.get("consequences", []),
+                "opportunity_signals": grouped.get("opportunity_signals", []),
+                "risk_signals": grouped.get("risk_signals", []),
+                "gaps": grouped.get("gaps", []),
+                "impact_chain": grouped.get("impact_chain", []),
+                "graph": {
+                    "nodes": grouped.get("graph_nodes", []),
+                    "edges": grouped.get("graph_edges", []),
+                    "paths": grouped.get("graph_paths", []),
+                },
+                "batch_contract": {
+                    "batch_index": index,
+                    "batch_count": len(batches),
+                    "lossless_record_partition": True,
+                    "record_count": len(batch),
+                },
+            }
+            user = (
+                base
+                + f"VERIFIED EVIDENCE BATCH {index}/{len(batches)}="
+                + _json(payload)
+                + "\n"
+                "Analyze ONLY the supplied evidence. Preserve provenance and mark "
+                "anything not supported by this batch as RESEARCH_REQUIRED."
+            )
             input_tokens = _messages_tokens(self.budget, system, user)
             if not self.budget.fits_in_budget(input_tokens, requested):
-                sub_batches = DataPartitioner.partition_records(batch, max_per_batch=max(1, len(batch) // 2))
-                for sub_index, sub_batch in enumerate(sub_batches, start=1):
-                    sub_payload = graph_payload_for(sub_batch)
-                    sub_user = common + f"VERIFIED GRAPH SUB-BATCH {index}.{sub_index}={_json(sub_payload)}"
-                    if not self.budget.fits_in_budget(_messages_tokens(self.budget, system, sub_user), requested):
-                        raise NewsPipelineContextOverflow(f"Final synthesis graph batch {index}.{sub_index} cannot fit without truncation")
-                    results.append(self._call_json(system, sub_user, requested, f"Final News Synthesis [{index}.{sub_index}]") )
-                continue
-            results.append(self._call_json(system, user, requested, f"Final News Synthesis [{index}/{len(batches)}]"))
+                # This should be unreachable because packing used the same
+                # estimator. Keep the guard to prevent accidental truncation if
+                # estimator behavior changes.
+                raise NewsPipelineContextOverflow(
+                    f"Final synthesis batch {index} exceeded the provider budget "
+                    f"after serialization ({input_tokens} tokens)."
+                )
+            results.append(
+                self._call_json(
+                    system,
+                    user,
+                    requested,
+                    f"Final News Synthesis [{index}/{len(batches)}]",
+                )
+            )
 
         if not results:
             raise RuntimeError("Final synthesis produced no batch results")
 
-        # Deterministic, loss-preserving merge. The first result supplies the
-        # article-level narrative; evidence-bearing collections are unioned.
+        # Deterministic, loss-preserving merge. Article-level fields come from
+        # the first result; evidence-bearing collections are unioned.
         merged = dict(results[0])
         list_fields = ("findings", "opportunities", "risks", "gaps", "key_entities")
         for field_name in list_fields:
@@ -3996,6 +4096,7 @@ Schema:
                         seen.add(key)
                         combined.append(item)
             merged[field_name] = combined
+
         merged["facts"] = _pf_safe_list(article.get("facts"))
         merged["meaning"] = _pf_safe_list(article.get("meaning"))
         merged["impact_domains"] = _pf_safe_list(impact.get("impact_domains"))
