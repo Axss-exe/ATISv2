@@ -556,11 +556,13 @@ async def news_endpoint(request: NewsRequest):
         perspective = PerspectiveContext.from_values(
             request.perspective_country, request.perspective_country_code
         )
-        result = await _run_with_timeout(
-            run_news_pipeline,
+        # News pipeline has its own per-stage transport timeouts via LLMCaller._call_provider()
+        # which uses config.llm_timeout (default 120s). The Main.py hard timeout was
+        # killing the pipeline prematurely during batching (7 batches * 30-40s each = 3-4 min).
+        # Removing hard timeout allows LLM-level timeouts to handle individual calls properly.
+        result = run_news_pipeline(
             request.article_text,
-            perspective,
-            timeout=60.0
+            perspective
         )
         elapsed = time.time() - start
         logger.info("News pipeline completed in %.1fs", elapsed)
