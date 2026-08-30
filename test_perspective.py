@@ -212,7 +212,7 @@ class TestValidateOpportunity(unittest.TestCase):
         self.assertEqual(result["status"], "RESEARCH_REQUIRED")
         self.assertIn("Missing perspective_actor", result["validation_note"])
 
-    def test_un evidenced_perspective_actor(self):
+    def test_un_evidenced_perspective_actor(self):
         """An invented perspective actor should result in RESEARCH_REQUIRED."""
         opp = {
             "opportunity_id": "OPP-003",
@@ -431,11 +431,23 @@ class TestVaultRetrieval(unittest.TestCase):
 
         bridges = mgr.get_cross_border_bridges(perspective, "Zambia")
 
-        self.assertEqual(len(bridges), 1)
-        self.assertEqual(bridges[0]["from_node"], "ZESA Holdings")
-        self.assertEqual(bridges[0]["from_country"], "Zimbabwe")
-        self.assertEqual(bridges[0]["to_node"], "Zambia REAP")
-        self.assertEqual(bridges[0]["to_country"], "Zambia")
+        # With bidirectional links between ZESA Holdings and Zambia REAP,
+        # we expect 2 unique bridges (one in each direction)
+        self.assertEqual(len(bridges), 2)
+        
+        # Find the ZESA Holdings -> Zambia REAP bridge
+        zesco_to_zambia = [b for b in bridges 
+                          if b["from_node"] == "ZESA Holdings" and b["to_node"] == "Zambia REAP"]
+        self.assertEqual(len(zesco_to_zambia), 1)
+        self.assertEqual(zesco_to_zambia[0]["from_country"], "Zimbabwe")
+        self.assertEqual(zesco_to_zambia[0]["to_country"], "Zambia")
+        
+        # Find the Zambia REAP -> ZESA Holdings bridge
+        zambia_to_zesco = [b for b in bridges 
+                          if b["from_node"] == "Zambia REAP" and b["to_node"] == "ZESA Holdings"]
+        self.assertEqual(len(zambia_to_zesco), 1)
+        self.assertEqual(zambia_to_zesco[0]["from_country"], "Zambia")
+        self.assertEqual(zambia_to_zesco[0]["to_country"], "Zimbabwe")
 
     def test_no_bridges_for_same_country(self):
         """No bridges should be found when source and perspective are the same."""
