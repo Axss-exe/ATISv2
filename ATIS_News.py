@@ -38,14 +38,144 @@ import os
 import re
 import sys
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from llm_client import LLMClient, get_client, LLMTokenLimitError, ModelCapabilities
+
+# --------------------------------------------------------------------------- #
+# Durable pipeline state & zero-loss partitioning
+# --------------------------------------------------------------------------- #
+class PipelineStage(str, Enum):
+    ARTICLE_UNDERSTANDING = "ARTICLE_UNDERSTANDING"
+    PERSPECTIVE_MAPPING = "PERSPECTIVE_MAPPING"
+    DATABASE_RETRIEVAL = "DATABASE_RETRIEVAL"
+    GRAPH_TRAVERSAL = "GRAPH_TRAVERSAL"
+    IMPACT_ANALYSIS = "IMPACT_ANALYSIS"
+    FINAL_SYNTHESIS = "FINAL_SYNTHESIS"
+    COMPLETE = "COMPLETE"
+
+
+@dataclass
+class JobState:
+    intelligence_id: str
+    status: str = "IN_PROGRESS"
+    current_stage: str = PipelineStage.ARTICLE_UNDERSTANDING.value
+    completed_stages: List[str] = field(default_factory=list)
+    stage_data: Dict[str, Any] = field(default_factory=dict)
+    error_log: List[str] = field(default_factory=list)
+    updated_at: float = field(default_factory=time.time)
+
+    def mark_stage_complete(self, stage: PipelineStage, data: Any) -> None:
+        self.stage_data[stage.value] = data
+        if stage.value not in self.completed_stages:
+            self.completed_stages.append(stage.value)
+        self.updated_at = time.time()
+
+    def is_completed(self, stage: PipelineStage) -> bool:
+        return stage.value in self.completed_stages and stage.value in self.stage_data
+
+
+class StatePersistenceManager:
+    """Durable, atomic checkpoint storage for resumable News jobs."""
+
+    def __init__(self, storage_dir: str | Path | None = None) -> None:
+        configured = storage_dir or os.getenv("ATIS_NEWS_JOB_STORE", "./job_store")
+        self.storage_dir = Path(configured)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_path(self, job_id: str) -> Path:
+        safe_id = "".join(c for c in str(job_id) if c.isalnum() or c in ("-", "_")) or "unknown"
+        return self.storage_dir / f"{safe_id}.json"
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): StatePersistenceManager._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [StatePersistenceManager._json_safe(v) for v in value]
+        if hasattr(value, "value"):
+            return StatePersistenceManager._json_safe(value.value)
+        return str(value)
+
+    def save_state(self, state: JobState) -> None:
+        state.updated_at = time.time()
+        path = self._get_path(state.intelligence_id)
+        payload = self._json_safe(asdict(state))
+        # Atomic replace prevents a timeout/process crash from leaving a half JSON file.
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=str(self.storage_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+    def load_state(self, job_id: str) -> Optional[JobState]:
+        path = self._get_path(job_id)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            return JobState(**raw)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("[STATE] Ignoring unreadable checkpoint %s: %s", path, exc)
+            return None
+
+
+class DataPartitioner:
+    """Partitions records/text without discarding any source material."""
+
+    @staticmethod
+    def partition_records(records: List[Any], max_per_batch: int = 40) -> List[List[Any]]:
+        if not records:
+            return []
+        if max_per_batch <= 0:
+            raise ValueError("max_per_batch must be positive")
+        return [records[i:i + max_per_batch] for i in range(0, len(records), max_per_batch)]
+
+    @staticmethod
+    def partition_paragraphs(text: str, max_chars: int = 4000) -> List[str]:
+        if not text:
+            return []
+        if max_chars <= 0:
+            raise ValueError("max_chars must be positive")
+        paragraphs = text.split("\n\n")
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for paragraph in paragraphs:
+            # A single oversized paragraph is further split rather than truncated.
+            if len(paragraph) > max_chars:
+                if current:
+                    chunks.append("\n\n".join(current))
+                    current, current_len = [], 0
+                chunks.extend(paragraph[i:i + max_chars] for i in range(0, len(paragraph), max_chars))
+                continue
+            projected = current_len + (2 if current else 0) + len(paragraph)
+            if current and projected > max_chars:
+                chunks.append("\n\n".join(current))
+                current, current_len = [paragraph], len(paragraph)
+            else:
+                current.append(paragraph)
+                current_len = projected
+        if current:
+            chunks.append("\n\n".join(current))
+        return chunks
+
 from atis_context import (
     PerspectiveContext,
     validate_opportunity,
@@ -1468,9 +1598,10 @@ class NewsLLMOrchestrator:
         logger.info("Estimated Stage-1 input tokens: %d (budget: %d)", estimated, self.budget.usable_context_budget)
 
         if not self.budget.fits_in_budget(estimated, 2048):
-            max_chars = int((self.budget.usable_context_budget - 2048) * 3.2) - len(PROMPT_STAGE_1_EXTRACTOR)
-            article_text = article_text[:max(max_chars, 500)] + "\n[ARTICLE TRUNCATED TO RESPECT TOKEN BUDGET]"
-            logger.warning("Article truncated to fit Stage-1 token budget.")
+            raise LLMTokenLimitError(
+                "Stage 1 source article exceeds the provider context budget; "
+                "ATIS refuses to truncate the article."
+            )
 
         raw_response = self._call_api(PROMPT_STAGE_1_EXTRACTOR, article_text, max_tokens=2048, stage_name="Stage 1")
         data = safe_json_loads(raw_response, stage_name="Stage 1")
@@ -2479,36 +2610,83 @@ def _legacy_run_news_pipeline(
 # the only authority for what entities and relationships exist in ATIS.
 # =============================================================================
 
-PERSPECTIVE_FIRST_VERSION = "3.3.0-production"
-MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "120000"))
-MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "500"))
+PERSPECTIVE_FIRST_VERSION = "3.6.0-production"
+
+# ---------------------------------------------------------------------------
+# Production controls
+# ---------------------------------------------------------------------------
+# These controls are deliberately conservative because Render terminates the
+# HTTP request at roughly 60 seconds.  The deadline begins BEFORE vault
+# indexing in _run_perspective_first_news, so indexing time is part of the
+# same end-to-end budget.
+MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "500000"))
+MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "0"))  # 0 = unlimited; retained for backward-compatible env naming
 MAX_IMPACT_DOMAINS = int(os.getenv("ATIS_NEWS_MAX_IMPACT_DOMAINS", "8"))
-MAX_RETRIEVAL_TARGETS = int(os.getenv("ATIS_NEWS_MAX_RETRIEVAL_TARGETS", "30"))
-MAX_GRAPH_NODES = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES", "80"))
-MAX_GRAPH_PATHS = int(os.getenv("ATIS_NEWS_MAX_GRAPH_PATHS", "60"))
+MAX_RETRIEVAL_TARGETS = int(os.getenv("ATIS_NEWS_MAX_RETRIEVAL_TARGETS", "0"))  # 0 = unlimited
+MAX_GRAPH_NODES = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES", "0"))  # 0 = unlimited
+MAX_GRAPH_PATHS = int(os.getenv("ATIS_NEWS_MAX_GRAPH_PATHS", "0"))  # 0 = unlimited
 MAX_GRAPH_DEPTH = int(os.getenv("ATIS_NEWS_MAX_GRAPH_DEPTH", "2"))
-MAX_GRAPH_NODES_PER_LLM_PARTITION = int(os.getenv("ATIS_NEWS_MAX_GRAPH_NODES_PER_PARTITION", "40"))
-MAX_FINAL_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_FINAL_OUTPUT_TOKENS", "4096"))
-MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "4096"))
+MAX_FINAL_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_FINAL_OUTPUT_TOKENS", "3072"))
+MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "3072"))
 MIN_NODE_RESOLUTION_SCORE = float(os.getenv("ATIS_NEWS_MIN_NODE_RESOLUTION_SCORE", "0.72"))
 MIN_OPPORTUNITY_GRAPH_SCORE = float(os.getenv("ATIS_NEWS_MIN_OPPORTUNITY_GRAPH_SCORE", "0.55"))
-# Render's news request has historically been killed at ~60s. Keep a hard internal
-# safety deadline so the pipeline can return a truthful partial result instead of
-# continuing past the HTTP request lifetime.
+
+# End-to-end deadline.  This is NOT intended to "kill" the provider thread;
+# Python cannot safely kill a running synchronous HTTP call.  It is a gate that
+# prevents ATIS from starting work when there is not enough time left for the
+# request.  The API therefore gets a response before its ~60s upstream limit.
 PIPELINE_DEADLINE_SECONDS = float(os.getenv("ATIS_NEWS_PIPELINE_DEADLINE_SECONDS", "52"))
-# Stage-level ceilings ensure one provider call cannot consume the entire HTTP lifetime.
-ARTICLE_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_ARTICLE_TIMEOUT_SECONDS", "12"))
-IMPACT_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_IMPACT_TIMEOUT_SECONDS", "12"))
-GRAPH_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_GRAPH_TIMEOUT_SECONDS", "12"))
-FINAL_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_FINAL_TIMEOUT_SECONDS", "10"))
-MIN_LLM_CALL_SECONDS = float(os.getenv("ATIS_NEWS_MIN_LLM_CALL_SECONDS", "2.5"))
-MAX_IMPACT_LLM_CALLS = max(1, int(os.getenv("ATIS_NEWS_MAX_IMPACT_LLM_CALLS", "2")))
-MAX_GRAPH_LLM_CALLS = max(1, int(os.getenv("ATIS_NEWS_MAX_GRAPH_LLM_CALLS", "2")))
-LLM_CONCURRENCY = max(1, int(os.getenv("ATIS_NEWS_LLM_CONCURRENCY", "2")))
+ARTICLE_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_ARTICLE_TIMEOUT_SECONDS", "14"))
+IMPACT_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_IMPACT_TIMEOUT_SECONDS", "9"))
+GRAPH_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_GRAPH_TIMEOUT_SECONDS", "0"))
+FINAL_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_FINAL_TIMEOUT_SECONDS", "14"))
+MIN_LLM_CALL_SECONDS = float(os.getenv("ATIS_NEWS_MIN_LLM_CALL_SECONDS", "2.0"))
+MAX_IMPACT_LLM_CALLS = 1
+MAX_GRAPH_LLM_CALLS = 0
+LLM_CONCURRENCY = 1
+
+# The production graph is already deterministic.  One graph interpretation
+# call is sufficient; splitting the same verified graph into several calls was
+# a major source of avoidable latency in the failing Render run.
+
+
+# ---------------------------------------------------------------------------
+# Shared in-process vault cache
+# ---------------------------------------------------------------------------
+# ATIS_News used to rebuild all ~716 markdown files for every /api/news call.
+# That consumed ~6 seconds before the first LLM request.  This cache lives in
+# this file only, preserving the requirement that no other repository file is
+# changed.  It invalidates when the vault file set or mtimes change.
+_VAULT_CACHE: Dict[str, Tuple[Tuple[Tuple[str, int, int], ...], "ObsidianVaultManager"]] = {}
+
+
+def _vault_signature(vault_dir: Path) -> Tuple[Tuple[str, int, int], ...]:
+    rows: List[Tuple[str, int, int]] = []
+    try:
+        for path in sorted(vault_dir.rglob("*.md"), key=lambda p: str(p)):
+            try:
+                stat = path.stat()
+                rows.append((str(path.relative_to(vault_dir)), int(stat.st_mtime_ns), int(stat.st_size)))
+            except OSError:
+                continue
+    except OSError:
+        return tuple()
+    return tuple(rows)
+
+
+def _get_cached_vault(vault_dir: Path) -> ObsidianVaultManager:
+    key = str(vault_dir.resolve())
+    signature = _vault_signature(vault_dir)
+    cached = _VAULT_CACHE.get(key)
+    if cached and cached[0] == signature:
+        logger.info("[VAULT] Reusing cached index: %d nodes", len(cached[1].file_map))
+        return cached[1]
+    vault = ObsidianVaultManager(vault_dir)
+    _VAULT_CACHE[key] = (signature, vault)
+    return vault
 
 
 def _pf_norm(value: Any) -> str:
-    """Normalize names for deterministic comparison without treating similarity as proof."""
     value = str(value or "").strip().lower()
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
@@ -2538,17 +2716,15 @@ def _pf_safe_list(value: Any) -> List[Any]:
 
 
 def _pf_text(value: Any, limit: int = 1200) -> str:
-    """Return complete text; structured LLM inputs are reduced by whole records, never characters.
+    """Normalize text without character truncation.
 
-    ``limit`` is retained for backward compatibility with callers, but is intentionally
-    not applied. This prevents silent evidence truncation. Context pressure is handled
-    by selecting fewer complete records before serialization.
+    The legacy ``limit`` argument remains for compatibility, but is ignored.
+    Production context control is record-level, never character-level.
     """
     return str(value or "").strip()
 
 
 def _pf_safe_float(value: Any, default: float = 0.0) -> float:
-    """Convert model-provided numeric fields safely without allowing malformed JSON to crash grounding."""
     if isinstance(value, bool):
         return float(value)
     try:
@@ -2561,23 +2737,109 @@ def _pf_safe_float(value: Any, default: float = 0.0) -> float:
 
 
 class NewsPipelineDeadline(RuntimeError):
-    """Raised when ATIS must stop before the upstream HTTP request deadline."""
+    """ATIS must stop before the upstream HTTP request deadline."""
 
 
+class NewsPipelineContextOverflow(RuntimeError):
+    """A complete record set cannot fit without silently truncating evidence."""
+
+
+# ---------------------------------------------------------------------------
+# Lossless structured-context helpers
+# ---------------------------------------------------------------------------
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _messages_tokens(budget: TokenBudgetManager, system: str, user: str) -> int:
+    return budget.estimate_messages_tokens([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ])
+
+
+def _record_cost(budget: TokenBudgetManager, record: Any) -> int:
+    return budget.estimate_tokens(_json(record))
+
+
+def _pack_complete_records(
+    records: List[Any],
+    budget: TokenBudgetManager,
+    fixed_tokens: int,
+    output_tokens: int,
+    max_records: Optional[int] = None,
+) -> List[List[Any]]:
+    """Pack complete records into context-safe batches.
+
+    No record is sliced. If a single record itself cannot fit, it is rejected
+    explicitly rather than truncated.
+    """
+    capacity = budget.provider_context_limit - budget.safety_margin - output_tokens - fixed_tokens
+    if capacity < 256:
+        raise NewsPipelineContextOverflow("No safe context capacity remains for complete records")
+    batches: List[List[Any]] = []
+    current: List[Any] = []
+    used = 0
+    for record in records:
+        cost = _record_cost(budget, record)
+        if cost > capacity:
+            raise NewsPipelineContextOverflow(
+                f"One complete evidence record requires ~{cost} tokens but only {capacity} are available"
+            )
+        if current and (used + cost > capacity or (max_records and len(current) >= max_records)):
+            batches.append(current)
+            current = []
+            used = 0
+        current.append(record)
+        used += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _dedupe_dict_records(records: List[Any], key_fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        key = "|".join(_pf_norm(item.get(k, "")) for k in key_fields)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(item))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Production engine
+# ---------------------------------------------------------------------------
 class PerspectiveFirstNewsEngine:
+    """Production perspective-first News engine.
+
+    Data authority:
+      * Article -> LLM may understand only article facts/meaning.
+      * Perspective ecosystem -> vault only.
+      * Relationships -> vault outbound links/backlinks only.
+      * Consequences -> LLM interprets verified graph evidence; it cannot add edges.
+      * Opportunities -> must be grounded in verified nodes/paths or explicitly
+        marked RESEARCH_REQUIRED.
+
+    Normal LLM budget is deliberately small:
+      1. Article Understanding
+      2. Perspective Impact Mapping (one call, or two concurrent complete batches)
+      3. Final News Synthesis
+
+    Graph traversal is deterministic and therefore does not require a separate
+    graph LLM partition stage.
     """
-    Production News engine implementing the perspective-first ATIS architecture.
 
-    The engine deliberately separates four responsibilities:
-      * LLM: article understanding and interpretation.
-      * Vault: authoritative perspective ecosystem and node contents.
-      * Graph: authoritative relationships/backlinks.
-      * LLM: interpretation of already-verified graph evidence.
-
-    No LLM call is permitted to manufacture a graph edge.
-    """
-
-    def __init__(self, vault: ObsidianVaultManager, perspective: PerspectiveContext) -> None:
+    def __init__(
+        self,
+        vault: ObsidianVaultManager,
+        perspective: PerspectiveContext,
+        started_at: Optional[float] = None,
+    ) -> None:
         self.vault = vault
         self.perspective = perspective
         self.client: LLMClient = get_client()
@@ -2588,45 +2850,12 @@ class PerspectiveFirstNewsEngine:
         self.truncated_retries = 0
         self.timeouts = 0
         self.deadline_exhausted = False
-        self._pipeline_started = time.monotonic()
-        self._deadline = self._pipeline_started + PIPELINE_DEADLINE_SECONDS
+        self.started_at = started_at if started_at is not None else time.monotonic()
+        self._deadline = self.started_at + PIPELINE_DEADLINE_SECONDS
+        self._stage_durations: Dict[str, float] = {}
 
-    # ------------------------------------------------------------------ #
-    # LLM boundary / token safety
-    # ------------------------------------------------------------------ #
-    def _model_output_cap(self) -> int:
-        return int(self.budget.max_output_tokens)
-
-    @staticmethod
-    def _is_truncated(raw: str) -> bool:
-        if not raw or not raw.strip():
-            return True
-        text = raw.strip()
-        if text.endswith("..."):
-            return True
-        stack: List[str] = []
-        in_string = False
-        escaped = False
-        for ch in text:
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch in "{[":
-                stack.append(ch)
-            elif ch in "]}" and stack:
-                expected = "]" if stack[-1] == "[" else "}"
-                if ch == expected:
-                    stack.pop()
-                else:
-                    return True
-        return in_string or bool(stack)
+    def _remaining_seconds(self) -> float:
+        return max(0.0, self._deadline - time.monotonic())
 
     def _stage_timeout(self, stage: str) -> float:
         name = stage.lower()
@@ -2634,52 +2863,68 @@ class PerspectiveFirstNewsEngine:
             return ARTICLE_LLM_TIMEOUT_SECONDS
         if "perspective impact" in name:
             return IMPACT_LLM_TIMEOUT_SECONDS
-        if "graph consequence" in name:
-            return GRAPH_LLM_TIMEOUT_SECONDS
         if "final news synthesis" in name:
             return FINAL_LLM_TIMEOUT_SECONDS
         return min(10.0, PIPELINE_DEADLINE_SECONDS)
 
-    def _remaining_seconds(self) -> float:
-        return max(0.0, self._deadline - time.monotonic())
+    def _call_provider(self, messages: List[Dict[str, str]], max_tokens: int, stage: str) -> str:
+        """Run one provider call inside a hard News-stage wall-clock window.
 
-    def _chat_with_deadline(self, messages: List[Dict[str, str]], max_tokens: int, stage: str) -> str:
-        """Run a synchronous provider client behind a hard local wait deadline.
-
-        LLMClient.chat is synchronous and does not expose a per-call timeout. A worker
-        thread prevents a slow provider call from holding the HTTP handler past the
-        ATIS deadline. The worker is cancelled when possible; if the underlying HTTP
-        library cannot be interrupted, the request handler still returns safely.
+        The provider client is synchronous.  A timeout therefore cannot safely
+        kill the underlying socket from Python.  We isolate it in a daemon
+        thread so a slow provider cannot hold the HTTP request open.  The
+        orchestration deadline is the authority: after a timeout we never
+        start another provider call unless the caller explicitly has budget.
         """
         remaining = self._remaining_seconds()
-        if remaining < MIN_LLM_CALL_SECONDS:
+        if remaining < MIN_LLM_CALL_SECONDS + 0.5:
             self.deadline_exhausted = True
             raise NewsPipelineDeadline(f"[{stage}] insufficient pipeline time remaining ({remaining:.2f}s)")
-        timeout = min(self._stage_timeout(stage), remaining - 0.75)
+        timeout = min(self._stage_timeout(stage), max(0.1, remaining - 1.0))
         if timeout < MIN_LLM_CALL_SECONDS:
             self.deadline_exhausted = True
-            raise NewsPipelineDeadline(f"[{stage}] insufficient safe call window ({remaining:.2f}s remaining)")
+            raise NewsPipelineDeadline(f"[{stage}] insufficient safe provider window ({remaining:.2f}s)")
 
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="atis-news-llm")
-        future = executor.submit(self.client.chat, messages, temperature=0.0, max_tokens=max_tokens)
-        try:
-            return future.result(timeout=timeout)
-        except TimeoutError as exc:
+        import threading
+        result: Dict[str, Any] = {}
+        error: Dict[str, BaseException] = {}
+
+        def worker() -> None:
+            try:
+                result["value"] = self.client.chat(messages, temperature=0.0, max_tokens=max_tokens)
+            except BaseException as exc:
+                error["value"] = exc
+
+        started = time.monotonic()
+        thread = threading.Thread(target=worker, name=f"atis-news-{stage[:24]}", daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        elapsed = time.monotonic() - started
+        self._stage_durations[stage] = round(elapsed, 3)
+
+        if thread.is_alive():
             self.timeouts += 1
             self.deadline_exhausted = True
-            future.cancel()
-            raise NewsPipelineDeadline(f"[{stage}] provider call exceeded {timeout:.1f}s") from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            logger.warning("[DEADLINE] [%s] provider call exceeded %.1fs; request will not wait for it", stage, timeout)
+            raise NewsPipelineDeadline(f"[{stage}] provider call exceeded {timeout:.1f}s")
+        if "value" in error:
+            raise error["value"]
+        return str(result.get("value") or "")
+
+    def _increment_reasoning_counter(self, name: str) -> None:
+        """Increment optional ReasoningLog counters without coupling engine state to its dataclass."""
+        # The run() method exposes the active log only after stage calls, so
+        # these counters are also mirrored onto the engine and copied later.
+        setattr(self, f"_{name}", getattr(self, f"_{name}", 0) + 1)
 
     def _call_json(self, system_prompt: str, user_prompt: str, requested_output: int, stage: str) -> Dict[str, Any]:
-        """Bounded, lossless structured-output call.
+        """Lossless JSON call with bounded retry.
 
-        No character slicing is performed on article/evidence input or retry input.
-        If output is incomplete, ATIS retries the exact same evidence once with a
-        larger output allowance, subject to the remaining pipeline deadline.
+        A retry NEVER shortens the input. If output is malformed/incomplete,
+        the exact same complete input is retried with a larger output allowance
+        only when both context and deadline allow it.
         """
-        cap = self._model_output_cap()
+        cap = max(512, self.budget.max_output_tokens)
         requested = min(max(512, int(requested_output)), cap)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2687,38 +2932,56 @@ class PerspectiveFirstNewsEngine:
         ]
         input_tokens = self.budget.estimate_messages_tokens(messages)
         if not self.budget.fits_in_budget(input_tokens, requested):
-            requested = self.budget.compute_safe_output_tokens(input_tokens)
-            if requested < 512 or not self.budget.fits_in_budget(input_tokens, requested):
+            safe_output = self.budget.compute_safe_output_tokens(input_tokens)
+            if safe_output < 512:
                 raise LLMTokenLimitError(
-                    f"[{stage}] rejected before transmission: input~{input_tokens:,}, output={requested:,}, "
-                    f"context={self.budget.provider_context_limit:,}"
+                    f"[{stage}] complete input cannot fit provider context without truncation: "
+                    f"input~{input_tokens}, context={self.budget.provider_context_limit}"
                 )
+            requested = min(requested, safe_output)
 
-        logger.info("[LLM] %s | input~%d | output<=%d | remaining=%.1fs", stage, input_tokens, requested, self._remaining_seconds())
+        logger.info(
+            "[LLM] %s | input~%d | output<=%d | remaining=%.1fs",
+            stage, input_tokens, requested, self._remaining_seconds()
+        )
         self.calls += 1
-        raw = self._chat_with_deadline(messages, requested, stage)
+        stage_l = stage.lower()
+        if "article understanding" in stage_l:
+            self._increment_reasoning_counter("evidence_calls")
+        elif "perspective impact" in stage_l:
+            self._increment_reasoning_counter("evidence_calls")
+        elif "final news synthesis" in stage_l:
+            self._increment_reasoning_counter("final_call")
+        raw = self._call_provider(messages, requested, stage)
         try:
-            return safe_json_loads(raw, stage_name=stage)
+            parsed = safe_json_loads(raw, stage_name=stage)
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"{stage} returned JSON that is not an object")
+            return parsed
         except RuntimeError as first_error:
-            retry_output = min(cap, max(requested + 2048, requested * 2))
-            if retry_output <= requested or self._remaining_seconds() < MIN_LLM_CALL_SECONDS + 1.0:
+            retry_output = min(cap, max(requested + 1024, requested * 2))
+            if retry_output <= requested or self._remaining_seconds() < MIN_LLM_CALL_SECONDS + 1.5:
                 raise first_error
             if not self.budget.fits_in_budget(input_tokens, retry_output):
                 retry_output = self.budget.compute_safe_output_tokens(input_tokens)
-            if retry_output < 512 or not self.budget.fits_in_budget(input_tokens, retry_output):
+            if retry_output <= requested or retry_output < 512:
                 raise first_error
             self.truncated_retries += 1
-            logger.warning("[LLM] %s returned incomplete/non-JSON output; retrying SAME input with output<=%d", stage, retry_output)
+            self._increment_reasoning_counter("retry_calls")
+            logger.warning(
+                "[LLM] %s returned unusable JSON; retrying SAME complete input with output<=%d",
+                stage, retry_output
+            )
             self.calls += 1
-            raw_retry = self._chat_with_deadline(messages, retry_output, f"{stage} retry")
-            try:
-                return safe_json_loads(raw_retry, stage_name=f"{stage} retry")
-            except RuntimeError as second_error:
-                raise RuntimeError(f"[{stage}] provider returned unusable structured output after lossless retry") from second_error
+            raw_retry = self._call_provider(messages, retry_output, f"{stage} retry")
+            parsed = safe_json_loads(raw_retry, stage_name=f"{stage} retry")
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"{stage} retry returned JSON that is not an object")
+            return parsed
 
-    # ------------------------------------------------------------------ #
-    # Perspective ecosystem — database first, never a generic dump
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Perspective ecosystem
+    # ------------------------------------------------------------------
     def load_perspective_ecosystem(self) -> List[Dict[str, Any]]:
         country = _pf_norm(self.perspective.country)
         candidates: List[Dict[str, Any]] = []
@@ -2727,7 +2990,8 @@ class PerspectiveFirstNewsEngine:
             node_country = _pf_norm(meta.get("country", ""))
             if not node_country:
                 path = str(meta.get("path", "")).lower()
-                node_country = country if country and country in path else ""
+                if country and country in path:
+                    node_country = country
             if node_country != country:
                 continue
             candidates.append({
@@ -2738,161 +3002,212 @@ class PerspectiveFirstNewsEngine:
                 "summary": meta.get("summary", ""),
                 "path": meta.get("path", ""),
             })
-        candidates.sort(key=lambda x: (x["sector"], x["type"], x["node_id"]))
-        logger.info("[PERSPECTIVE] %s ecosystem nodes available: %d", self.perspective.country, len(candidates))
-        return candidates[:MAX_PERSPECTIVE_ECOSYSTEM_NODES]
+        candidates.sort(key=lambda x: (str(x["sector"]), str(x["type"]), str(x["node_id"])))
+        # Never silently discard perspective-country nodes. If the complete registry
+        # does not fit one provider request, map_impact_domains partitions it.
+        result = candidates
+        logger.info("[PERSPECTIVE] %s ecosystem nodes available: %d (complete registry)", self.perspective.country, len(result))
+        return result
 
-    def _ecosystem_context(self, ecosystem: List[Dict[str, Any]]) -> str:
+    @staticmethod
+    def _ecosystem_context(ecosystem: List[Dict[str, Any]], country: str, code: str) -> str:
         lines = [
-            f"PERSPECTIVE COUNTRY: {self.perspective.country} ({self.perspective.country_code})",
-            "This registry defines the perspective ecosystem. It is retrieval guidance, not proof of impact.",
+            f"PERSPECTIVE COUNTRY: {country} ({code})",
+            "Every NODE ID below is an existing database node. This registry is retrieval guidance, not proof of impact.",
         ]
         for n in ecosystem:
             lines.append(
-                f"- NODE={n['node_id']} | type={n['type'] or 'unknown'} | sector={n['sector'] or 'unknown'} | summary={_pf_text(n['summary'], 240)}"
+                f"NODE={n['node_id']} | type={n.get('type') or 'unknown'} | "
+                f"sector={n.get('sector') or 'unknown'} | summary={n.get('summary') or ''}"
             )
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------ #
-    # Stage 1 — article facts and meaning
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Stage 1: article understanding
+    # ------------------------------------------------------------------
     def understand_article(self, article_text: str) -> Dict[str, Any]:
+        """Understand the complete article without character truncation."""
         system = """You are ATIS News Stage 1: Article Understanding.
-Your job is to understand ONLY what is contained in the supplied article.
-Do not search for external facts. Do not invent entities or relationships.
-Separate direct article facts from interpretation.
-Return JSON only.
+Understand ONLY what is contained in the supplied article segment.
+Do not use external knowledge. Do not invent entities, relationships, causes, or facts.
+Preserve every material fact, actor, mechanism, meaning and uncertainty present in the supplied segment.
+Return ONLY valid JSON.
 
-Required shape:
+Schema:
 {
-  "event": {"title":"", "summary":"", "event_country":"", "source_country":""},
-  "facts": [{"fact":"", "evidence":"", "importance":"high|medium|low"}],
-  "actors": [{"name":"", "role":"", "evidence":""}],
-  "mechanisms": [{"mechanism":"", "evidence":""}],
-  "meaning": [{"interpretation":"", "based_on_fact_indexes":[0]}],
-  "uncertainties": ["..."]
+  "event":{"title":"","summary":"","event_country":"","source_country":""},
+  "facts":[{"fact":"","evidence":"","importance":"high|medium|low"}],
+  "actors":[{"name":"","role":"","evidence":""}],
+  "mechanisms":[{"mechanism":"","evidence":""}],
+  "meaning":[{"interpretation":"","based_on_fact_indexes":[0]}],
+  "uncertainties":["..."]
 }
 """
-        user = f"ARTICLE:\n{article_text}"
-        result = self._call_json(system, user, min(MAX_STAGE_OUTPUT_TOKENS, 3072), "Article Understanding")
-        result.setdefault("event", {})
-        result.setdefault("facts", [])
-        result.setdefault("actors", [])
-        result.setdefault("mechanisms", [])
-        result.setdefault("meaning", [])
-        result.setdefault("uncertainties", [])
-        logger.info("[FACTS] %d facts | %d actors | %d mechanisms | %d meanings", len(_pf_safe_list(result["facts"])), len(_pf_safe_list(result["actors"])), len(_pf_safe_list(result["mechanisms"])), len(_pf_safe_list(result["meaning"])))
-        return result
 
-    # ------------------------------------------------------------------ #
-    # Stage 2 — map meaning against the perspective ecosystem
-    # ------------------------------------------------------------------ #
+        requested = min(MAX_STAGE_OUTPUT_TOKENS, 3072)
+        full_user = "ARTICLE SEGMENT (COMPLETE):\n" + article_text
+        full_tokens = _messages_tokens(self.budget, system, full_user)
+        if self.budget.fits_in_budget(full_tokens, requested):
+            result = self._call_json(system, full_user, requested, "Article Understanding")
+            result.setdefault("event", {})
+            for key in ("facts", "actors", "mechanisms", "meaning", "uncertainties"):
+                result.setdefault(key, [])
+            logger.info("[FACTS] %d facts | %d actors | %d mechanisms | %d meanings", len(_pf_safe_list(result["facts"])), len(_pf_safe_list(result["actors"])), len(_pf_safe_list(result["mechanisms"])), len(_pf_safe_list(result["meaning"])))
+            return result
+
+        batch_chars = int(os.getenv("ATIS_NEWS_ARTICLE_BATCH_CHARS", "12000"))
+        batches = DataPartitioner.partition_paragraphs(article_text, max_chars=batch_chars)
+        logger.warning("[ARTICLE] complete article does not fit; processing %d lossless article batches", len(batches))
+        results: List[Dict[str, Any]] = []
+        for index, batch in enumerate(batches, start=1):
+            user = f"ARTICLE SEGMENT {index}/{len(batches)} (COMPLETE; DO NOT INFER BEYOND THIS SEGMENT):\n{batch}"
+            input_tokens = _messages_tokens(self.budget, system, user)
+            if not self.budget.fits_in_budget(input_tokens, requested):
+                raise NewsPipelineContextOverflow(f"Article segment {index} cannot fit provider context without truncation")
+            results.append(self._call_json(system, user, requested, f"Article Understanding [{index}/{len(batches)}]"))
+
+        merged: Dict[str, Any] = {"event": {}, "facts": [], "actors": [], "mechanisms": [], "meaning": [], "uncertainties": []}
+        for result in results:
+            event = result.get("event") if isinstance(result.get("event"), dict) else {}
+            for key in ("title", "summary", "event_country", "source_country"):
+                if not merged["event"].get(key) and event.get(key):
+                    merged["event"][key] = event[key]
+            for key in ("facts", "actors", "mechanisms", "meaning", "uncertainties"):
+                for item in _pf_safe_list(result.get(key)):
+                    identity = _json(item)
+                    if not any(_json(existing) == identity for existing in merged[key]):
+                        merged[key].append(item)
+        # Batch-local fact indexes cannot safely be reused after merging. Clear them
+        # rather than creating false provenance links. The meaning text itself is preserved.
+        for item in merged["meaning"]:
+            if isinstance(item, dict):
+                item["based_on_fact_indexes"] = []
+        logger.info("[FACTS] merged %d facts | %d actors | %d mechanisms | %d meanings from %d batches", len(merged["facts"]), len(merged["actors"]), len(merged["mechanisms"]), len(merged["meaning"]), len(results))
+        return merged
+
+    # ------------------------------------------------------------------
+    # Stage 2: perspective impact mapping
+    # ------------------------------------------------------------------
     def map_impact_domains(self, article: Dict[str, Any], ecosystem: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Map article meaning to the selected country's ecosystem.
+        """Map the article onto the complete perspective ecosystem.
 
-        Prefer ONE call when the complete ecosystem fits the real model context.
-        Only partition when required by the provider's actual context limit.
-        Independent partitions are executed concurrently and merged deterministically.
+        The complete registry is sent when it fits. When it does not, the registry
+        is partitioned into complete record batches. No node is character-truncated
+        or silently discarded. Batch results are merged deterministically.
         """
         system = """You are ATIS News Stage 2: Perspective Impact Mapper.
-The analytical perspective is the selected country. Determine which areas of THAT
-country's supplied ecosystem should be investigated because of the event.
+The selected country is the analytical perspective. Determine which areas of THAT country's supplied ecosystem should be investigated because of the event.
 
-IMPORTANT:
-- Do not claim that an impact exists merely because it is plausible.
-- Identify investigation targets/domains, not final opportunities.
+Rules:
 - Use only the supplied article understanding and supplied perspective ecosystem.
 - Do not create database relationships.
-- Do not use article entity names as direct vault queries.
-- The ecosystem registry contains node IDs that may be used as retrieval hints.
-Return JSON only.
+- Do not claim an impact merely because it is plausible.
+- Return investigation targets/domains, not final opportunities.
+- ecosystem_node_hints MUST be exact NODE IDs supplied in the current registry batch.
+- Preserve distinctions between direct article meaning and investigation hypotheses.
+- Return ONLY valid JSON.
 
-Required shape:
+Schema:
 {
-  "impact_domains":[
-    {"domain":"", "why_relevant":"", "mechanism":"", "priority":"high|medium|low", "ecosystem_node_hints":["exact supplied NODE IDs"]}
-  ],
+  "impact_domains":[{"domain":"","why_relevant":"","mechanism":"","priority":"high|medium|low","ecosystem_node_hints":["exact NODE ID"]}],
   "excluded_domains":[{"domain":"","reason":""}]
 }
 """
-        article_json = json.dumps(article, ensure_ascii=False)
-        full_registry = self._ecosystem_context(ecosystem)
-        full_user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM:\n{full_registry}"
-        requested = MAX_STAGE_OUTPUT_TOKENS
+        article_json = _json(article)
 
-        def fits(user: str) -> bool:
-            messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-            return self.budget.fits_in_budget(self.budget.estimate_messages_tokens(messages), requested)
+        def normalize(result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            domains: List[Dict[str, Any]] = []
+            for item in _pf_safe_list(result.get("impact_domains")):
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                item["ecosystem_node_hints"] = sorted({
+                    str(x).strip() for x in _pf_safe_list(item.get("ecosystem_node_hints"))
+                    if not isinstance(x, (dict, list)) and str(x).strip()
+                })
+                domains.append(item)
+            excluded = [x for x in _pf_safe_list(result.get("excluded_domains")) if isinstance(x, dict)]
+            return domains, excluded
 
-        if fits(full_user):
-            result = self._call_json(system, full_user, requested, "Perspective Impact Mapping")
-            results = [result]
+        registry = self._ecosystem_context(ecosystem, self.perspective.country, self.perspective.country_code)
+        requested = min(MAX_STAGE_OUTPUT_TOKENS, 3072)
+        full_user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM (COMPLETE):\n{registry}"
+        full_tokens = _messages_tokens(self.budget, system, full_user)
+
+        batches: List[List[Dict[str, Any]]]
+        if self.budget.fits_in_budget(full_tokens, requested):
+            batches = [ecosystem]
         else:
-            safe_input_budget = max(2000, self.budget.usable_context_budget - self.budget.estimate_tokens(system) - requested)
-            per_node_estimate = max(40, self.budget.estimate_tokens("NODE=xxxxxxxx | type= | sector= | summary=" + "x" * 240))
-            batch_size = max(8, min(100, safe_input_budget // per_node_estimate))
-            batches = [ecosystem[i:i + batch_size] for i in range(0, len(ecosystem), batch_size)] or [[]]
-            # Never fan out into an unbounded set of LLM calls. If the full ecosystem
-            # cannot fit in two calls, retain the highest-priority deterministic slice
-            # rather than turning one news request into a call explosion.
-            if len(batches) > MAX_IMPACT_LLM_CALLS:
-                ranked = sorted(
-                    ecosystem,
-                    key=lambda n: (
-                        -_pf_similarity(article_json, f"{n.get('node_id','')} {n.get('sector','')} {n.get('summary','')}"),
-                        str(n.get('node_id','')),
-                    ),
+            # Start with a conservative record batch and shrink adaptively when a
+            # batch still exceeds the actual provider capability.
+            batches = DataPartitioner.partition_records(ecosystem, max_per_batch=40)
+            logger.warning(
+                "[PERSPECTIVE] complete registry is ~%d tokens; partitioning into %d lossless batches",
+                full_tokens, len(batches)
+            )
+
+        all_domains: List[Dict[str, Any]] = []
+        all_excluded: List[Dict[str, Any]] = []
+        for batch_index, batch in enumerate(batches, start=1):
+            if not batch:
+                continue
+            batch_registry = self._ecosystem_context(batch, self.perspective.country, self.perspective.country_code)
+            user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM BATCH {batch_index}/{len(batches)}:\n{batch_registry}"
+            input_tokens = _messages_tokens(self.budget, system, user)
+            if not self.budget.fits_in_budget(input_tokens, requested):
+                # Shrink only the batch boundaries, never the records themselves.
+                sub_batches = DataPartitioner.partition_records(batch, max_per_batch=max(1, len(batch) // 2))
+                if len(sub_batches) > 1:
+                    for sub_index, sub_batch in enumerate(sub_batches, start=1):
+                        sub_registry = self._ecosystem_context(sub_batch, self.perspective.country, self.perspective.country_code)
+                        sub_user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM SUB-BATCH {batch_index}.{sub_index}:\n{sub_registry}"
+                        sub_tokens = _messages_tokens(self.budget, system, sub_user)
+                        if not self.budget.fits_in_budget(sub_tokens, requested):
+                            raise NewsPipelineContextOverflow(
+                                f"Perspective ecosystem batch {batch_index}.{sub_index} cannot fit provider context without truncation"
+                            )
+                        result = self._call_json(system, sub_user, requested, f"Perspective Impact Mapping [{batch_index}.{sub_index}]")
+                        domains, excluded = normalize(result)
+                        all_domains.extend(domains)
+                        all_excluded.extend(excluded)
+                    continue
+                raise NewsPipelineContextOverflow(
+                    f"Perspective ecosystem node batch {batch_index} cannot fit provider context without truncation"
                 )
-                keep = batch_size * MAX_IMPACT_LLM_CALLS
-                batches = [ranked[i:i + batch_size] for i in range(0, min(len(ranked), keep), batch_size)]
-                logger.warning("[PERSPECTIVE] ecosystem requires %d batches; capped to %d evidence-complete batches", len(ranked) // max(1, batch_size) + 1, len(batches))
+            result = self._call_json(system, user, requested, f"Perspective Impact Mapping [{batch_index}/{len(batches)}]")
+            domains, excluded = normalize(result)
+            all_domains.extend(domains)
+            all_excluded.extend(excluded)
 
-            def run_batch(item: Tuple[int, List[Dict[str, Any]]]) -> Tuple[int, Dict[str, Any]]:
-                idx, batch = item
-                registry = self._ecosystem_context(batch)
-                user = f"ARTICLE UNDERSTANDING:\n{article_json}\n\nPERSPECTIVE ECOSYSTEM BATCH {idx}/{len(batches)}:\n{registry}"
-                return idx, self._call_json(system, user, requested, f"Perspective Impact Mapping B{idx}")
+        # Merge equivalent domains without losing any node hints.
+        merged: Dict[str, Dict[str, Any]] = {}
+        for domain in all_domains:
+            key = _pf_norm(domain.get("domain", "")) or f"domain-{len(merged)}"
+            if key not in merged:
+                merged[key] = dict(domain)
+                merged[key]["ecosystem_node_hints"] = sorted(set(domain.get("ecosystem_node_hints", [])))
+                continue
+            current = merged[key]
+            current["ecosystem_node_hints"] = sorted(set(current.get("ecosystem_node_hints", [])) | set(domain.get("ecosystem_node_hints", [])))
+            for field_name in ("why_relevant", "mechanism"):
+                if domain.get(field_name) and domain[field_name] not in str(current.get(field_name, "")):
+                    current[field_name] = f"{current.get(field_name, '')}; {domain[field_name]}".strip("; ")
+            priority_rank = {"high": 0, "medium": 1, "low": 2}
+            if priority_rank.get(str(domain.get("priority", "medium")).lower(), 1) < priority_rank.get(str(current.get("priority", "medium")).lower(), 1):
+                current["priority"] = domain.get("priority")
 
-            indexed_results: Dict[int, Dict[str, Any]] = {}
-            with ThreadPoolExecutor(max_workers=min(LLM_CONCURRENCY, len(batches)), thread_name_prefix="atis-news-impact") as pool:
-                futures = [pool.submit(run_batch, item) for item in enumerate(batches, 1)]
-                for future in as_completed(futures):
-                    idx, result = future.result()
-                    indexed_results[idx] = result
-            results = [indexed_results[idx] for idx in sorted(indexed_results)]
+        domains = sorted(
+            merged.values(),
+            key=lambda d: (
+                0 if str(d.get("priority", "medium")).lower() == "high" else 1 if str(d.get("priority", "medium")).lower() == "medium" else 2,
+                _pf_norm(d.get("domain", "")),
+            ),
+        )
+        return {"impact_domains": domains, "excluded_domains": all_excluded}
 
-        aggregate_domains: Dict[str, Dict[str, Any]] = {}
-        excluded: List[Dict[str, Any]] = []
-        for result in results:
-            for domain in _pf_safe_list(result.get("impact_domains")):
-                if not isinstance(domain, dict):
-                    continue
-                key = _pf_norm(domain.get("domain", ""))
-                if not key:
-                    continue
-                domain = dict(domain)
-                hints = [str(x).strip() for x in _pf_safe_list(domain.get("ecosystem_node_hints")) if not isinstance(x, (dict, list)) and str(x).strip()]
-                domain["ecosystem_node_hints"] = hints
-                existing = aggregate_domains.get(key)
-                if existing is None:
-                    aggregate_domains[key] = domain
-                else:
-                    merged_hints = {str(x).strip() for x in _pf_safe_list(existing.get("ecosystem_node_hints")) if not isinstance(x, (dict, list)) and str(x).strip()}
-                    merged_hints.update(hints)
-                    existing["ecosystem_node_hints"] = sorted(merged_hints)[:12]
-                    if str(domain.get("priority", "medium")).lower() == "high":
-                        existing["priority"] = "high"
-                    if not existing.get("why_relevant") and domain.get("why_relevant"):
-                        existing["why_relevant"] = str(domain.get("why_relevant"))
-                    if not existing.get("mechanism") and domain.get("mechanism"):
-                        existing["mechanism"] = str(domain.get("mechanism"))
-            excluded.extend(x for x in _pf_safe_list(result.get("excluded_domains")) if isinstance(x, dict))
-        domains = sorted(aggregate_domains.values(), key=lambda d: (0 if str(d.get("priority", "medium")).lower() == "high" else 1 if str(d.get("priority", "medium")).lower() == "medium" else 2, _pf_norm(d.get("domain", ""))))[:MAX_IMPACT_DOMAINS]
-        return {"impact_domains": domains, "excluded_domains": excluded[:MAX_IMPACT_DOMAINS]}
-
-    # ------------------------------------------------------------------ #
-    # Targeted DB retrieval
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # DB target resolution
+    # ------------------------------------------------------------------
     def _node_record(self, canon: str) -> Dict[str, Any]:
         meta = self.vault.node_metadata.get(canon, {})
         return {
@@ -2907,27 +3222,20 @@ Required shape:
         }
 
     def _resolve_supplied_node(self, hint: str, ecosystem: List[Dict[str, Any]]) -> Optional[str]:
-        """Resolve only against supplied perspective ecosystem; similarity is never relationship evidence."""
         target = _pf_norm(hint)
         if not target:
             return None
-        exact = []
         for n in ecosystem:
-            if _pf_norm(n["node_id"]) == target or _pf_norm(n["canonical_id"]) == target:
-                exact.append(n["canonical_id"])
-        if exact:
-            return exact[0]
-        # Alias/normalized match against node name only.
+            if _pf_norm(n.get("node_id", "")) == target or _pf_norm(n.get("canonical_id", "")) == target:
+                return n["canonical_id"]
         candidates: List[Tuple[float, str]] = []
         for n in ecosystem:
-            score = max(_pf_similarity(hint, n["node_id"]), _pf_similarity(hint, n.get("summary", "")))
+            score = max(_pf_similarity(hint, n.get("node_id", "")), _pf_similarity(hint, n.get("summary", "")))
             if score >= MIN_NODE_RESOLUTION_SCORE:
                 candidates.append((score, n["canonical_id"]))
         candidates.sort(key=lambda x: (-x[0], x[1]))
-        if candidates:
-            # Require a clear winner; do not force ambiguous matches.
-            if len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.12:
-                return candidates[0][1]
+        if candidates and (len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.12):
+            return candidates[0][1]
         return None
 
     def retrieve_targets(self, impact: Dict[str, Any], ecosystem: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2936,231 +3244,148 @@ Required shape:
         for domain in _pf_safe_list(impact.get("impact_domains")):
             if not isinstance(domain, dict):
                 continue
-            hints = domain.get("ecosystem_node_hints", [])
+            hints = _pf_safe_list(domain.get("ecosystem_node_hints"))
             if not hints:
-                # Domain-level targeting: sector/type matching is retrieval, not graph evidence.
                 sector = _pf_norm(domain.get("domain", ""))
-                hints = [n["node_id"] for n in ecosystem if sector and sector in _pf_norm(n.get("sector", ""))][:8]
-            found_for_domain = False
+                hints = [n["node_id"] for n in ecosystem if sector and sector in _pf_norm(n.get("sector", ""))]
+            found = False
             for hint in hints:
                 canon = self._resolve_supplied_node(str(hint), ecosystem)
                 if canon:
-                    found_for_domain = True
+                    found = True
                     rec = self._node_record(canon)
-                    rec["target_domains"] = sorted({str(x).strip() for x in (_pf_safe_list(rec.get("target_domains")) + [domain.get("domain", "")]) if str(x).strip()})
+                    domains = set(rec.get("target_domains", []))
+                    domains.add(str(domain.get("domain", "")))
+                    rec["target_domains"] = sorted(x for x in domains if x)
                     resolved[canon] = rec
                 else:
                     unresolved.append({"hint": str(hint), "domain": domain.get("domain", ""), "status": "UNRESOLVED"})
-            if not found_for_domain:
+            if not found:
                 unresolved.append({"hint": domain.get("domain", ""), "domain": domain.get("domain", ""), "status": "NO_TARGET_NODE_RESOLVED"})
-        nodes = sorted(resolved.values(), key=lambda n: (n.get("sector", ""), n["node_id"]))[:MAX_RETRIEVAL_TARGETS]
+        nodes = sorted(resolved.values(), key=lambda n: (str(n.get("sector", "")), str(n.get("node_id", ""))))
+        if MAX_RETRIEVAL_TARGETS > 0 and len(nodes) > MAX_RETRIEVAL_TARGETS:
+            # This is an explicit operator-configured cap, never an implicit truncation.
+            overflow = nodes[MAX_RETRIEVAL_TARGETS:]
+            nodes = nodes[:MAX_RETRIEVAL_TARGETS]
+            unresolved.extend({"hint": n.get("node_id", ""), "domain": "retrieval_cap", "status": "RESEARCH_REQUIRED", "reason": "operator_configured_target_cap"} for n in overflow)
         logger.info("[RETRIEVAL] targeted nodes=%d unresolved targets=%d", len(nodes), len(unresolved))
         return nodes, unresolved
 
-    # ------------------------------------------------------------------ #
-    # Actual graph traversal
-    # ------------------------------------------------------------------ #
-    def _canonical_from_actual(self, node_id: str) -> Optional[str]:
-        canon = self.vault._canonicalize(node_id)
-        if canon in self.vault.file_map:
-            return canon
-        return None
-
+    # ------------------------------------------------------------------
+    # Deterministic graph traversal
+    # ------------------------------------------------------------------
     def traverse_graph(self, target_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         seeds = sorted({n["canonical_id"] for n in target_nodes if n.get("canonical_id") in self.vault.file_map})
         visited: Dict[str, int] = {s: 0 for s in seeds}
         queue: List[str] = list(seeds)
         paths: List[Dict[str, Any]] = []
-        direct_edges: List[Dict[str, Any]] = []
-        first_nodes: Set[str] = set()
-        second_nodes: Set[str] = set()
+        edges: List[Dict[str, Any]] = []
         backlink_candidates = 0
 
-        while queue and len(visited) <= MAX_GRAPH_NODES:
+        while queue:
             current = queue.pop(0)
             depth = visited[current]
             if depth >= MAX_GRAPH_DEPTH:
                 continue
-            current_actual = self.vault.file_map.get(current, current)
             outgoing = sorted(self.vault.outbound_links.get(current, []), key=lambda x: self.vault._canonicalize(x))
             incoming = sorted(self.vault.backlink_map.get(current, set()), key=lambda x: self.vault._canonicalize(x))
-            edges: List[Tuple[str, str]] = []
+            neighbours: List[Tuple[str, str]] = []
             for target in outgoing:
-                target_canon = self.vault._canonicalize(target)
-                if target_canon in self.vault.file_map:
-                    edges.append((target_canon, "outbound_link"))
+                canon = self.vault._canonicalize(target)
+                if canon in self.vault.file_map:
+                    neighbours.append((canon, "outbound_link"))
             for source in incoming:
-                source_canon = self.vault._canonicalize(source)
-                if source_canon in self.vault.file_map:
-                    edges.append((source_canon, "inbound_backlink"))
-                    if source_canon not in visited:
+                canon = self.vault._canonicalize(source)
+                if canon in self.vault.file_map:
+                    neighbours.append((canon, "inbound_backlink"))
+                    if canon not in visited:
                         backlink_candidates += 1
-            seen_edge: Set[Tuple[str, str]] = set()
-            for neighbour, relation_type in sorted(edges, key=lambda x: (x[0], x[1])):
-                if (neighbour, relation_type) in seen_edge:
-                    continue
-                seen_edge.add((neighbour, relation_type))
-                next_depth = depth + 1
-                # A node already reached at an equal or lower depth is not a new
-                # first/second-order node. This prevents reverse backlinks from
-                # turning a seed node into a false second-order discovery.
+            for neighbour, relation in sorted(set(neighbours), key=lambda x: (x[0], x[1])):
                 if neighbour in visited:
                     continue
-                if next_depth == 1:
-                    first_nodes.add(neighbour)
-                else:
-                    second_nodes.add(neighbour)
+                next_depth = depth + 1
+                visited[neighbour] = next_depth
+                queue.append(neighbour)
                 edge = {
-                    "from_node": current_actual,
+                    "from_node": self.vault.file_map.get(current, current),
                     "to_node": self.vault.file_map.get(neighbour, neighbour),
-                    "relationship_type": relation_type,
+                    "relationship_type": relation,
                     "depth": next_depth,
                     "source": "database",
                 }
-                direct_edges.append(edge)
+                edges.append(edge)
                 paths.append({
-                    "nodes": [self.vault.file_map.get(current, current), self.vault.file_map.get(neighbour, neighbour)],
+                    "nodes": [edge["from_node"], edge["to_node"]],
                     "edges": [edge],
                     "depth": next_depth,
                     "source": "database",
                 })
-                if len(visited) < MAX_GRAPH_NODES:
-                    visited[neighbour] = next_depth
-                    queue.append(neighbour)
-        # Convert reachable nodes to records.
-        direct_set = set(seeds)
-        graph_nodes: Dict[str, Dict[str, Any]] = {}
+
+        graph_nodes: List[Dict[str, Any]] = []
         for canon, depth in sorted(visited.items(), key=lambda x: (x[1], x[0])):
             rec = self._node_record(canon)
-            if canon in direct_set:
-                category = "target"
-            elif depth == 1:
-                category = "first_order"
-            else:
-                category = "second_order"
             rec["graph_depth"] = depth
-            rec["graph_category"] = category
-            graph_nodes[canon] = rec
-        paths = paths[:MAX_GRAPH_PATHS]
+            rec["graph_category"] = "target" if canon in seeds else "first_order" if depth == 1 else "second_order"
+            graph_nodes.append(rec)
+
         logger.info(
             "[GRAPH] targets=%d | direct=%d | first-order=%d | second-order=%d | backlink candidates=%d | paths=%d",
-            len(seeds), len(direct_set), len(first_nodes), len(second_nodes), backlink_candidates, len(paths)
+            len(seeds),
+            len(seeds),
+            sum(1 for n in graph_nodes if n["graph_category"] == "first_order"),
+            sum(1 for n in graph_nodes if n["graph_category"] == "second_order"),
+            backlink_candidates,
+            len(paths),
         )
         return {
-            # Sort canonical IDs first; graph_nodes values are dictionaries and are
-            # not orderable in Python 3. This also guarantees deterministic output.
-            "target_nodes": [
-                graph_nodes[c]
-                for c in sorted(direct_set)
-                if c in graph_nodes
-            ],
-            "nodes": list(graph_nodes.values()),
-            "edges": direct_edges[:MAX_GRAPH_PATHS],
-            "paths": paths,
-            "direct_nodes": len(direct_set),
-            "first_order_nodes": len(first_nodes),
-            "second_order_nodes": len(second_nodes),
+            "target_nodes": [n for n in graph_nodes if n["graph_category"] == "target"],
+            "nodes": graph_nodes,
+            "edges": edges if MAX_GRAPH_PATHS <= 0 else edges[:MAX_GRAPH_PATHS],
+            "paths": paths if MAX_GRAPH_PATHS <= 0 else paths[:MAX_GRAPH_PATHS],
+            "direct_nodes": len(seeds),
+            "first_order_nodes": sum(1 for n in graph_nodes if n["graph_category"] == "first_order"),
+            "second_order_nodes": sum(1 for n in graph_nodes if n["graph_category"] == "second_order"),
             "backlink_candidates": backlink_candidates,
         }
 
-    # ------------------------------------------------------------------ #
-    # Graph interpretation — LLM sees verified graph, not raw vault universe
-    # ------------------------------------------------------------------ #
-    def _graph_context(self, graph: Dict[str, Any]) -> str:
-        lines = ["VERIFIED DATABASE GRAPH — relationships are authoritative and may not be invented."]
-        for edge in graph.get("edges", [])[:MAX_GRAPH_PATHS]:
-            lines.append(
-                f"EDGE: {edge['from_node']} --{edge['relationship_type']}--> {edge['to_node']} | depth={edge['depth']} | source=database"
-            )
-        lines.append("NODE EVIDENCE:")
-        for n in graph.get("nodes", [])[:MAX_GRAPH_NODES]:
-            lines.append(
-                f"NODE: {n['node_id']} | country={n.get('country','')} | type={n.get('type','')} | sector={n.get('sector','')} | depth={n.get('graph_depth')} | category={n.get('graph_category')} | summary={_pf_text(n.get('summary',''), 220)}"
-            )
-        return "\n".join(lines)
-
-    def analyze_graph_partition(self, article: Dict[str, Any], impact: Dict[str, Any], graph_nodes: List[Dict[str, Any]], graph_edges: List[Dict[str, Any]], partition_no: int) -> Dict[str, Any]:
-        system = """You are ATIS News Graph Consequence Analyst.
-You are given a news event, its meaning, perspective impact domains, and a subset
-of VERIFIED database graph nodes/edges.
-
-The database graph is authoritative. You may interpret it, but you may NOT create
-new graph edges or factual entities. If a relationship is absent, it is absent.
-Distinguish supported consequence from hypothesis and research-required gaps.
-Do not turn mere node co-occurrence into a relationship.
-Return JSON only.
-
-Shape:
-{
- "consequences":[{"statement":"","order":"direct|first_order|second_order","supporting_nodes":[""],"supporting_edges":["FROM->TO"],"confidence":0.0}],
- "gaps":[{"gap":"","missing_relationship":"","status":"RESEARCH_REQUIRED","related_nodes":[""]}],
- "opportunity_signals":[{"signal":"","status":"SUPPORTED|RESEARCH_REQUIRED","supporting_nodes":[""],"supporting_edges":[""]}],
- "risk_signals":[{"signal":"","status":"SUPPORTED|RESEARCH_REQUIRED","supporting_nodes":[""],"supporting_edges":[""]}]
-}
-"""
-        compact_nodes = []
-        for n in graph_nodes[:MAX_GRAPH_NODES_PER_LLM_PARTITION]:
-            compact_nodes.append({k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")})
-        compact_edges = [
-            {"from_node": e["from_node"], "to_node": e["to_node"], "relationship_type": e["relationship_type"], "depth": e["depth"]}
-            for e in graph_edges[:MAX_GRAPH_NODES_PER_LLM_PARTITION * 2]
-        ]
-        user = (
-            f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
-            f"ARTICLE MEANING={json.dumps(article.get('meaning', []), ensure_ascii=False)}\n"
-            f"IMPACT DOMAINS={json.dumps(impact.get('impact_domains', []), ensure_ascii=False)}\n"
-            f"VERIFIED NODES={json.dumps(compact_nodes, ensure_ascii=False)}\n"
-            f"VERIFIED EDGES={json.dumps(compact_edges, ensure_ascii=False)}"
-        )
-        return self._call_json(system, user, MAX_STAGE_OUTPUT_TOKENS, f"Graph Consequence Partition {partition_no}")
-
+    # ------------------------------------------------------------------
+    # Graph consequence interpretation — exactly one call
+    # ------------------------------------------------------------------
     def analyze_graph(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], reasoning_log: ReasoningLog) -> Dict[str, Any]:
+        """Convert the verified graph into machine-grounded evidence.
+
+        There is intentionally NO graph LLM call here.  The graph is a database
+        fact set, so relationships are reported deterministically.  The single
+        final synthesis call receives these verified nodes/edges and performs
+        interpretation. This removes the graph-partition latency seen in the
+        production logs.
+        """
         nodes = [n for n in graph.get("nodes", []) if isinstance(n, dict)]
         edges = [e for e in graph.get("edges", []) if isinstance(e, dict)]
+        consequences: List[Dict[str, Any]] = []
+        for edge in edges:
+            consequences.append({
+                "statement": f"Verified database relationship: {edge.get('from_node')} -> {edge.get('to_node')}.",
+                "order": "direct" if int(edge.get("depth") or 1) == 1 else "second_order",
+                "supporting_nodes": [str(edge.get("from_node")), str(edge.get("to_node"))],
+                "supporting_edges": [f"{edge.get('from_node')}->{edge.get('to_node')}"],
+                "confidence": 1.0,
+                "source": "database",
+            })
+        gaps = []
         if not nodes:
-            return {"consequences": [], "gaps": [{"gap": "No targeted graph nodes were resolved", "status": "RESEARCH_REQUIRED", "related_nodes": []}], "opportunity_signals": [], "risk_signals": []}
+            gaps.append({"gap": "No targeted database graph nodes were resolved", "status": "RESEARCH_REQUIRED", "related_nodes": []})
+        return {
+            "consequences": consequences,
+            "gaps": gaps,
+            "opportunity_signals": [],
+            "risk_signals": [],
+            "source": "database_deterministic",
+        }
 
-        partitions = [nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION] for i in range(0, len(nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION)]
-        if len(partitions) > MAX_GRAPH_LLM_CALLS:
-            # Keep complete, highest-depth/relevance records rather than silently
-            # truncating serialized graph data or creating excessive LLM calls.
-            ranked_nodes = sorted(
-                nodes,
-                key=lambda n: (
-                    int(n.get("graph_depth", 99) or 99),
-                    0 if n.get("graph_category") == "target" else 1,
-                    str(n.get("node_id", "")),
-                ),
-            )
-            ranked_nodes = ranked_nodes[:MAX_GRAPH_NODES_PER_LLM_PARTITION * MAX_GRAPH_LLM_CALLS]
-            partitions = [ranked_nodes[i:i + MAX_GRAPH_NODES_PER_LLM_PARTITION] for i in range(0, len(ranked_nodes), MAX_GRAPH_NODES_PER_LLM_PARTITION)]
-            logger.warning("[GRAPH] graph workload capped at %d complete LLM partitions", len(partitions))
-        reasoning_log.partitions = len(partitions)
-
-        def run_partition(item: Tuple[int, List[Dict[str, Any]]]) -> Tuple[int, Dict[str, Any]]:
-            idx, part = item
-            part_ids = {str(n.get("node_id", "")) for n in part}
-            part_edges = [e for e in edges if str(e.get("from_node", "")) in part_ids or str(e.get("to_node", "")) in part_ids]
-            return idx, self.analyze_graph_partition(article, impact, part, part_edges, idx)
-
-        results: Dict[int, Dict[str, Any]] = {}
-        with ThreadPoolExecutor(max_workers=min(LLM_CONCURRENCY, len(partitions)), thread_name_prefix="atis-news-graph") as pool:
-            futures = [pool.submit(run_partition, item) for item in enumerate(partitions, 1)]
-            for future in as_completed(futures):
-                idx, result = future.result()
-                results[idx] = result
-
-        combined = {"consequences": [], "gaps": [], "opportunity_signals": [], "risk_signals": []}
-        for idx in sorted(results):
-            result = results[idx]
-            for key in combined:
-                combined[key].extend(x for x in _pf_safe_list(result.get(key)) if isinstance(x, dict))
-            reasoning_log.evidence_calls += 1
-        return combined
-
-    # ------------------------------------------------------------------ #
-    # Impact-chain construction from verified stages
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Impact chain
+    # ------------------------------------------------------------------
     def build_impact_chain(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], consequences: Dict[str, Any]) -> List[Dict[str, Any]]:
         chain: List[Dict[str, Any]] = []
         event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
@@ -3171,26 +3396,30 @@ Shape:
             "source": "article",
             "evidence": [f"article_fact_{i}" for i, _ in enumerate(_pf_safe_list(article.get("facts")))],
         })
-        meanings = _pf_safe_list(article.get("meaning"))
-        if meanings:
+        for idx, meaning in enumerate(_pf_safe_list(article.get("meaning"))):
+            if not isinstance(meaning, dict):
+                continue
             chain.append({
                 "stage": "meaning",
-                "label": _pf_text(meanings[0].get("interpretation", ""), 500) if isinstance(meanings[0], dict) else _pf_text(meanings[0], 500),
+                "label": str(meaning.get("interpretation", "")),
                 "status": "INTERPRETATION",
                 "source": "llm_article_interpretation",
-                "evidence": meanings[0].get("based_on_fact_indexes", []) if isinstance(meanings[0], dict) else [],
+                "evidence": meaning.get("based_on_fact_indexes", []),
+                "sequence": idx,
             })
-        for domain in _pf_safe_list(impact.get("impact_domains"))[:MAX_IMPACT_DOMAINS]:
-            if isinstance(domain, dict):
-                chain.append({
-                    "stage": "zimbabwe_ecosystem" if _pf_norm(self.perspective.country) == "zimbabwe" else "perspective_ecosystem",
-                    "label": domain.get("domain", ""),
-                    "status": "INVESTIGATION_TARGET",
-                    "source": "perspective_ecosystem",
-                    "mechanism": domain.get("mechanism", ""),
-                    "priority": domain.get("priority", "medium"),
-                })
-        for edge in graph.get("edges", [])[:MAX_GRAPH_PATHS]:
+        for domain in _pf_safe_list(impact.get("impact_domains")):
+            if not isinstance(domain, dict):
+                continue
+            chain.append({
+                "stage": "perspective_ecosystem",
+                "label": str(domain.get("domain", "")),
+                "status": "INVESTIGATION_TARGET",
+                "source": "perspective_ecosystem",
+                "mechanism": str(domain.get("mechanism", "")),
+                "priority": str(domain.get("priority", "medium")),
+                "node_hints": _pf_safe_list(domain.get("ecosystem_node_hints")),
+            })
+        for edge in graph.get("edges", []):
             chain.append({
                 "stage": "graph_relationship",
                 "label": f"{edge.get('from_node')} → {edge.get('to_node')}",
@@ -3198,134 +3427,207 @@ Shape:
                 "source": "database",
                 "relationship": edge.get("relationship_type"),
                 "depth": edge.get("depth"),
-                "evidence": [f"{edge.get('from_node')}->{edge.get('to_node')}"]
+                "evidence": [f"{edge.get('from_node')}->{edge.get('to_node')}"],
             })
-        for item in _pf_safe_list(consequences.get("consequences"))[:20]:
-            if isinstance(item, dict):
-                chain.append({
-                    "stage": "consequence" if item.get("order") != "second_order" else "second_order_effect",
-                    "label": item.get("statement", ""),
-                    "status": "SUPPORTED" if item.get("supporting_edges") or item.get("supporting_nodes") else "RESEARCH_REQUIRED",
-                    "source": "verified_graph_interpretation",
-                    "evidence": item.get("supporting_nodes", []),
-                    "graph_edges": item.get("supporting_edges", []),
-                    "confidence": item.get("confidence", 0.0),
-                })
-        for gap in _pf_safe_list(consequences.get("gaps"))[:20]:
-            if isinstance(gap, dict):
-                chain.append({
-                    "stage": "gap",
-                    "label": gap.get("gap", ""),
-                    "status": "RESEARCH_REQUIRED",
-                    "source": "database_graph_gap",
-                    "evidence": gap.get("related_nodes", []),
-                    "missing_relationship": gap.get("missing_relationship", ""),
-                })
-        return chain[:MAX_GRAPH_PATHS + MAX_IMPACT_DOMAINS + 10]
+        for item in _pf_safe_list(consequences.get("consequences")):
+            if not isinstance(item, dict):
+                continue
+            chain.append({
+                "stage": "second_order_effect" if item.get("order") == "second_order" else "consequence",
+                "label": str(item.get("statement", "")),
+                "status": "SUPPORTED" if item.get("supporting_edges") or item.get("supporting_nodes") else "RESEARCH_REQUIRED",
+                "source": "verified_graph_interpretation",
+                "evidence": _pf_safe_list(item.get("supporting_nodes")),
+                "graph_edges": _pf_safe_list(item.get("supporting_edges")),
+                "confidence": _pf_safe_float(item.get("confidence", 0.0)),
+            })
+        for gap in _pf_safe_list(consequences.get("gaps")):
+            if not isinstance(gap, dict):
+                continue
+            chain.append({
+                "stage": "gap",
+                "label": str(gap.get("gap", "")),
+                "status": "RESEARCH_REQUIRED",
+                "source": "database_graph_gap",
+                "evidence": _pf_safe_list(gap.get("related_nodes")),
+                "missing_relationship": str(gap.get("missing_relationship", "")),
+            })
+        return chain
 
-    # ------------------------------------------------------------------ #
-    # Final synthesis from distilled evidence
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Final synthesis
+    # ------------------------------------------------------------------
     def final_synthesis(self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any], consequences: Dict[str, Any], impact_chain: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Produce final synthesis while evaluating the complete graph losslessly.
+
+        A graph that fits the provider context is handled in one call. Otherwise
+        nodes are partitioned into complete batches; every batch is evaluated and
+        the resulting JSON objects are deterministically merged. No graph node or
+        edge is character-truncated to make the request fit.
+        """
         system = """You are the ATIS News Final Synthesis Engine.
 Produce the final dashboard from the supplied structured analysis.
 
 HARD RULES:
-1. The selected perspective country is the lens. Never switch to a local source-country perspective.
-2. Database nodes and edges are authoritative. Do not invent missing edges.
-3. Opportunities must be supported by at least one verified database node AND one verified graph edge/path, unless explicitly labelled RESEARCH_REQUIRED.
-4. If evidence is missing, say RESEARCH_REQUIRED rather than filling the gap with world knowledge.
-5. Never infer a relationship merely because two nodes appear in the same context.
-6. Preserve the impact chain exactly as an evidence trail.
-7. Return concise JSON. Do not write an essay.
+1. The selected perspective country is the lens. Never switch to a source-country/local perspective.
+2. Article facts come only from the supplied article understanding.
+3. Database nodes and edges are authoritative. Never invent an edge, actor, capability, or relationship.
+4. Opportunities must be supported by verified database nodes AND a verified graph path/edge, unless status=RESEARCH_REQUIRED.
+5. A plausible commercial idea without database support is RESEARCH_REQUIRED, not SUPPORTED.
+6. Preserve the supplied impact chain; do not rewrite its evidence trail.
+7. Key entities must correspond to supplied database nodes or article actors and must carry provenance.
+8. Return concise but complete JSON. Do not omit fields simply because an analysis is partial.
+9. Return ONLY valid JSON.
 
-Return:
+Schema:
 {
  "trigger_event":"",
  "market_equilibrium_shift":"",
  "executive_summary":"",
  "analytical_perspective":{"country":"","country_code":"","description":""},
- "facts":[],
- "meaning":[],
- "impact_domains":[],
- "impact_chain":[],
- "findings":[],
- "opportunities":[{"opportunity_id":"","title":"","status":"SUPPORTED|RESEARCH_REQUIRED","perspective_country":"","opportunity_country":"","perspective_actor":"","perspective_capability":"","pathway":"","justification":"","urgency_score":0.0,"feasibility_score":0.0,"source_nodes":[],"graph_paths":[],"required_missing_nodes":[]}],
+ "facts":[], "meaning":[], "impact_domains":[], "impact_chain":[],
+ "findings":[{"text":"","source_nodes":[],"graph_paths":[],"status":"SUPPORTED|RESEARCH_REQUIRED"}],
+ "opportunities":[{"opportunity_id":"","title":"","status":"SUPPORTED|RESEARCH_REQUIRED","perspective_country":"","opportunity_country":"","source_country":"","event_country":"","cross_border":false,"cross_border_countries":[],"perspective_actor":"","perspective_capability":"","pathway":"","justification":"","urgency_score":0.0,"feasibility_score":0.0,"source_nodes":[],"graph_paths":[],"required_missing_nodes":[]}],
  "risks":[{"text":"","status":"SUPPORTED|RESEARCH_REQUIRED","severity":"high|medium|low","source_nodes":[],"graph_paths":[]}],
  "gaps":[{"gap":"","status":"RESEARCH_REQUIRED","related_nodes":[],"missing_relationship":""}],
- "entities":[],
- "graph_analysis":{"direct":0,"first_order":0,"second_order":0,"backlink_candidates":0,"paths":[]}
+ "key_entities":[{"entity_name":"","entity_type":"","country":"","sector":"","significance_score":0,"summary":"","source_node":""}]
 }
 """
-        # Final prompt uses distilled graph and consequences, not the entire vault.
-        graph_summary = {
-            "nodes": [
-                {k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")}
-                for n in graph.get("nodes", [])[:MAX_GRAPH_NODES]
-            ],
-            "edges": graph.get("edges", [])[:MAX_GRAPH_PATHS],
-        }
-        user = (
-            f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
-            f"ARTICLE={json.dumps(article, ensure_ascii=False)}\n"
-            f"IMPACT={json.dumps(impact, ensure_ascii=False)}\n"
-            f"GRAPH={json.dumps(graph_summary, ensure_ascii=False)}\n"
-            f"CONSEQUENCES={json.dumps(consequences, ensure_ascii=False)}\n"
-            f"IMPACT_CHAIN={json.dumps(impact_chain, ensure_ascii=False)}"
-        )
-        result = self._call_json(system, user, MAX_FINAL_OUTPUT_TOKENS, "Final News Synthesis")
-        result["impact_chain"] = impact_chain
-        return result
 
-    # ------------------------------------------------------------------ #
-    # Deterministic validation / post-processing
-    # ------------------------------------------------------------------ #
-    def validate_and_ground(self, dashboard: Dict[str, Any], graph: Dict[str, Any], ecosystem: List[Dict[str, Any]], article: Dict[str, Any], impact: Dict[str, Any], consequences: Dict[str, Any]) -> Dict[str, Any]:
-        valid_nodes = {n["node_id"] for n in graph.get("nodes", [])}
-        valid_edges = {f"{e.get('from_node')}->{e.get('to_node')}" for e in graph.get("edges", [])}
-        perspective_nodes = {n["node_id"] for n in ecosystem}
-        opportunities: List[Dict[str, Any]] = []
-        for opp in _pf_safe_list(dashboard.get("opportunities")):
-            if not isinstance(opp, dict):
+        def graph_payload_for(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+            node_ids = {str(n.get("node_id")) for n in nodes if n.get("node_id")}
+            edges = [e for e in graph.get("edges", []) if str(e.get("from_node")) in node_ids or str(e.get("to_node")) in node_ids]
+            paths = [p for p in graph.get("paths", []) if any(str(x) in node_ids for x in _pf_safe_list(p.get("nodes")))]
+            return {
+                "nodes": [
+                    {k: n.get(k, "") for k in ("node_id", "country", "type", "sector", "summary", "graph_depth", "graph_category")}
+                    for n in nodes
+                ],
+                "edges": edges,
+                "paths": paths,
+            }
+
+        common = (
+            f"PERSPECTIVE={self.perspective.country} ({self.perspective.country_code})\n"
+            f"ARTICLE UNDERSTANDING={_json(article)}\n"
+            f"PERSPECTIVE IMPACT={_json(impact)}\n"
+            f"GRAPH CONSEQUENCES={_json(consequences)}\n"
+            f"IMPACT CHAIN={_json(impact_chain)}\n"
+        )
+        nodes = list(graph.get("nodes", []))
+        full_payload = graph_payload_for(nodes)
+        full_user = common + f"VERIFIED GRAPH (COMPLETE)={_json(full_payload)}"
+        requested = MAX_FINAL_OUTPUT_TOKENS
+        if self.budget.fits_in_budget(_messages_tokens(self.budget, system, full_user), requested):
+            return self._call_json(system, full_user, requested, "Final News Synthesis")
+
+        batches = DataPartitioner.partition_records(nodes, max_per_batch=40)
+        logger.warning("[FINAL] complete graph does not fit; evaluating %d lossless graph batches", len(batches))
+        results: List[Dict[str, Any]] = []
+        for index, batch in enumerate(batches, start=1):
+            payload = graph_payload_for(batch)
+            user = common + f"VERIFIED GRAPH BATCH {index}/{len(batches)}={_json(payload)}"
+            input_tokens = _messages_tokens(self.budget, system, user)
+            if not self.budget.fits_in_budget(input_tokens, requested):
+                sub_batches = DataPartitioner.partition_records(batch, max_per_batch=max(1, len(batch) // 2))
+                for sub_index, sub_batch in enumerate(sub_batches, start=1):
+                    sub_payload = graph_payload_for(sub_batch)
+                    sub_user = common + f"VERIFIED GRAPH SUB-BATCH {index}.{sub_index}={_json(sub_payload)}"
+                    if not self.budget.fits_in_budget(_messages_tokens(self.budget, system, sub_user), requested):
+                        raise NewsPipelineContextOverflow(f"Final synthesis graph batch {index}.{sub_index} cannot fit without truncation")
+                    results.append(self._call_json(system, sub_user, requested, f"Final News Synthesis [{index}.{sub_index}]") )
                 continue
-            source_nodes = [str(x) for x in _pf_safe_list(opp.get("source_nodes")) if str(x) in valid_nodes]
-            graph_paths = [str(x) for x in _pf_safe_list(opp.get("graph_paths")) if str(x) in valid_edges]
-            actor = str(opp.get("perspective_actor", ""))
-            actor_supported = not actor or actor in perspective_nodes
-            supported = bool(source_nodes and graph_paths and actor_supported)
-            item = dict(opp)
+            results.append(self._call_json(system, user, requested, f"Final News Synthesis [{index}/{len(batches)}]"))
+
+        if not results:
+            raise RuntimeError("Final synthesis produced no batch results")
+
+        # Deterministic, loss-preserving merge. The first result supplies the
+        # article-level narrative; evidence-bearing collections are unioned.
+        merged = dict(results[0])
+        list_fields = ("findings", "opportunities", "risks", "gaps", "key_entities")
+        for field_name in list_fields:
+            combined: List[Any] = []
+            seen: Set[str] = set()
+            for result in results:
+                for item in _pf_safe_list(result.get(field_name)):
+                    key = _json(item)
+                    if key not in seen:
+                        seen.add(key)
+                        combined.append(item)
+            merged[field_name] = combined
+        merged["facts"] = _pf_safe_list(article.get("facts"))
+        merged["meaning"] = _pf_safe_list(article.get("meaning"))
+        merged["impact_domains"] = _pf_safe_list(impact.get("impact_domains"))
+        merged["impact_chain"] = impact_chain
+        return merged
+
+    # ------------------------------------------------------------------
+    # Grounding
+    # ------------------------------------------------------------------
+    def validate_and_ground(
+        self,
+        dashboard: Dict[str, Any],
+        graph: Dict[str, Any],
+        ecosystem: List[Dict[str, Any]],
+        article: Dict[str, Any],
+        impact: Dict[str, Any],
+        consequences: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        valid_nodes = {str(n.get("node_id")) for n in graph.get("nodes", []) if n.get("node_id")}
+        valid_edges = {
+            f"{e.get('from_node')}->{e.get('to_node')}"
+            for e in graph.get("edges", [])
+            if e.get("from_node") and e.get("to_node")
+        }
+        perspective_nodes = {str(n.get("node_id")) for n in ecosystem if n.get("node_id")}
+
+        grounded_opportunities: List[Dict[str, Any]] = []
+        for raw in _pf_safe_list(dashboard.get("opportunities")):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            source_nodes = [str(x) for x in _pf_safe_list(item.get("source_nodes")) if str(x) in valid_nodes]
+            graph_paths = [str(x) for x in _pf_safe_list(item.get("graph_paths")) if str(x) in valid_edges]
+            actor = str(item.get("perspective_actor", ""))
+            actor_supported = bool(actor) and actor in perspective_nodes
+            perspective_country = str(item.get("perspective_country") or self.perspective.country)
+            supported = bool(source_nodes and graph_paths and actor_supported and _pf_norm(perspective_country) == _pf_norm(self.perspective.country))
             item["source_nodes"] = source_nodes
             item["graph_paths"] = graph_paths
-            if not supported:
-                item["status"] = "RESEARCH_REQUIRED"
-                item["opportunity_confidence"] = min(_pf_safe_float(item.get("opportunity_confidence", 0.0)), 0.49)
-                if not item.get("required_missing_nodes"):
-                    item["required_missing_nodes"] = ["verified graph pathway and/or perspective actor evidence"]
-            else:
+            item["perspective_country"] = self.perspective.country
+            item["perspective_country_code"] = self.perspective.country_code
+            if supported:
                 item["status"] = "SUPPORTED"
-                item["opportunity_confidence"] = max(_pf_safe_float(item.get("opportunity_confidence", 0.0)), MIN_OPPORTUNITY_GRAPH_SCORE)
-            item.setdefault("perspective_country", self.perspective.country)
-            item.setdefault("perspective_country_code", self.perspective.country_code)
-            opportunities.append(item)
-        dashboard["opportunities"] = opportunities
+                item["opportunity_confidence"] = max(_pf_safe_float(item.get("opportunity_confidence")), MIN_OPPORTUNITY_GRAPH_SCORE)
+            else:
+                item["status"] = "RESEARCH_REQUIRED"
+                item["opportunity_confidence"] = min(_pf_safe_float(item.get("opportunity_confidence")), 0.49)
+                missing = list(_pf_safe_list(item.get("required_missing_nodes")))
+                if not source_nodes:
+                    missing.append("verified source node")
+                if not graph_paths:
+                    missing.append("verified database graph path")
+                if not actor_supported:
+                    missing.append("verified perspective-country actor")
+                item["required_missing_nodes"] = sorted(set(str(x) for x in missing if x))
+            grounded_opportunities.append(item)
+        dashboard["opportunities"] = grounded_opportunities
 
-        risks: List[Dict[str, Any]] = []
-        for risk in _pf_safe_list(dashboard.get("risks")):
-            if not isinstance(risk, dict):
+        grounded_risks: List[Dict[str, Any]] = []
+        for raw in _pf_safe_list(dashboard.get("risks")):
+            if not isinstance(raw, dict):
                 continue
-            item = dict(risk)
+            item = dict(raw)
             item["source_nodes"] = [str(x) for x in _pf_safe_list(item.get("source_nodes")) if str(x) in valid_nodes]
             item["graph_paths"] = [str(x) for x in _pf_safe_list(item.get("graph_paths")) if str(x) in valid_edges]
-            if not item["source_nodes"]:
-                item["status"] = "RESEARCH_REQUIRED"
-            else:
-                item.setdefault("status", "SUPPORTED")
-            risks.append(item)
-        dashboard["risks"] = risks
+            item.setdefault("status", "SUPPORTED" if item["source_nodes"] else "RESEARCH_REQUIRED")
+            grounded_risks.append(item)
+        dashboard["risks"] = grounded_risks
 
-        dashboard.setdefault("gaps", consequences.get("gaps", []))
-        dashboard.setdefault("findings", [])
-        dashboard.setdefault("entities", article.get("actors", []))
+        dashboard["findings"] = [x for x in _pf_safe_list(dashboard.get("findings")) if isinstance(x, dict)]
+        dashboard["gaps"] = [x for x in _pf_safe_list(dashboard.get("gaps")) if isinstance(x, dict)]
+        dashboard["entities"] = _pf_safe_list(dashboard.get("entities"))
         dashboard["analytical_perspective"] = {
             "country": self.perspective.country,
             "country_code": self.perspective.country_code,
@@ -3336,33 +3638,33 @@ Return:
             "first_order": graph.get("first_order_nodes", 0),
             "second_order": graph.get("second_order_nodes", 0),
             "backlink_candidates": graph.get("backlink_candidates", 0),
-            "paths": graph.get("paths", [])[:MAX_GRAPH_PATHS],
+            "paths": graph.get("paths", []),
         }
-        dashboard["source_country"] = article.get("event", {}).get("source_country", "") if isinstance(article.get("event"), dict) else ""
-        dashboard["event_country"] = article.get("event", {}).get("event_country", "") if isinstance(article.get("event"), dict) else ""
+        event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
+        dashboard["source_country"] = event.get("source_country", "") or ""
+        dashboard["event_country"] = event.get("event_country", "") or ""
         return dashboard
 
-    # ------------------------------------------------------------------ #
-    # Deadline-safe deterministic fallback
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Truthful deterministic fallback
+    # ------------------------------------------------------------------
     def _fallback_dashboard(
-        self, article: Dict[str, Any], impact: Dict[str, Any], graph: Dict[str, Any],
-        consequences: Dict[str, Any], impact_chain: List[Dict[str, Any]], reason: str,
+        self,
+        article: Dict[str, Any],
+        impact: Dict[str, Any],
+        graph: Dict[str, Any],
+        consequences: Dict[str, Any],
+        impact_chain: List[Dict[str, Any]],
+        reason: str,
     ) -> Dict[str, Any]:
-        """Return grounded partial intelligence when the final LLM cannot safely run.
-
-        This contains only article facts, database graph facts, and already-computed
-        LLM interpretations. It deliberately does not invent an executive conclusion.
-        """
         event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
-        summary = str(event.get("summary") or "").strip()
         return {
             "status": "partial",
             "partial": True,
             "detail": reason,
             "trigger_event": str(event.get("title") or "News event"),
             "market_equilibrium_shift": "",
-            "executive_summary": summary,
+            "executive_summary": str(event.get("summary") or ""),
             "analytical_perspective": {
                 "country": self.perspective.country,
                 "country_code": self.perspective.country_code,
@@ -3382,57 +3684,95 @@ Return:
                 "first_order": graph.get("first_order_nodes", 0),
                 "second_order": graph.get("second_order_nodes", 0),
                 "backlink_candidates": graph.get("backlink_candidates", 0),
-                "paths": graph.get("paths", [])[:MAX_GRAPH_PATHS],
+                "paths": graph.get("paths", []),
             },
             "source_country": event.get("source_country", ""),
             "event_country": event.get("event_country", ""),
         }
 
-    # ------------------------------------------------------------------ #
-    # Full pipeline
-    # ------------------------------------------------------------------ #
-    def run(self, article_text: str, reasoning_log: ReasoningLog) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Full run
+    # ------------------------------------------------------------------
+    def run(
+        self,
+        article_text: str,
+        reasoning_log: ReasoningLog,
+        state: Optional[JobState] = None,
+        persistence: Optional[StatePersistenceManager] = None,
+    ) -> Dict[str, Any]:
+        """Run the News pipeline through durable, resumable stage checkpoints."""
         if not article_text or not article_text.strip():
             raise ValueError("News article text is empty")
         article_text = article_text.strip()
-        pipeline_started = time.monotonic()
         if len(article_text) > MAX_ARTICLE_CHARS:
             raise ValueError(
-                f"News article is {len(article_text):,} characters, exceeding the configured "
-                f"ATIS_NEWS_MAX_ARTICLE_CHARS limit of {MAX_ARTICLE_CHARS:,}. "
-                "Increase the environment limit rather than silently truncating the article."
+                f"Article contains {len(article_text):,} characters, exceeding the configured safety limit "
+                f"{MAX_ARTICLE_CHARS:,}. ATIS refuses to truncate the source article."
             )
 
-        ecosystem = self.load_perspective_ecosystem()
-        reasoning_log.perspective_nodes = len(ecosystem)
-        try:
+        persistence = persistence or StatePersistenceManager()
+        if state is None:
+            state = JobState(intelligence_id="transient-news-job")
+        state.stage_data.setdefault("raw_article", article_text)
+        state.stage_data.setdefault("perspective", self.perspective.as_dict())
+
+        def checkpoint(stage: PipelineStage, data: Any) -> None:
+            state.current_stage = stage.value
+            state.mark_stage_complete(stage, data)
+            state.status = "IN_PROGRESS"
+            persistence.save_state(state)
+            logger.info("[CHECKPOINT] %s complete | job=%s", stage.value, state.intelligence_id)
+
+        def set_stage(stage: PipelineStage) -> None:
+            state.current_stage = stage.value
+            state.status = "IN_PROGRESS"
+            persistence.save_state(state)
+
+        # Stage 1 — Article Understanding
+        if state.is_completed(PipelineStage.ARTICLE_UNDERSTANDING):
+            article = state.stage_data[PipelineStage.ARTICLE_UNDERSTANDING.value]
+        else:
+            set_stage(PipelineStage.ARTICLE_UNDERSTANDING)
             article = self.understand_article(article_text)
-        except NewsPipelineDeadline as exc:
-            logger.warning("[DEADLINE] %s", exc)
-            dashboard = self._fallback_dashboard(
-                {"event": {}, "facts": [], "meaning": [], "actors": [], "uncertainties": []},
-                {"impact_domains": []},
-                {"nodes": [], "edges": [], "paths": [], "direct_nodes": 0, "first_order_nodes": 0, "second_order_nodes": 0, "backlink_candidates": 0},
-                {"consequences": [], "gaps": [{"gap": str(exc), "status": "RESEARCH_REQUIRED", "related_nodes": []}], "opportunity_signals": [], "risk_signals": []},
-                [],
-                str(exc),
-            )
-            dashboard["status"] = "partial"
-            dashboard["partial"] = True
-            dashboard["research_required"] = dashboard.get("gaps", [])
-            reasoning_log.total_llm_calls = self.calls
-            return dashboard
+            checkpoint(PipelineStage.ARTICLE_UNDERSTANDING, article)
+
         reasoning_log.entities_extracted = len(_pf_safe_list(article.get("actors")))
-        try:
+        reasoning_log.estimated_tokens = self.budget.estimate_tokens(article_text)
+        reasoning_log.safe_budget = self.budget.provider_context_limit - self.budget.safety_margin
+
+        # Stage 2 — Perspective Mapping. The ecosystem is database-derived only.
+        if state.is_completed(PipelineStage.PERSPECTIVE_MAPPING):
+            stage2 = state.stage_data[PipelineStage.PERSPECTIVE_MAPPING.value]
+            ecosystem = _pf_safe_list(stage2.get("ecosystem"))
+            impact = stage2.get("impact", {}) if isinstance(stage2, dict) else {}
+        else:
+            set_stage(PipelineStage.PERSPECTIVE_MAPPING)
+            ecosystem = self.load_perspective_ecosystem()
+            reasoning_log.perspective_nodes = len(ecosystem)
             impact = self.map_impact_domains(article, ecosystem)
-        except NewsPipelineDeadline as exc:
-            logger.warning("[DEADLINE] %s", exc)
-            impact = {"impact_domains": [], "excluded_domains": [], "deadline": str(exc)}
+            checkpoint(PipelineStage.PERSPECTIVE_MAPPING, {"ecosystem": ecosystem, "impact": impact})
+        reasoning_log.perspective_nodes = len(ecosystem)
         reasoning_log.impact_domains = len(_pf_safe_list(impact.get("impact_domains")))
-        targets, unresolved = self.retrieve_targets(impact, ecosystem)
+
+        # Stage 3 — Database Retrieval
+        if state.is_completed(PipelineStage.DATABASE_RETRIEVAL):
+            stage3 = state.stage_data[PipelineStage.DATABASE_RETRIEVAL.value]
+            targets = _pf_safe_list(stage3.get("targets"))
+            unresolved = _pf_safe_list(stage3.get("unresolved"))
+        else:
+            set_stage(PipelineStage.DATABASE_RETRIEVAL)
+            targets, unresolved = self.retrieve_targets(impact, ecosystem)
+            checkpoint(PipelineStage.DATABASE_RETRIEVAL, {"targets": targets, "unresolved": unresolved})
         reasoning_log.retrieval_targets = len(targets)
         reasoning_log.candidate_nodes = len(self.vault.file_map)
-        graph = self.traverse_graph(targets)
+
+        # Stage 4 — Deterministic Graph Traversal
+        if state.is_completed(PipelineStage.GRAPH_TRAVERSAL):
+            graph = state.stage_data[PipelineStage.GRAPH_TRAVERSAL.value]
+        else:
+            set_stage(PipelineStage.GRAPH_TRAVERSAL)
+            graph = self.traverse_graph(targets)
+            checkpoint(PipelineStage.GRAPH_TRAVERSAL, graph)
         reasoning_log.direct_graph_nodes = graph.get("direct_nodes", 0)
         reasoning_log.first_order_graph_nodes = graph.get("first_order_nodes", 0)
         reasoning_log.second_order_graph_nodes = graph.get("second_order_nodes", 0)
@@ -3440,75 +3780,120 @@ Return:
         reasoning_log.graph_paths = len(graph.get("paths", []))
         reasoning_log.relevant_nodes = len(graph.get("nodes", []))
         reasoning_log.selected_evidence = len(graph.get("nodes", []))
+        reasoning_log.reasoning_mode = "perspective_first_graph_grounded" if graph.get("nodes") else "perspective_only_no_graph_evidence"
 
-        if graph.get("nodes"):
-            reasoning_log.reasoning_mode = ReasoningMode.MULTI_STAGE.value
-            try:
-                consequences = self.analyze_graph(article, impact, graph, reasoning_log)
-            except NewsPipelineDeadline as exc:
-                logger.warning("[DEADLINE] %s", exc)
-                consequences = {
-                    "consequences": [],
-                    "gaps": [{"gap": str(exc), "status": "RESEARCH_REQUIRED", "related_nodes": [n.get("node_id", "") for n in graph.get("nodes", [])[:10]]}],
-                    "opportunity_signals": [],
-                    "risk_signals": [],
-                }
-                self.deadline_exhausted = True
+        # Stage 5 — Impact Analysis. Consequences are interpreted from verified graph data.
+        if state.is_completed(PipelineStage.IMPACT_ANALYSIS):
+            stage5 = state.stage_data[PipelineStage.IMPACT_ANALYSIS.value]
+            consequences = stage5.get("consequences", {})
+            impact_chain = _pf_safe_list(stage5.get("impact_chain"))
         else:
-            reasoning_log.reasoning_mode = "perspective_only_no_graph_evidence"
-            consequences = {
-                "consequences": [],
-                "gaps": [{
-                    "gap": "No evidence-backed relationship was found between the identified perspective targets and the current graph.",
+            set_stage(PipelineStage.IMPACT_ANALYSIS)
+            consequences = self.analyze_graph(article, impact, graph, reasoning_log)
+            if not graph.get("nodes"):
+                consequences.setdefault("gaps", []).append({
+                    "gap": "No evidence-backed relationship was found between the selected perspective targets and the current database graph.",
                     "status": "RESEARCH_REQUIRED",
-                    "related_nodes": [n["node_id"] for n in targets],
-                }],
-                "opportunity_signals": [],
-                "risk_signals": [],
-            }
-        impact_chain = self.build_impact_chain(article, impact, graph, consequences)
+                    "related_nodes": [n.get("node_id", "") for n in targets],
+                })
+            impact_chain = self.build_impact_chain(article, impact, graph, consequences)
+            checkpoint(PipelineStage.IMPACT_ANALYSIS, {"consequences": consequences, "impact_chain": impact_chain})
 
-        # Reserve time for the HTTP response itself. If the upstream analysis has
-        # consumed the safe execution window, do not start another network call.
-        elapsed = time.monotonic() - pipeline_started
-        if elapsed >= max(1.0, PIPELINE_DEADLINE_SECONDS - 12.0):
-            logger.warning("[DEADLINE] %.1fs elapsed; skipping final LLM synthesis and returning grounded partial result", elapsed)
-            dashboard = self._fallback_dashboard(
-                article, impact, graph, consequences, impact_chain,
-                f"Final synthesis skipped after {elapsed:.1f}s to protect the API request deadline.",
-            )
+        # Stage 6 — Final Synthesis. If the deadline is too small, return a truthful
+        # partial result without marking the stage complete; the next invocation resumes here.
+        if state.is_completed(PipelineStage.FINAL_SYNTHESIS):
+            dashboard = state.stage_data[PipelineStage.FINAL_SYNTHESIS.value]
         else:
-            try:
-                dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
-                dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
-            except NewsPipelineDeadline as exc:
-                logger.warning("[DEADLINE] %s", exc)
-                dashboard = self._fallback_dashboard(article, impact, graph, consequences, impact_chain, str(exc))
-        dashboard["facts"] = article.get("facts", [])
-        dashboard["meaning"] = article.get("meaning", [])
-        dashboard["impact_domains"] = impact.get("impact_domains", [])
+            set_stage(PipelineStage.FINAL_SYNTHESIS)
+            if self._remaining_seconds() < FINAL_LLM_TIMEOUT_SECONDS + 2.0:
+                self.deadline_exhausted = True
+                dashboard = self._fallback_dashboard(
+                    article, impact, graph, consequences, impact_chain,
+                    "Final synthesis skipped because the remaining request budget was too small for a safe provider call."
+                )
+            else:
+                try:
+                    dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
+                    dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
+                except (NewsPipelineDeadline, LLMTokenLimitError, NewsPipelineContextOverflow, RuntimeError) as exc:
+                    logger.warning("[FINAL] %s", exc)
+                    self.deadline_exhausted = isinstance(exc, NewsPipelineDeadline)
+                    dashboard = self._fallback_dashboard(article, impact, graph, consequences, impact_chain, str(exc))
+            if not self.deadline_exhausted and dashboard.get("status") != "partial":
+                checkpoint(PipelineStage.FINAL_SYNTHESIS, dashboard)
+
+        # Authoritative fields are rebuilt from deterministic/article sources after
+        # every resume so a malformed or stale LLM result cannot erase evidence.
+        dashboard = dict(dashboard or {})
+        dashboard["facts"] = _pf_safe_list(article.get("facts"))
+        dashboard["meaning"] = _pf_safe_list(article.get("meaning"))
+        dashboard["impact_domains"] = _pf_safe_list(impact.get("impact_domains"))
         dashboard["impact_chain"] = impact_chain
+        dashboard["source_nodes"] = [
+            {k: n.get(k, "") for k in ("node_id", "canonical_id", "country", "type", "sector", "summary", "path", "graph_depth", "graph_category")}
+            for n in graph.get("nodes", []) if isinstance(n, dict)
+        ]
+        dashboard["perspective_nodes"] = [
+            {k: n.get(k, "") for k in ("node_id", "canonical_id", "country", "type", "sector", "summary", "path")}
+            for n in ecosystem if isinstance(n, dict)
+        ]
+        dashboard["cross_border_bridges"] = dashboard.get("cross_border_analysis", {}).get("cross_border_bridges", []) if isinstance(dashboard.get("cross_border_analysis"), dict) else []
+        dashboard["structured_intelligence"] = {
+            "facts": dashboard["facts"],
+            "meaning": dashboard["meaning"],
+            "impact_domains": dashboard["impact_domains"],
+            "graph": {"nodes": dashboard["source_nodes"], "edges": graph.get("edges", []), "paths": graph.get("paths", [])},
+            "consequences": consequences.get("consequences", []),
+            "opportunities": dashboard.get("opportunities", []),
+            "risks": dashboard.get("risks", []),
+            "gaps": dashboard.get("gaps", []),
+        }
         dashboard["research_required"] = unresolved + _pf_safe_list(consequences.get("gaps"))
         reasoning_log.gaps = len(_pf_safe_list(dashboard.get("gaps")))
         reasoning_log.opportunities = len(_pf_safe_list(dashboard.get("opportunities")))
         reasoning_log.total_llm_calls = self.calls
+        reasoning_log.evidence_calls = getattr(self, "_evidence_calls", 0)
+        reasoning_log.final_call = getattr(self, "_final_call", 0)
+        reasoning_log.synthesis_calls = 0
+        reasoning_log.partitions = max(1, reasoning_log.partitions, 1 if reasoning_log.impact_domains else 0)
         dashboard["status"] = "partial" if self.deadline_exhausted else dashboard.get("status", "complete")
         dashboard["partial"] = bool(self.deadline_exhausted or dashboard.get("partial", False))
         dashboard["pipeline_execution"] = {
             "deadline_seconds": PIPELINE_DEADLINE_SECONDS,
-            "elapsed_seconds": round(time.monotonic() - pipeline_started, 3),
+            "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
             "remaining_seconds": round(self._remaining_seconds(), 3),
             "llm_calls": self.calls,
             "llm_timeouts": self.timeouts,
             "truncated_retries": self.truncated_retries,
+            "retry_calls": getattr(self, "_retry_calls", 0),
             "deadline_exhausted": self.deadline_exhausted,
+            "stage_durations": dict(self._stage_durations),
+            "graph_llm_calls": 0,
+            "planned_llm_stages": ["Article Understanding", "Perspective Impact Mapping", "Final News Synthesis"],
+            "max_normal_llm_calls": 3,
+            "character_truncation": False,
+            "structured_record_truncation": False,
+            "durable_checkpointing": True,
+            "checkpoint_job_id": state.intelligence_id,
+            "completed_stages": list(state.completed_stages),
+            "current_stage": state.current_stage,
         }
+        if not self.deadline_exhausted and dashboard.get("status") != "partial":
+            state.status = "COMPLETED"
+            state.current_stage = PipelineStage.COMPLETE.value
+            if PipelineStage.COMPLETE.value not in state.completed_stages:
+                state.completed_stages.append(PipelineStage.COMPLETE.value)
+            state.stage_data[PipelineStage.FINAL_SYNTHESIS.value] = dashboard
+            persistence.save_state(state)
+        else:
+            state.status = "PARTIAL"
+            persistence.save_state(state)
         return dashboard
 
 
-# --------------------------------------------------------------------------- #
-# Backward-compatible helper builders now operate on the perspective-first data
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Reasoning metadata / response shaping
+# ---------------------------------------------------------------------------
 def _pf_build_reasoning_metadata(
     reasoning_log: ReasoningLog,
     engine: PerspectiveFirstNewsEngine,
@@ -3520,34 +3905,36 @@ def _pf_build_reasoning_metadata(
 ) -> Dict[str, Any]:
     event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
     core_event = event.get("title") or event.get("summary") or dashboard.get("trigger_event") or "Unknown event"
-    try:
-        knowledge_hash = knowledge_state.knowledge_state_hash
-    except Exception:
-        knowledge_hash = getattr(knowledge_state, "hash", "")
+    knowledge_hash = getattr(knowledge_state, "knowledge_state_hash", "")
+    graph_paths = dashboard.get("graph_analysis", {}).get("paths", []) if isinstance(dashboard.get("graph_analysis"), dict) else []
     evidence_ids = sorted(
-        f"{p.get('from_node', '')}->{p.get('to_node', '')}:{p.get('depth', '')}:{p.get('relationship_type', '')}"
-        if isinstance(p, dict) else str(p)
-        for p in dashboard.get("graph_analysis", {}).get("paths", [])
+        f"{p.get('from_node','')}->{p.get('to_node','')}:{p.get('depth','')}:{p.get('relationship_type','')}"
+        for p in graph_paths if isinstance(p, dict)
     )
-    entity_ids = sorted(str(x.get("node_id", x)) if isinstance(x, dict) else str(x) for x in dashboard.get("entities", []))
+    entity_ids = sorted(
+        str(x.get("node_id", x)) if isinstance(x, dict) else str(x)
+        for x in _pf_safe_list(dashboard.get("entities"))
+    )
     try:
         fingerprint = compute_analysis_fingerprint(
             story_id=core_event,
             perspective=perspective,
             evidence_ids=evidence_ids,
             entity_ids=entity_ids,
-            relationship_ids=sorted(f"{e.get('from_node')}->{e.get('to_node')}" for e in dashboard.get("graph_analysis", {}).get("paths", []) if isinstance(e, dict)),
+            relationship_ids=sorted(
+                f"{p.get('from_node')}->{p.get('to_node')}"
+                for p in graph_paths if isinstance(p, dict)
+            ),
             knowledge_state_hash=knowledge_hash,
         )
     except Exception:
-        fingerprint = hashlib.sha256(json.dumps(dashboard, sort_keys=True, default=str).encode()).hexdigest()[:24]
+        fingerprint = hashlib.sha256(_json(dashboard).encode()).hexdigest()[:24]
+
     reasoning_data = reasoning_log.to_dict()
-    # The original ReasoningLog predates the perspective-first counters. Include
-    # them without breaking callers that depend on its legacy to_dict shape.
     for attr in (
         "perspective_nodes", "impact_domains", "retrieval_targets",
         "direct_graph_nodes", "first_order_graph_nodes", "second_order_graph_nodes",
-        "graph_paths", "gaps", "opportunities",
+        "graph_paths", "gaps", "opportunities", "graph_llm_calls",
     ):
         reasoning_data[attr] = getattr(reasoning_log, attr, 0)
 
@@ -3565,7 +3952,7 @@ def _pf_build_reasoning_metadata(
         "model_fallback": getattr(engine.config, "fallback_model", ""),
         "seed_sent_to_provider": False,
         "selected_evidence_nodes": dashboard.get("graph_analysis", {}).get("direct", 0) + dashboard.get("graph_analysis", {}).get("first_order", 0) + dashboard.get("graph_analysis", {}).get("second_order", 0),
-        "cross_border_bridges_found": len(vault.build_cross_border_bridge_context(perspective, dashboard.get("source_country", "") or perspective.country)),
+        "cross_border_bridges_found": dashboard.get("cross_border_analysis", {}).get("cross_border_bridges_count", 0) if isinstance(dashboard.get("cross_border_analysis"), dict) else 0,
         "analysis_version": ANALYSIS_VERSION,
         "schema_version": SCHEMA_VERSION,
         "analysis_fingerprint": fingerprint,
@@ -3573,6 +3960,7 @@ def _pf_build_reasoning_metadata(
         "reasoning_log": reasoning_data,
         "llm_calls": engine.calls,
         "truncated_retries": engine.truncated_retries,
+        "pipeline_execution": dashboard.get("pipeline_execution", {}),
     }
 
 
@@ -3583,7 +3971,6 @@ def _pf_finalize_dashboard(
     reasoning_log: ReasoningLog,
     vault: ObsidianVaultManager,
 ) -> Dict[str, Any]:
-    """Canonical response shaping while retaining legacy frontend fields."""
     dashboard = dict(dashboard or {})
     dashboard.setdefault("intelligence_id", f"ATIS-INT-{hashlib.sha256(str(dashboard.get('trigger_event','')).encode()).hexdigest()[:12].upper()}")
     dashboard.setdefault("trigger_event", "Unknown event")
@@ -3600,40 +3987,131 @@ def _pf_finalize_dashboard(
         "cross_border_bridges": [],
         "cross_border_bridges_count": 0,
     })
-    dashboard.setdefault("opportunities", [])
-    dashboard.setdefault("risks", [])
-    dashboard.setdefault("gaps", [])
-    dashboard.setdefault("entities", [])
-    dashboard.setdefault("findings", [])
-    dashboard.setdefault("facts", [])
-    dashboard.setdefault("meaning", [])
-    dashboard.setdefault("impact_domains", [])
-    dashboard.setdefault("impact_chain", [])
+    for key in ("opportunities", "risks", "gaps", "entities", "findings", "facts", "meaning", "impact_domains", "impact_chain", "structured_intelligence"):
+        dashboard.setdefault(key, [])
     return dashboard
 
 
-# --------------------------------------------------------------------------- #
-# Production entry points — these override the legacy orchestration functions
-# without removing their implementation above.
-# --------------------------------------------------------------------------- #
-def _run_perspective_first_news(article_text: str, perspective: Any | None = None, source_label: str = "web_upload") -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Production entry points
+# ---------------------------------------------------------------------------
+def _run_perspective_first_news(article_text: str, perspective: Any | None = None, source_label: str = "web_upload", job_id: str | None = None) -> Dict[str, Any]:
+    started_at = time.monotonic()
     perspective = perspective or PerspectiveContext()
     reasoning_log = ReasoningLog()
     logger.info("=" * 78)
     logger.info("ATIS NEWS v%s | PERSPECTIVE-FIRST | %s (%s)", PERSPECTIVE_FIRST_VERSION, perspective.country, perspective.country_code)
     logger.info("=" * 78)
-    vault = ObsidianVaultManager()
-    engine = PerspectiveFirstNewsEngine(vault, perspective)
+
+    # Start the deadline BEFORE indexing so the 60s Render request is respected
+    # end-to-end rather than giving indexing an unbounded hidden budget.
+    persistence = StatePersistenceManager()
+    if not job_id:
+        fingerprint_source = f"{perspective.country_code}|{perspective.country}|{article_text.strip()}"
+        job_id = "ATIS-NEWS-" + hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:20]
+    state = persistence.load_state(job_id)
+    if state is not None and state.stage_data.get("raw_article") != article_text.strip():
+        logger.warning("[STATE] Checkpoint %s belongs to different article input; starting a fresh job", job_id)
+        state = None
+    if state is not None and state.stage_data.get("_pipeline_version") != PERSPECTIVE_FIRST_VERSION:
+        logger.info("[STATE] Checkpoint %s was created by an older pipeline version; starting a fresh job", job_id)
+        state = None
+    if state is None:
+        state = JobState(intelligence_id=job_id)
+        state.stage_data["raw_article"] = article_text.strip()
+        state.stage_data["perspective"] = perspective.as_dict()
+        state.stage_data["_pipeline_version"] = PERSPECTIVE_FIRST_VERSION
+        persistence.save_state(state)
+    vault = _get_cached_vault(VAULT_DIR)
+    engine = PerspectiveFirstNewsEngine(vault, perspective, started_at=started_at)
     knowledge_state = KnowledgeState(vault_path=vault.vault_dir)
     knowledge_state.compute()
-    dashboard = engine.run(article_text, reasoning_log)
+    # KnowledgeState in older builds can report zero cached nodes even when the
+    # authoritative vault index contains them. News telemetry must describe the
+    # actual graph used for this request.
+    try:
+        knowledge_state.total_nodes = len(vault.file_map)
+        knowledge_state.total_files = len(list(vault.vault_dir.rglob("*.md")))
+    except Exception:
+        pass
+
+    try:
+        dashboard = engine.run(article_text, reasoning_log, state=state, persistence=persistence)
+    except Exception as exc:
+        logger.exception("[NEWS] Production pipeline failed safely: %s", exc)
+        state.status = "PARTIAL"
+        state.current_stage = state.current_stage or PipelineStage.ARTICLE_UNDERSTANDING.value
+        state.error_log.append(str(exc))
+        persistence.save_state(state)
+        article_state = state.stage_data.get(PipelineStage.ARTICLE_UNDERSTANDING.value, {})
+        stage2 = state.stage_data.get(PipelineStage.PERSPECTIVE_MAPPING.value, {})
+        stage3 = state.stage_data.get(PipelineStage.DATABASE_RETRIEVAL.value, {})
+        graph = state.stage_data.get(PipelineStage.GRAPH_TRAVERSAL.value, {})
+        stage5 = state.stage_data.get(PipelineStage.IMPACT_ANALYSIS.value, {})
+        impact = stage2.get("impact", {}) if isinstance(stage2, dict) else {}
+        ecosystem = _pf_safe_list(stage2.get("ecosystem")) if isinstance(stage2, dict) else []
+        targets = _pf_safe_list(stage3.get("targets")) if isinstance(stage3, dict) else []
+        unresolved = _pf_safe_list(stage3.get("unresolved")) if isinstance(stage3, dict) else []
+        consequences = stage5.get("consequences", {}) if isinstance(stage5, dict) else {}
+        impact_chain = _pf_safe_list(stage5.get("impact_chain")) if isinstance(stage5, dict) else []
+        dashboard = engine._fallback_dashboard(
+            article_state if isinstance(article_state, dict) else {"event": {}, "facts": [], "meaning": [], "actors": [], "uncertainties": []},
+            impact if isinstance(impact, dict) else {"impact_domains": []},
+            graph if isinstance(graph, dict) else {"nodes": [], "edges": [], "paths": []},
+            consequences if isinstance(consequences, dict) else {"consequences": [], "gaps": []},
+            impact_chain, str(exc)
+        )
+        dashboard["research_required"] = unresolved + _pf_safe_list(dashboard.get("gaps"))
+        dashboard["status"] = "partial"
+        dashboard["partial"] = True
+        dashboard["pipeline_checkpoint"] = {
+            "job_id": job_id,
+            "completed_stages": list(state.completed_stages),
+            "current_stage": state.current_stage,
+            "resume_available": True,
+            "errors": list(state.error_log),
+        }
+
     dashboard = _pf_finalize_dashboard(dashboard, perspective, engine, reasoning_log, vault)
-    dashboard["pipeline_metadata"] = _pf_build_reasoning_metadata(reasoning_log, engine, vault, perspective, {
-        "event": {"title": dashboard.get("trigger_event", ""), "source_country": dashboard.get("source_country", ""), "event_country": dashboard.get("event_country", "")},
-        "facts": dashboard.get("facts", []),
-    }, dashboard, knowledge_state)
+
+    # Cross-border bridges are deterministic DB output.  Crucially, an unknown
+    # source/event country must NOT be replaced with the perspective country,
+    # because that would fabricate a cross-border relationship.
+    source_country = str(dashboard.get("source_country") or "").strip()
+    event_country = str(dashboard.get("event_country") or "").strip()
+    bridge_source = source_country or event_country
+    bridges: List[Dict[str, Any]] = []
+    if bridge_source and _pf_norm(bridge_source) != _pf_norm(perspective.country):
+        try:
+            bridges = vault.build_cross_border_bridge_context(perspective, bridge_source)
+        except Exception as exc:
+            logger.warning("[BRIDGE] deterministic bridge lookup failed: %s", exc)
+    dashboard["cross_border_analysis"] = {
+        "event_country": event_country,
+        "source_country": source_country,
+        "cross_border_bridges": bridges,
+        "cross_border_bridges_count": len(bridges),
+        "source": "database",
+        "status": "SUPPORTED" if bridges else "NONE_FOUND" if bridge_source else "UNKNOWN_SOURCE_COUNTRY",
+    }
+
+    dashboard["pipeline_metadata"] = _pf_build_reasoning_metadata(
+        reasoning_log, engine, vault, perspective,
+        {"event": {"title": dashboard.get("trigger_event", ""), "source_country": source_country, "event_country": event_country}, "facts": dashboard.get("facts", [])},
+        dashboard, knowledge_state
+    )
     dashboard["pipeline_metadata"]["source_article"] = source_label
     dashboard["pipeline_metadata"]["reasoning_log"] = dict(dashboard["pipeline_metadata"].get("reasoning_log", {}))
+    dashboard["pipeline_metadata"]["checkpointing"] = {
+        "job_id": state.intelligence_id,
+        "status": state.status,
+        "current_stage": state.current_stage,
+        "completed_stages": list(state.completed_stages),
+        "checkpoint_store": str(persistence.storage_dir),
+        "resume_available": state.status != "COMPLETED",
+        "updated_at": state.updated_at,
+    }
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}.json"
     try:
@@ -3642,38 +4120,35 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
         logger.info("[FINAL] Dashboard persisted: %s", output_path.resolve())
     except Exception as exc:
         logger.error("[FINAL] Failed to persist dashboard: %s", exc)
+
     logger.info("\n%s", reasoning_log.log_tree())
+    logger.info("[EXECUTION] elapsed=%.2fs | llm_calls=%d | timeouts=%d | truncation_retries=%d", time.monotonic() - started_at, engine.calls, engine.timeouts, engine.truncated_retries)
     logger.info("=" * 78)
     logger.info("ATIS NEWS PIPELINE COMPLETE")
     logger.info("=" * 78)
     return dashboard
 
 
-def process_article_pipeline(article_path: str, perspective: Any | None = None) -> Dict[str, Any]:
+def process_article_pipeline(article_path: str, perspective: Any | None = None, job_id: str | None = None) -> Dict[str, Any]:
     article_file = Path(article_path)
     if not article_file.exists():
         raise FileNotFoundError(f"Article not found: {article_path}")
-    article_text = article_file.read_text(encoding="utf-8")
-    return _run_perspective_first_news(article_text, perspective, source_label="file_upload")
+    return _run_perspective_first_news(article_file.read_text(encoding="utf-8"), perspective, source_label="file_upload", job_id=job_id)
 
 
-def run_news_pipeline(article_text: str, perspective: Any | None = None) -> Dict[str, Any]:
-    return _run_perspective_first_news(article_text, perspective, source_label="web_upload")
+def run_news_pipeline(article_text: str, perspective: Any | None = None, job_id: str | None = None) -> Dict[str, Any]:
+    return _run_perspective_first_news(article_text, perspective, source_label="web_upload", job_id=job_id)
 
 
-# --------------------------------------------------------------------------- #
-# CLI Entry Point
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="ATIS News — Perspective-First, Graph-Grounded Intelligence Engine",
-        epilog="Example: python ATIS_News.py ./articles/news.txt",
-    )
+    parser = argparse.ArgumentParser(description="ATIS News — Perspective-First, Graph-Grounded Intelligence Engine")
     parser.add_argument("article_path", metavar="ARTICLE", help="Path to the plain-text news article to process.")
     args = parser.parse_args()
     try:
-        result = process_article_pipeline(args.article_path)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(json.dumps(process_article_pipeline(args.article_path), indent=2, ensure_ascii=False))
     except Exception as exc:
         logger.critical("Pipeline terminated with fatal error: %s", exc)
         sys.exit(1)
