@@ -536,6 +536,10 @@ class MistralAdapter(ProviderAdapter):
 
     def _send_request(self, payload: Dict[str, Any]) -> Any:
         client = self._init_client()
+        # Add timeout to prevent hanging requests
+        # Mistral SDK accepts timeout_ms parameter
+        if "timeout_ms" not in payload:
+            payload["timeout_ms"] = self.config.timeout * 1000
         return client.chat.complete(**payload)
 
     def _extract_content(self, response: Any) -> str:
@@ -648,6 +652,10 @@ class OpenAIAdapter(ProviderAdapter):
 
     def _send_request(self, payload: Dict[str, Any]) -> Any:
         client = self._init_client()
+        # Add timeout to prevent hanging requests
+        # OpenAI SDK accepts timeout parameter
+        if "timeout" not in payload:
+            payload["timeout"] = self.config.timeout
         return client.chat.completions.create(**payload)
 
     def _extract_content(self, response: Any) -> str:
@@ -734,6 +742,10 @@ class CerebrasAdapter(ProviderAdapter):
 
     def _send_request(self, payload: Dict[str, Any]) -> Any:
         client = self._init_client()
+        # Add timeout to prevent hanging requests
+        # Cerebras uses OpenAI SDK, accepts timeout parameter
+        if "timeout" not in payload:
+            payload["timeout"] = self.config.timeout
         return client.chat.completions.create(**payload)
 
     def _extract_content(self, response: Any) -> str:
