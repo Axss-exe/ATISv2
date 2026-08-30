@@ -39,6 +39,11 @@ import re
 import sys
 import time
 import tempfile
+import sqlite3
+import socket
+import traceback
+import uuid
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -2610,15 +2615,13 @@ def _legacy_run_news_pipeline(
 # the only authority for what entities and relationships exist in ATIS.
 # =============================================================================
 
-PERSPECTIVE_FIRST_VERSION = "3.6.0-production"
+PERSPECTIVE_FIRST_VERSION = "3.7.0-production-durable"
 
 # ---------------------------------------------------------------------------
 # Production controls
 # ---------------------------------------------------------------------------
-# These controls are deliberately conservative because Render terminates the
-# HTTP request at roughly 60 seconds.  The deadline begins BEFORE vault
-# indexing in _run_perspective_first_news, so indexing time is part of the
-# same end-to-end budget.
+# These controls govern source-size safety and operator-configured graph limits.
+# HTTP transport lifetime is intentionally not coupled to News intelligence execution.
 MAX_ARTICLE_CHARS = int(os.getenv("ATIS_NEWS_MAX_ARTICLE_CHARS", "500000"))
 MAX_PERSPECTIVE_ECOSYSTEM_NODES = int(os.getenv("ATIS_NEWS_MAX_PERSPECTIVE_NODES", "0"))  # 0 = unlimited; retained for backward-compatible env naming
 MAX_IMPACT_DOMAINS = int(os.getenv("ATIS_NEWS_MAX_IMPACT_DOMAINS", "8"))
@@ -2631,24 +2634,378 @@ MAX_STAGE_OUTPUT_TOKENS = int(os.getenv("ATIS_NEWS_MAX_STAGE_OUTPUT_TOKENS", "30
 MIN_NODE_RESOLUTION_SCORE = float(os.getenv("ATIS_NEWS_MIN_NODE_RESOLUTION_SCORE", "0.72"))
 MIN_OPPORTUNITY_GRAPH_SCORE = float(os.getenv("ATIS_NEWS_MIN_OPPORTUNITY_GRAPH_SCORE", "0.55"))
 
-# End-to-end deadline.  This is NOT intended to "kill" the provider thread;
-# Python cannot safely kill a running synchronous HTTP call.  It is a gate that
-# prevents ATIS from starting work when there is not enough time left for the
-# request.  The API therefore gets a response before its ~60s upstream limit.
-PIPELINE_DEADLINE_SECONDS = float(os.getenv("ATIS_NEWS_PIPELINE_DEADLINE_SECONDS", "52"))
-ARTICLE_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_ARTICLE_TIMEOUT_SECONDS", "14"))
-IMPACT_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_IMPACT_TIMEOUT_SECONDS", "9"))
+# Provider transport protection is deliberately separate from job lifetime.
+# A News job is durable and may outlive the HTTP request that submitted it.
+# These values bound individual synchronous provider calls; they are NOT an
+# end-to-end intelligence deadline and MUST NOT cause completed work to be
+# discarded merely because an HTTP request is approaching its upstream limit.
+ARTICLE_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_ARTICLE_TIMEOUT_SECONDS", "45"))
+IMPACT_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_IMPACT_TIMEOUT_SECONDS", "45"))
 GRAPH_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_GRAPH_TIMEOUT_SECONDS", "0"))
-FINAL_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_FINAL_TIMEOUT_SECONDS", "14"))
+FINAL_LLM_TIMEOUT_SECONDS = float(os.getenv("ATIS_NEWS_FINAL_TIMEOUT_SECONDS", "45"))
 MIN_LLM_CALL_SECONDS = float(os.getenv("ATIS_NEWS_MIN_LLM_CALL_SECONDS", "2.0"))
+PROVIDER_RETRY_COUNT = max(0, int(os.getenv("ATIS_NEWS_PROVIDER_RETRY_COUNT", "1")))
 MAX_IMPACT_LLM_CALLS = 1
 MAX_GRAPH_LLM_CALLS = 0
 LLM_CONCURRENCY = 1
 
-# The production graph is already deterministic.  One graph interpretation
-# call is sufficient; splitting the same verified graph into several calls was
-# a major source of avoidable latency in the failing Render run.
+# Retained as a compatibility/read-only telemetry setting. It is no longer an
+# intelligence deadline. HTTP callers must use their own transport timeout.
+PIPELINE_DEADLINE_SECONDS = 0.0
 
+# Durable queue controls. SQLite is used intentionally so no Redis/Celery
+# dependency is required and multiple worker processes can coordinate through
+# an atomic lease transaction.
+NEWS_QUEUE_DB = Path(os.getenv(
+    "ATIS_NEWS_QUEUE_DB",
+    os.getenv("ATIS_NEWS_JOB_STORE", "./job_store") + "/news_jobs.sqlite3",
+))
+NEWS_QUEUE_LEASE_SECONDS = max(10.0, float(os.getenv("ATIS_NEWS_QUEUE_LEASE_SECONDS", "180")))
+NEWS_QUEUE_POLL_SECONDS = max(0.2, float(os.getenv("ATIS_NEWS_QUEUE_POLL_SECONDS", "1.0")))
+NEWS_QUEUE_MAX_ATTEMPTS = max(1, int(os.getenv("ATIS_NEWS_QUEUE_MAX_ATTEMPTS", "5")))
+
+# The production graph is deterministic. No LLM call is used to manufacture
+# graph relationships.
+
+
+
+# ---------------------------------------------------------------------------
+# Durable News Job Queue — SQLite-backed atomic leases
+# ---------------------------------------------------------------------------
+class DurableNewsJobQueue:
+    """Cross-process durable queue for News jobs.
+
+    The queue is intentionally independent from the HTTP request lifecycle.
+    SQLite transactions provide the atomic claim/lease primitive without
+    requiring Redis or Celery. A worker crash leaves an expired lease that a
+    later worker can reclaim. Payloads are immutable after submission so a
+    retried job cannot silently change its article or perspective.
+    """
+
+    def __init__(self, db_path: str | Path = NEWS_QUEUE_DB) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _initialize(self) -> None:
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS news_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    article_text TEXT NOT NULL,
+                    perspective_json TEXT NOT NULL,
+                    source_label TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at REAL NOT NULL,
+                    lease_until REAL,
+                    worker_id TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    error TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_news_jobs_claim
+                ON news_jobs(status, available_at, lease_until)
+            """)
+
+    @staticmethod
+    def make_job_id(article_text: str, perspective: PerspectiveContext) -> str:
+        canonical = json.dumps(
+            {
+                "article_sha256": hashlib.sha256(article_text.strip().encode("utf-8")).hexdigest(),
+                "perspective": perspective.as_dict(),
+                "pipeline_version": PERSPECTIVE_FIRST_VERSION,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return "ATIS-NEWS-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+    def submit(
+        self,
+        article_text: str,
+        perspective: PerspectiveContext,
+        source_label: str = "web_upload",
+        job_id: str | None = None,
+    ) -> Dict[str, Any]:
+        article_text = article_text.strip()
+        if not article_text:
+            raise ValueError("News article text is empty")
+        if len(article_text) > MAX_ARTICLE_CHARS:
+            raise ValueError(
+                f"Article contains {len(article_text):,} characters, exceeding "
+                f"{MAX_ARTICLE_CHARS:,}. ATIS refuses to truncate the source article."
+            )
+        job_id = job_id or self.make_job_id(article_text, perspective)
+        now = time.time()
+        payload = json.dumps(perspective.as_dict(), sort_keys=True, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO news_jobs
+                (job_id, article_text, perspective_json, source_label, status,
+                 attempts, available_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'QUEUED', 0, ?, ?, ?)
+                ON CONFLICT(job_id) DO NOTHING
+                """,
+                (job_id, article_text, payload, source_label, now, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM news_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Failed to persist News job {job_id}")
+        # A caller-supplied job ID is an idempotency key, not permission to
+        # mutate an existing job. Reject accidental ID collisions.
+        if row["article_text"] != article_text or row["perspective_json"] != payload:
+            raise ValueError(
+                f"News job ID {job_id} already belongs to different immutable input"
+            )
+        return self._row_to_status(row)
+
+    def claim(self, worker_id: str | None = None) -> Optional[Dict[str, Any]]:
+        worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        lease_until = now + NEWS_QUEUE_LEASE_SECONDS
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM news_jobs
+                WHERE attempts < ?
+                  AND available_at <= ?
+                  AND (
+                      status = 'QUEUED'
+                      OR (status = 'RUNNING' AND lease_until IS NOT NULL AND lease_until < ?)
+                  )
+                ORDER BY created_at ASC, job_id ASC
+                LIMIT 1
+                """,
+                (NEWS_QUEUE_MAX_ATTEMPTS, now, now),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            next_attempt = int(row["attempts"]) + 1
+            conn.execute(
+                """
+                UPDATE news_jobs
+                SET status='RUNNING', attempts=?, lease_until=?, worker_id=?,
+                    updated_at=?, error=NULL
+                WHERE job_id=?
+                """,
+                (next_attempt, lease_until, worker_id, now, row["job_id"]),
+            )
+            claimed = conn.execute(
+                "SELECT * FROM news_jobs WHERE job_id = ?", (row["job_id"],)
+            ).fetchone()
+            conn.commit()
+        return self._row_to_job(claimed)
+
+    def renew(self, job_id: str, worker_id: str) -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE news_jobs
+                SET lease_until=?, updated_at=?
+                WHERE job_id=? AND status='RUNNING' AND worker_id=?
+                """,
+                (now + NEWS_QUEUE_LEASE_SECONDS, now, job_id, worker_id),
+            )
+        return cur.rowcount == 1
+
+    def complete(self, job_id: str, worker_id: str) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE news_jobs
+                SET status='COMPLETED', lease_until=NULL, worker_id=NULL,
+                    completed_at=?, updated_at=?, error=NULL
+                WHERE job_id=? AND status='RUNNING' AND worker_id=?
+                """,
+                (now, now, job_id, worker_id),
+            )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"Lost News job lease while completing {job_id}")
+
+    def fail(self, job_id: str, worker_id: str, error: str) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM news_jobs WHERE job_id=? AND worker_id=?",
+                (job_id, worker_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"News job {job_id} is not owned by worker {worker_id}")
+            attempts = int(row["attempts"])
+            terminal = attempts >= NEWS_QUEUE_MAX_ATTEMPTS
+            status = "FAILED" if terminal else "QUEUED"
+            available = now if terminal else now + min(60.0, 2.0 ** min(attempts, 5))
+            conn.execute(
+                """
+                UPDATE news_jobs
+                SET status=?, lease_until=NULL, worker_id=NULL,
+                    available_at=?, updated_at=?, error=?
+                WHERE job_id=? AND worker_id=?
+                """,
+                (status, available, now, str(error)[:4000], job_id, worker_id),
+            )
+
+    def get(self, job_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM news_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return self._row_to_status(row) if row else None
+
+    @staticmethod
+    def _row_to_status(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "attempts": int(row["attempts"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+            "error": row["error"],
+            "worker_id": row["worker_id"],
+            "lease_until": row["lease_until"],
+        }
+
+    @classmethod
+    def _row_to_job(cls, row: sqlite3.Row) -> Dict[str, Any]:
+        result = cls._row_to_status(row)
+        result.update({
+            "article_text": row["article_text"],
+            "perspective": json.loads(row["perspective_json"]),
+            "source_label": row["source_label"],
+        })
+        return result
+
+
+def submit_news_job(
+    article_text: str,
+    perspective: Any | None = None,
+    source_label: str = "web_upload",
+    job_id: str | None = None,
+) -> Dict[str, Any]:
+    """Persist a News job and return immediately; no LLM work is done here."""
+    perspective_ctx = perspective or PerspectiveContext()
+    queue = DurableNewsJobQueue()
+    return queue.submit(article_text, perspective_ctx, source_label, job_id)
+
+
+def get_news_job_status(job_id: str) -> Dict[str, Any]:
+    """Return durable queue status plus resumable pipeline checkpoint metadata."""
+    result = DurableNewsJobQueue().get(job_id)
+    if result is None:
+        raise KeyError(f"News job not found: {job_id}")
+    state = StatePersistenceManager().load_state(job_id)
+    if state is not None:
+        result["checkpoint"] = {
+            "status": state.status,
+            "current_stage": state.current_stage,
+            "completed_stages": list(state.completed_stages),
+            "updated_at": state.updated_at,
+            "error_count": len(state.error_log),
+            "resume_available": state.status != "COMPLETED",
+        }
+        if state.status == "COMPLETED":
+            result["result"] = state.stage_data.get(PipelineStage.FINAL_SYNTHESIS.value)
+    return result
+
+
+def run_news_worker_once(worker_id: str | None = None) -> Optional[Dict[str, Any]]:
+    """Claim and execute one durable News job in a worker process."""
+    queue = DurableNewsJobQueue()
+    claimed = queue.claim(worker_id)
+    if claimed is None:
+        return None
+
+    owner = claimed["worker_id"]
+    stop_heartbeat = threading.Event()
+    lease_lost = threading.Event()
+
+    def heartbeat() -> None:
+        interval = max(2.0, NEWS_QUEUE_LEASE_SECONDS / 3.0)
+        while not stop_heartbeat.wait(interval):
+            try:
+                if not queue.renew(claimed["job_id"], owner):
+                    lease_lost.set()
+                    logger.error("[WORKER] Lease lost for News job %s", claimed["job_id"])
+                    return
+            except Exception:
+                logger.exception("[WORKER] Lease renewal failed for %s", claimed["job_id"])
+                # A transient DB error is not proof of lease loss. The next
+                # heartbeat gets another chance unless the lease actually expires.
+                continue
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        name=f"atis-news-lease-{claimed['job_id'][-12:]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    try:
+        perspective_payload = claimed["perspective"] if isinstance(claimed["perspective"], dict) else {}
+        perspective = PerspectiveContext(
+            country=str(perspective_payload.get("country") or "Zimbabwe"),
+            country_code=str(perspective_payload.get("country_code") or "ZW"),
+        )
+        dashboard = _run_perspective_first_news(
+            claimed["article_text"],
+            perspective,
+            source_label=claimed["source_label"],
+            job_id=claimed["job_id"],
+        )
+        if lease_lost.is_set():
+            raise RuntimeError(f"Lost durable lease for News job {claimed['job_id']}")
+
+        transport_failures = int(
+            (dashboard.get("pipeline_execution") or {}).get("transport_failures", 0)
+        )
+        if dashboard.get("partial") and transport_failures > 0:
+            queue.fail(
+                claimed["job_id"],
+                owner,
+                str((dashboard.get("detail") or "provider transport failure"))[:4000],
+            )
+        else:
+            queue.complete(claimed["job_id"], owner)
+        return dashboard
+    except Exception as exc:
+        logger.exception("[WORKER] News job %s failed: %s", claimed["job_id"], exc)
+        try:
+            queue.fail(claimed["job_id"], owner, traceback.format_exc())
+        except Exception:
+            logger.exception("[WORKER] Could not release lease for %s", claimed["job_id"])
+        return None
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=2.0)
+
+
+def run_news_worker_forever(worker_id: str | None = None) -> None:
+    """Run the durable worker loop as a separate process/service."""
+    resolved_worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+    logger.info("[WORKER] ATIS News durable worker started: %s", resolved_worker_id)
+    while True:
+        job = run_news_worker_once(resolved_worker_id)
+        if job is None:
+            time.sleep(NEWS_QUEUE_POLL_SECONDS)
 
 # ---------------------------------------------------------------------------
 # Shared in-process vault cache
@@ -2851,11 +3208,14 @@ class PerspectiveFirstNewsEngine:
         self.timeouts = 0
         self.deadline_exhausted = False
         self.started_at = started_at if started_at is not None else time.monotonic()
-        self._deadline = self.started_at + PIPELINE_DEADLINE_SECONDS
+        # Job lifetime is durable and independent of HTTP transport lifetime.
+        # There is intentionally no intelligence deadline here.
+        self._deadline = float("inf")
         self._stage_durations: Dict[str, float] = {}
 
     def _remaining_seconds(self) -> float:
-        return max(0.0, self._deadline - time.monotonic())
+        """Return job execution budget; durable workers have no artificial deadline."""
+        return float("inf")
 
     def _stage_timeout(self, stage: str) -> float:
         name = stage.lower()
@@ -2868,48 +3228,67 @@ class PerspectiveFirstNewsEngine:
         return min(10.0, PIPELINE_DEADLINE_SECONDS)
 
     def _call_provider(self, messages: List[Dict[str, str]], max_tokens: int, stage: str) -> str:
-        """Run one provider call inside a hard News-stage wall-clock window.
+        """Run a synchronous provider call behind a transport-only timeout.
 
-        The provider client is synchronous.  A timeout therefore cannot safely
-        kill the underlying socket from Python.  We isolate it in a daemon
-        thread so a slow provider cannot hold the HTTP request open.  The
-        orchestration deadline is the authority: after a timeout we never
-        start another provider call unless the caller explicitly has budget.
+        This timeout protects the worker from a permanently hung socket. It is
+        deliberately NOT a pipeline deadline: a completed stage remains valid
+        regardless of how long the job has been running.
         """
-        remaining = self._remaining_seconds()
-        if remaining < MIN_LLM_CALL_SECONDS + 0.5:
-            self.deadline_exhausted = True
-            raise NewsPipelineDeadline(f"[{stage}] insufficient pipeline time remaining ({remaining:.2f}s)")
-        timeout = min(self._stage_timeout(stage), max(0.1, remaining - 1.0))
-        if timeout < MIN_LLM_CALL_SECONDS:
-            self.deadline_exhausted = True
-            raise NewsPipelineDeadline(f"[{stage}] insufficient safe provider window ({remaining:.2f}s)")
-
+        timeout = max(0.1, self._stage_timeout(stage))
         import threading
-        result: Dict[str, Any] = {}
-        error: Dict[str, BaseException] = {}
 
-        def worker() -> None:
-            try:
-                result["value"] = self.client.chat(messages, temperature=0.0, max_tokens=max_tokens)
-            except BaseException as exc:
-                error["value"] = exc
+        attempts = PROVIDER_RETRY_COUNT + 1
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            result: Dict[str, Any] = {}
+            error: Dict[str, BaseException] = {}
 
-        started = time.monotonic()
-        thread = threading.Thread(target=worker, name=f"atis-news-{stage[:24]}", daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-        elapsed = time.monotonic() - started
-        self._stage_durations[stage] = round(elapsed, 3)
+            def worker() -> None:
+                try:
+                    result["value"] = self.client.chat(
+                        messages, temperature=0.0, max_tokens=max_tokens
+                    )
+                except BaseException as exc:
+                    error["value"] = exc
 
-        if thread.is_alive():
-            self.timeouts += 1
-            self.deadline_exhausted = True
-            logger.warning("[DEADLINE] [%s] provider call exceeded %.1fs; request will not wait for it", stage, timeout)
-            raise NewsPipelineDeadline(f"[{stage}] provider call exceeded {timeout:.1f}s")
-        if "value" in error:
-            raise error["value"]
-        return str(result.get("value") or "")
+            started = time.monotonic()
+            thread = threading.Thread(
+                target=worker,
+                name=f"atis-news-{stage[:24]}-{attempt}",
+                daemon=True,
+            )
+            thread.start()
+            thread.join(timeout=timeout)
+            elapsed = time.monotonic() - started
+            self._stage_durations[f"{stage}#attempt{attempt}"] = round(elapsed, 3)
+
+            if thread.is_alive():
+                self.timeouts += 1
+                last_error = NewsPipelineDeadline(
+                    f"[{stage}] provider transport timeout after {timeout:.1f}s"
+                )
+                logger.warning(
+                    "[TRANSPORT] [%s] provider call timed out after %.1fs (attempt %d/%d)",
+                    stage, timeout, attempt, attempts,
+                )
+            elif "value" in error:
+                last_error = error["value"]
+                logger.warning(
+                    "[PROVIDER] [%s] attempt %d/%d failed: %s",
+                    stage, attempt, attempts, last_error,
+                )
+            else:
+                return str(result.get("value") or "")
+
+            if attempt < attempts:
+                self._increment_reasoning_counter("retry_calls")
+                # The provider call itself is retried; the complete input and
+                # requested output remain unchanged.
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"[{stage}] provider call returned no result")
 
     def _increment_reasoning_counter(self, name: str) -> None:
         """Increment optional ReasoningLog counters without coupling engine state to its dataclass."""
@@ -2960,7 +3339,7 @@ class PerspectiveFirstNewsEngine:
             return parsed
         except RuntimeError as first_error:
             retry_output = min(cap, max(requested + 1024, requested * 2))
-            if retry_output <= requested or self._remaining_seconds() < MIN_LLM_CALL_SECONDS + 1.5:
+            if retry_output <= requested:
                 raise first_error
             if not self.budget.fits_in_budget(input_tokens, retry_output):
                 retry_output = self.budget.compute_safe_output_tokens(input_tokens)
@@ -3275,11 +3654,15 @@ Schema:
     # Deterministic graph traversal
     # ------------------------------------------------------------------
     def traverse_graph(self, target_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Traverse authoritative database links without dropping discovered edges.
+
+        Node/path caps are explicit operator controls. They never masquerade as
+        complete graph truth: overflow is reported as research-required metadata.
+        """
         seeds = sorted({n["canonical_id"] for n in target_nodes if n.get("canonical_id") in self.vault.file_map})
         visited: Dict[str, int] = {s: 0 for s in seeds}
         queue: List[str] = list(seeds)
-        paths: List[Dict[str, Any]] = []
-        edges: List[Dict[str, Any]] = []
+        all_edges: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         backlink_candidates = 0
 
         while queue:
@@ -3300,12 +3683,14 @@ Schema:
                     neighbours.append((canon, "inbound_backlink"))
                     if canon not in visited:
                         backlink_candidates += 1
+
             for neighbour, relation in sorted(set(neighbours), key=lambda x: (x[0], x[1])):
-                if neighbour in visited:
-                    continue
                 next_depth = depth + 1
-                visited[neighbour] = next_depth
-                queue.append(neighbour)
+                if neighbour not in visited:
+                    visited[neighbour] = next_depth
+                    queue.append(neighbour)
+                elif visited[neighbour] < next_depth:
+                    next_depth = visited[neighbour]
                 edge = {
                     "from_node": self.vault.file_map.get(current, current),
                     "to_node": self.vault.file_map.get(neighbour, neighbour),
@@ -3313,39 +3698,76 @@ Schema:
                     "depth": next_depth,
                     "source": "database",
                 }
-                edges.append(edge)
-                paths.append({
-                    "nodes": [edge["from_node"], edge["to_node"]],
-                    "edges": [edge],
-                    "depth": next_depth,
-                    "source": "database",
-                })
+                all_edges[(edge["from_node"], edge["to_node"], relation)] = edge
 
+        ordered_edges = sorted(
+            all_edges.values(),
+            key=lambda e: (int(e.get("depth") or 0), str(e.get("from_node")), str(e.get("to_node")), str(e.get("relationship_type"))),
+        )
         graph_nodes: List[Dict[str, Any]] = []
-        for canon, depth in sorted(visited.items(), key=lambda x: (x[1], x[0])):
+        overflow_nodes: List[str] = []
+        ordered_nodes = sorted(visited.items(), key=lambda x: (x[1], x[0]))
+        for index, (canon, depth) in enumerate(ordered_nodes):
+            if MAX_GRAPH_NODES > 0 and index >= MAX_GRAPH_NODES:
+                overflow_nodes.append(self.vault.file_map.get(canon, canon))
+                continue
             rec = self._node_record(canon)
             rec["graph_depth"] = depth
             rec["graph_category"] = "target" if canon in seeds else "first_order" if depth == 1 else "second_order"
             graph_nodes.append(rec)
 
+        allowed_ids = {str(n.get("node_id")) for n in graph_nodes}
+        filtered_edges = [
+            e for e in ordered_edges
+            if str(e.get("from_node")) in allowed_ids and str(e.get("to_node")) in allowed_ids
+        ]
+        overflow_edges = max(0, len(ordered_edges) - len(filtered_edges))
+        if MAX_GRAPH_PATHS > 0 and len(filtered_edges) > MAX_GRAPH_PATHS:
+            overflow_edges += len(filtered_edges) - MAX_GRAPH_PATHS
+            filtered_edges = filtered_edges[:MAX_GRAPH_PATHS]
+
+        paths = [
+            {
+                "nodes": [e["from_node"], e["to_node"]],
+                "edges": [e],
+                "depth": e["depth"],
+                "source": "database",
+            }
+            for e in filtered_edges
+        ]
         logger.info(
-            "[GRAPH] targets=%d | direct=%d | first-order=%d | second-order=%d | backlink candidates=%d | paths=%d",
+            "[GRAPH] targets=%d | direct=%d | first-order=%d | second-order=%d | "
+            "backlink candidates=%d | edges=%d | paths=%d | overflow_nodes=%d | overflow_edges=%d",
             len(seeds),
             len(seeds),
             sum(1 for n in graph_nodes if n["graph_category"] == "first_order"),
             sum(1 for n in graph_nodes if n["graph_category"] == "second_order"),
             backlink_candidates,
+            len(filtered_edges),
             len(paths),
+            len(overflow_nodes),
+            overflow_edges,
         )
         return {
             "target_nodes": [n for n in graph_nodes if n["graph_category"] == "target"],
             "nodes": graph_nodes,
-            "edges": edges if MAX_GRAPH_PATHS <= 0 else edges[:MAX_GRAPH_PATHS],
-            "paths": paths if MAX_GRAPH_PATHS <= 0 else paths[:MAX_GRAPH_PATHS],
+            "edges": filtered_edges,
+            "paths": paths,
             "direct_nodes": len(seeds),
             "first_order_nodes": sum(1 for n in graph_nodes if n["graph_category"] == "first_order"),
             "second_order_nodes": sum(1 for n in graph_nodes if n["graph_category"] == "second_order"),
             "backlink_candidates": backlink_candidates,
+            "overflow_nodes": overflow_nodes,
+            "overflow_edge_count": overflow_edges,
+            "graph_complete": not overflow_nodes and overflow_edges == 0,
+            "research_required": [
+                {
+                    "status": "RESEARCH_REQUIRED",
+                    "reason": "operator_configured_graph_cap",
+                    "node_id": node_id,
+                }
+                for node_id in overflow_nodes
+            ],
         }
 
     # ------------------------------------------------------------------
@@ -3592,7 +4014,18 @@ Schema:
             actor = str(item.get("perspective_actor", ""))
             actor_supported = bool(actor) and actor in perspective_nodes
             perspective_country = str(item.get("perspective_country") or self.perspective.country)
-            supported = bool(source_nodes and graph_paths and actor_supported and _pf_norm(perspective_country) == _pf_norm(self.perspective.country))
+            path_endpoints = {
+                part for path in graph_paths
+                for part in str(path).split("->", 1)
+            }
+            supported = bool(
+                source_nodes
+                and graph_paths
+                and actor_supported
+                and _pf_norm(perspective_country) == _pf_norm(self.perspective.country)
+                and _pf_norm(str(item.get("opportunity_country") or self.perspective.country)) == _pf_norm(self.perspective.country)
+                and any(node in path_endpoints for node in source_nodes)
+            )
             item["source_nodes"] = source_nodes
             item["graph_paths"] = graph_paths
             item["perspective_country"] = self.perspective.country
@@ -3805,20 +4238,15 @@ Schema:
             dashboard = state.stage_data[PipelineStage.FINAL_SYNTHESIS.value]
         else:
             set_stage(PipelineStage.FINAL_SYNTHESIS)
-            if self._remaining_seconds() < FINAL_LLM_TIMEOUT_SECONDS + 2.0:
-                self.deadline_exhausted = True
-                dashboard = self._fallback_dashboard(
-                    article, impact, graph, consequences, impact_chain,
-                    "Final synthesis skipped because the remaining request budget was too small for a safe provider call."
-                )
-            else:
-                try:
-                    dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
-                    dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
-                except (NewsPipelineDeadline, LLMTokenLimitError, NewsPipelineContextOverflow, RuntimeError) as exc:
-                    logger.warning("[FINAL] %s", exc)
-                    self.deadline_exhausted = isinstance(exc, NewsPipelineDeadline)
-                    dashboard = self._fallback_dashboard(article, impact, graph, consequences, impact_chain, str(exc))
+            try:
+                dashboard = self.final_synthesis(article, impact, graph, consequences, impact_chain)
+                dashboard = self.validate_and_ground(dashboard, graph, ecosystem, article, impact, consequences)
+            except (NewsPipelineDeadline, LLMTokenLimitError, NewsPipelineContextOverflow, RuntimeError) as exc:
+                logger.warning("[FINAL] %s", exc)
+                # A transport failure is a job failure/partial result, not an
+                # HTTP deadline. The durable worker may retry the whole job
+                # while already-completed checkpoints remain intact.
+                dashboard = self._fallback_dashboard(article, impact, graph, consequences, impact_chain, str(exc))
             if not self.deadline_exhausted and dashboard.get("status") != "partial":
                 checkpoint(PipelineStage.FINAL_SYNTHESIS, dashboard)
 
@@ -3848,7 +4276,11 @@ Schema:
             "risks": dashboard.get("risks", []),
             "gaps": dashboard.get("gaps", []),
         }
-        dashboard["research_required"] = unresolved + _pf_safe_list(consequences.get("gaps"))
+        dashboard["research_required"] = (
+            unresolved
+            + _pf_safe_list(consequences.get("gaps"))
+            + _pf_safe_list(graph.get("research_required"))
+        )
         reasoning_log.gaps = len(_pf_safe_list(dashboard.get("gaps")))
         reasoning_log.opportunities = len(_pf_safe_list(dashboard.get("opportunities")))
         reasoning_log.total_llm_calls = self.calls
@@ -3856,21 +4288,25 @@ Schema:
         reasoning_log.final_call = getattr(self, "_final_call", 0)
         reasoning_log.synthesis_calls = 0
         reasoning_log.partitions = max(1, reasoning_log.partitions, 1 if reasoning_log.impact_domains else 0)
-        dashboard["status"] = "partial" if self.deadline_exhausted else dashboard.get("status", "complete")
-        dashboard["partial"] = bool(self.deadline_exhausted or dashboard.get("partial", False))
+        dashboard["status"] = dashboard.get("status", "complete")
+        dashboard["partial"] = bool(dashboard.get("partial", False))
         dashboard["pipeline_execution"] = {
-            "deadline_seconds": PIPELINE_DEADLINE_SECONDS,
+            "deadline_seconds": None,
+            "execution_model": "durable_worker",
+            "transport_timeout_only": True,
             "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
             "remaining_seconds": round(self._remaining_seconds(), 3),
             "llm_calls": self.calls,
             "llm_timeouts": self.timeouts,
             "truncated_retries": self.truncated_retries,
             "retry_calls": getattr(self, "_retry_calls", 0),
-            "deadline_exhausted": self.deadline_exhausted,
+            "deadline_exhausted": False,
+            "transport_failures": self.timeouts,
             "stage_durations": dict(self._stage_durations),
             "graph_llm_calls": 0,
             "planned_llm_stages": ["Article Understanding", "Perspective Impact Mapping", "Final News Synthesis"],
-            "max_normal_llm_calls": 3,
+            "max_normal_llm_calls": None,
+            "llm_call_policy": "stage calls are bounded by provider transport timeouts; partitioning may increase call count",
             "character_truncation": False,
             "structured_record_truncation": False,
             "durable_checkpointing": True,
@@ -4003,12 +4439,11 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
     logger.info("ATIS NEWS v%s | PERSPECTIVE-FIRST | %s (%s)", PERSPECTIVE_FIRST_VERSION, perspective.country, perspective.country_code)
     logger.info("=" * 78)
 
-    # Start the deadline BEFORE indexing so the 60s Render request is respected
-    # end-to-end rather than giving indexing an unbounded hidden budget.
+    # Job execution is intentionally independent of HTTP request lifetime.
+    # The caller may disconnect while this durable worker continues processing.
     persistence = StatePersistenceManager()
     if not job_id:
-        fingerprint_source = f"{perspective.country_code}|{perspective.country}|{article_text.strip()}"
-        job_id = "ATIS-NEWS-" + hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:20]
+        job_id = DurableNewsJobQueue.make_job_id(article_text, perspective)
     state = persistence.load_state(job_id)
     if state is not None and state.stage_data.get("raw_article") != article_text.strip():
         logger.warning("[STATE] Checkpoint %s belongs to different article input; starting a fresh job", job_id)
@@ -4016,6 +4451,17 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
     if state is not None and state.stage_data.get("_pipeline_version") != PERSPECTIVE_FIRST_VERSION:
         logger.info("[STATE] Checkpoint %s was created by an older pipeline version; starting a fresh job", job_id)
         state = None
+    if state is not None:
+        saved_perspective = state.stage_data.get("perspective", {})
+        if isinstance(saved_perspective, dict):
+            saved_country = _pf_norm(saved_perspective.get("country", ""))
+            saved_code = _pf_norm(saved_perspective.get("country_code", ""))
+            if saved_country != _pf_norm(perspective.country) or saved_code != _pf_norm(perspective.country_code):
+                logger.warning(
+                    "[STATE] Checkpoint %s belongs to a different analytical perspective; starting a fresh job",
+                    job_id,
+                )
+                state = None
     if state is None:
         state = JobState(intelligence_id=job_id)
         state.stage_data["raw_article"] = article_text.strip()
@@ -4061,7 +4507,11 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
             consequences if isinstance(consequences, dict) else {"consequences": [], "gaps": []},
             impact_chain, str(exc)
         )
-        dashboard["research_required"] = unresolved + _pf_safe_list(dashboard.get("gaps"))
+        dashboard["research_required"] = (
+            unresolved
+            + _pf_safe_list(dashboard.get("gaps"))
+            + _pf_safe_list(graph.get("research_required"))
+        )
         dashboard["status"] = "partial"
         dashboard["partial"] = True
         dashboard["pipeline_checkpoint"] = {
@@ -4111,9 +4561,17 @@ def _run_perspective_first_news(article_text: str, perspective: Any | None = Non
         "resume_available": state.status != "COMPLETED",
         "updated_at": state.updated_at,
     }
+    dashboard["pipeline_metadata"]["durable_execution"] = {
+        "queue_db": str(NEWS_QUEUE_DB),
+        "execution_model": "durable_worker",
+        "lease_seconds": NEWS_QUEUE_LEASE_SECONDS,
+        "max_attempts": NEWS_QUEUE_MAX_ATTEMPTS,
+        "http_request_independent": True,
+    }
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}.json"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", str(state.intelligence_id))[-40:]
+    output_path = DASHBOARDS_DIR / f"atis_dashboard_{timestamp}_{safe_job}.json"
     try:
         output_path.write_text(json.dumps(dashboard, indent=2, ensure_ascii=False), encoding="utf-8")
         dashboard["pipeline_metadata"]["dashboard_path"] = str(output_path)
@@ -4133,10 +4591,32 @@ def process_article_pipeline(article_path: str, perspective: Any | None = None, 
     article_file = Path(article_path)
     if not article_file.exists():
         raise FileNotFoundError(f"Article not found: {article_path}")
-    return _run_perspective_first_news(article_file.read_text(encoding="utf-8"), perspective, source_label="file_upload", job_id=job_id)
+    article_text = article_file.read_text(encoding="utf-8")
+    if os.getenv("ATIS_NEWS_EXECUTION_MODE", "sync").strip().lower() == "async":
+        receipt = submit_news_job(article_text, perspective, "file_upload", job_id)
+        return {
+            "status": receipt["status"].lower(),
+            "job_id": receipt["job_id"],
+            "resume_available": True,
+            "execution_model": "durable_worker",
+        }
+    return _run_perspective_first_news(article_text, perspective, source_label="file_upload", job_id=job_id)
 
 
 def run_news_pipeline(article_text: str, perspective: Any | None = None, job_id: str | None = None) -> Dict[str, Any]:
+    """Backward-compatible synchronous API with optional durable submission mode.
+
+    Set ATIS_NEWS_EXECUTION_MODE=async to submit and return a durable job receipt.
+    The default remains synchronous so existing callers are not silently broken.
+    """
+    if os.getenv("ATIS_NEWS_EXECUTION_MODE", "sync").strip().lower() == "async":
+        receipt = submit_news_job(article_text, perspective, "web_upload", job_id)
+        return {
+            "status": receipt["status"].lower(),
+            "job_id": receipt["job_id"],
+            "resume_available": True,
+            "execution_model": "durable_worker",
+        }
     return _run_perspective_first_news(article_text, perspective, source_label="web_upload", job_id=job_id)
 
 
@@ -4145,10 +4625,30 @@ def run_news_pipeline(article_text: str, perspective: Any | None = None, job_id:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="ATIS News — Perspective-First, Graph-Grounded Intelligence Engine")
-    parser.add_argument("article_path", metavar="ARTICLE", help="Path to the plain-text news article to process.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    article_parser = subparsers.add_parser("process", help="Process an article synchronously (backward-compatible mode).")
+    article_parser.add_argument("article_path", metavar="ARTICLE", help="Path to the plain-text news article to process.")
+
+    worker_parser = subparsers.add_parser("worker", help="Run the durable News worker.")
+    worker_parser.add_argument("--worker-id", default=None)
+
+    status_parser = subparsers.add_parser("status", help="Get durable News job status.")
+    status_parser.add_argument("job_id")
+
     args = parser.parse_args()
     try:
-        print(json.dumps(process_article_pipeline(args.article_path), indent=2, ensure_ascii=False))
+        if args.command == "worker":
+            run_news_worker_forever(args.worker_id)
+            return
+        if args.command == "status":
+            print(json.dumps(get_news_job_status(args.job_id), indent=2, ensure_ascii=False))
+            return
+        article_path = args.article_path if args.command == "process" else getattr(args, "article_path", None)
+        if not article_path:
+            parser.print_help()
+            return
+        print(json.dumps(process_article_pipeline(article_path), indent=2, ensure_ascii=False))
     except Exception as exc:
         logger.critical("Pipeline terminated with fatal error: %s", exc)
         sys.exit(1)
