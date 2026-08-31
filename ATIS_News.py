@@ -3163,7 +3163,10 @@ class PerspectiveFirstNewsEngine:
         config = get_config()
         
         if perspective:
-            self.perspective = perspective
+            if isinstance(perspective, PerspectiveContext):
+                self.perspective = perspective
+            else:
+                self.perspective = PerspectiveContext.from_payload(perspective)
         
         if reasoning_log is None:
             reasoning_log = ReasoningLog()
@@ -3198,7 +3201,13 @@ class PerspectiveFirstNewsEngine:
         try:
             # Stage 0: Input Validation
             if state.is_completed(PipelineStage.INPUT_VALIDATION):
-                article_text, self.perspective = state.get_stage_data(PipelineStage.INPUT_VALIDATION)
+                data = state.get_stage_data(PipelineStage.INPUT_VALIDATION)
+                article_text = data[0]
+                raw_perspective = data[1]
+                self.perspective = (
+                    raw_perspective if isinstance(raw_perspective, PerspectiveContext)
+                    else PerspectiveContext.from_payload(raw_perspective)
+                )
             else:
                 set_stage(PipelineStage.INPUT_VALIDATION)
                 article_text, self.perspective = self.stages.stage_0_validate_input(
@@ -3423,6 +3432,11 @@ class PerspectiveFirstNewsEngine:
         reason: str,
     ) -> Dict[str, Any]:
         """Create a truthful partial dashboard when pipeline fails."""
+        # Ensure self.perspective is a PerspectiveContext object
+        perspective = self.perspective
+        if isinstance(perspective, dict):
+            perspective = PerspectiveContext.from_payload(perspective)
+        
         event = article.get("event", {}) if isinstance(article.get("event"), dict) else {}
         return {
             "status": "partial",
@@ -3432,8 +3446,8 @@ class PerspectiveFirstNewsEngine:
             "market_equilibrium_shift": "",
             "executive_summary": str(event.get("summary") or ""),
             "analytical_perspective": {
-                "country": self.perspective.country,
-                "country_code": self.perspective.country_code,
+                "country": perspective.country,
+                "country_code": perspective.country_code,
                 "description": "Country through which this event is interpreted.",
             },
             "facts": _pf_safe_list(article.get("facts")),
@@ -3465,6 +3479,10 @@ class PerspectiveFirstNewsEngine:
     ) -> None:
         """Finalize dashboard with metadata and persistence."""
         config = get_config()
+        
+        # Ensure perspective is a PerspectiveContext object
+        if isinstance(perspective, dict):
+            perspective = PerspectiveContext.from_payload(perspective)
         
         dashboard = dict(dashboard or {})
         dashboard.setdefault("intelligence_id", 
