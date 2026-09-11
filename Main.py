@@ -4,7 +4,8 @@ ATIS Intelligence API — Render Web Service Entry Point
 
 Features:
   - CORS configured for Vercel frontend
-  60-second hard timeout on all LLM pipelines
+  - Durable asynchronous News execution (HTTP request is decoupled from News worker)
+  - 60-second hard timeout on non-News LLM pipelines
   - Global request lock (prevents concurrent pipeline runs)
   - Emergency kill endpoint
   - Perspective-First Deterministic Architecture v2.2
@@ -29,12 +30,17 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ATIS pipeline modules
-from ATIS_News import run_news_pipeline
+from ATIS_News import (
+    run_news_pipeline,
+    submit_news_job,
+    get_news_job_status,
+    run_news_worker_forever,
+)
 from ATIS_Execute import run_execute_pipeline
 from ATIS_Query import run_query_pipeline, ObsidianVaultManager as QueryVaultManager
 from atis_context import (
@@ -111,9 +117,30 @@ def _get_query_vault() -> QueryVaultManager:
         logger.info("Query vault index complete: %d nodes", _query_vault.indexed_count)
     return _query_vault
 
-# Request lock — prevents concurrent LLM pipeline runs
+# Request lock — prevents concurrent non-News LLM pipeline runs.
+# News uses its own durable SQLite queue and worker; it must NOT share this
+# request-scoped lock because News execution intentionally outlives HTTP.
 _pipeline_lock = threading.Lock()
 _pipeline_in_progress = False
+
+_news_worker_thread: threading.Thread | None = None
+_news_worker_start_lock = threading.Lock()
+
+def _ensure_news_worker_started() -> None:
+    """Start exactly one in-process durable News worker for this API process."""
+    global _news_worker_thread
+    with _news_worker_start_lock:
+        if _news_worker_thread is not None and _news_worker_thread.is_alive():
+            return
+        worker_id = os.getenv("ATIS_NEWS_WORKER_ID") or f"api-news-worker:{os.getpid()}"
+        _news_worker_thread = threading.Thread(
+            target=run_news_worker_forever,
+            args=(worker_id,),
+            name="atis-news-worker",
+            daemon=True,
+        )
+        _news_worker_thread.start()
+        logger.info("Started durable ATIS News worker: %s", worker_id)
 
 # Simple in-memory cache for query results
 _query_cache: Dict[str, Any] = {}
@@ -543,44 +570,115 @@ async def search_entities(q: str):
 # -----------------------------------------------------------------------------
 # News pipeline
 # -----------------------------------------------------------------------------
-@app.post("/api/news")
+@app.post("/api/news", status_code=202)
 async def news_endpoint(request: NewsRequest):
-    if not _acquire_pipeline_lock():
-        return {
-            "status": "busy",
-            "detail": "Another pipeline is running. Please wait and retry."
-        }
+    """Submit News work durably and return before intelligence execution begins.
 
+    News analysis can legitimately exceed the HTTP request lifetime. The API
+    therefore persists the immutable input first, starts the durable worker if
+    necessary, and returns a job receipt. Clients retrieve completion through
+    GET /api/news/{job_id}. No asyncio timeout is applied to the News pipeline.
+    """
     try:
-        start = time.time()
         perspective = PerspectiveContext.from_values(
             request.perspective_country, request.perspective_country_code
         )
-        # News pipeline has its own per-stage transport timeouts via LLMCaller._call_provider()
-        # which uses config.llm_timeout (default 120s). The Main.py hard timeout was
-        # killing the pipeline prematurely during batching (7 batches * 30-40s each = 3-4 min).
-        # Removing hard timeout allows LLM-level timeouts to handle individual calls properly.
-        result = run_news_pipeline(
+        receipt = submit_news_job(
             request.article_text,
-            perspective
+            perspective,
+            "web_upload",
         )
-        elapsed = time.time() - start
-        logger.info("News pipeline completed in %.1fs", elapsed)
+        _ensure_news_worker_started()
+        logger.info(
+            "News job accepted: job_id=%s status=%s",
+            receipt.get("job_id"),
+            receipt.get("status"),
+        )
         return {
-            "status": "success",
-            "elapsed_seconds": round(elapsed, 1),
+            "status": "accepted",
+            "job_id": receipt["job_id"],
+            "execution_model": "durable_worker",
+            "resume_available": True,
             "analysis_version": ANALYSIS_VERSION,
             "schema_version": SCHEMA_VERSION,
-            "data": result
         }
-    except RuntimeError as exc:
-        logger.error("News pipeline failed: %s", exc)
-        return {"status": "error", "detail": str(exc)}
     except Exception as exc:
-        logger.error("News pipeline unexpected error: %s", exc)
-        return {"status": "error", "detail": f"Pipeline failed: {str(exc)}"}
-    finally:
-        _release_pipeline_lock()
+        logger.exception("News job submission failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"News job submission failed: {exc}")
+
+
+@app.get("/api/news/status/{job_id}")
+async def news_job_status_compatibility_endpoint(job_id: str):
+    """Return the durable queue status for AV2 polling."""
+    try:
+        _ensure_news_worker_started()
+        result = get_news_job_status(job_id)
+        return {
+            "status": "success",
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": result,
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"News job not found: {job_id}")
+    except Exception as exc:
+        logger.exception("News job status failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail=f"News job status failed: {exc}")
+
+
+@app.get("/api/news/result/{job_id}")
+async def news_job_result_endpoint(job_id: str):
+    """Return the persisted completed News result for AV2."""
+    try:
+        result = get_news_job_status(job_id)
+        if result.get("status") != "COMPLETED":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": result.get("status"),
+                    "job": result,
+                },
+            )
+
+        completed_result = result.get("result")
+        if not isinstance(completed_result, dict):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Completed News result is unavailable for {job_id}",
+            )
+
+        return {
+            "status": "success",
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": completed_result,
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"News job not found: {job_id}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("News job result failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail=f"News job result failed: {exc}")
+
+
+@app.get("/api/news/{job_id}")
+async def news_job_status_endpoint(job_id: str):
+    """Return durable News job state and completed dashboard when available."""
+    try:
+        _ensure_news_worker_started()
+        result = get_news_job_status(job_id)
+        return {
+            "status": "success",
+            "analysis_version": ANALYSIS_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "data": result,
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"News job not found: {job_id}")
+    except Exception as exc:
+        logger.exception("News job status failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail=f"News job status failed: {exc}")
 
 # -----------------------------------------------------------------------------
 # Execute pipeline
@@ -963,6 +1061,7 @@ async def kill_pipeline():
 async def startup_event():
     logger.info("ATIS API v2.2.0 starting up...")
     try:
+        _ensure_news_worker_started()
         vault = _get_query_vault()
         ks = KnowledgeState(vault_path=_vault_path)
         ks.compute()
