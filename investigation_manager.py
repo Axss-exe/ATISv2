@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from atis_context import PerspectiveContext
-from ATIS_Query import run_query_pipeline
+from ATIS_Query import run_query_pipeline, safe_json_loads
 from llm_client import get_client
 
 logger = logging.getLogger("ATIS_Investigation")
@@ -492,15 +492,11 @@ OUTPUT SCHEMA (raw JSON only, no markdown fences):
 def _parse_report_response(
     raw: str, investigation: Dict[str, Any], aggregated: Dict[str, Any],
 ) -> Dict[str, Any]:
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        data = json.loads(match.group(0)) if match else {}
+        data = safe_json_loads(raw, "investigation_report")
+    except RuntimeError as exc:
+        logger.error("Failed to parse investigation report JSON: %s", exc)
+        data = {}
     return {
         "executive_summary": data.get("executive_summary", ""),
         "investigation_objective": data.get("investigation_objective", ""),
